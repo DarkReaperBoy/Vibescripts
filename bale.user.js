@@ -44,7 +44,7 @@
     );
 
   // ─── 2. Crypto Engine ─────────────────────────────────────────────────────
-  const GLOBAL_KEY = "%CC*em@h*%YCFXMkhnm^kTqHTW##uy97"; // <- you must change this. must be 32 characters, i randomly generated with proton pass.
+  const GLOBAL_KEY = ""; // <- you must change this. must be 32 characters (like: %CC*em@h*%YCFXMkhnm^kTqHTW##uy97), i randomly generated with proton pass.
   const keyCache = new Map();
 
   async function getCryptoKey(k = GLOBAL_KEY) {
