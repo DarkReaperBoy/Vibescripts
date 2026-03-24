@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor/Decryptor (Ultimate Privacy)
 // @namespace    http://tampermonkey.net/
-// @version      9.0
+// @version      10.0
 // @description  Per-chat keys, Shield button, Material UI, Auto-decrypt, Draft blocker. Desktop & Mobile.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -34,7 +34,7 @@
 	const saveChatSettings = (s) => localStorage.setItem("bale_bridge_settings_" + getChatId(), JSON.stringify(s), );
 	// ─── 2. Crypto Engine ─────────────────────────────────────────────────────
 	const GLOBAL_KEY = "G6f$b&qyA1%JGT$t5b0Y*15RwN!6B1vg";
-    const keyCache = new Map();
+	const keyCache = new Map();
 	async function getCryptoKey(k = GLOBAL_KEY) {
 		if (keyCache.has(k)) return keyCache.get(k);
 		let b = new TextEncoder().encode(k);
@@ -703,77 +703,94 @@
 		real.parentElement.insertBefore(secureEdit, real);
 		lockInput(real);
 		secureEdit.focus();
-		// Auto-decrypt whatever is already in the box (editing an existing message)
+
+		// Auto-decrypt whatever is already in the box
 		const existing = real.value.trim();
+
+		// 🚨 SECURITY FIX: Instantly wipe the real app input.
+		// This guarantees Bale's native background draft sync and React state
+		// have absolutely ZERO access to the decrypted plaintext.
+		_textareaSetter?.call(real, "");
+		real.dispatchEvent(new Event("input", { bubbles: true }));
+
 		if (existing.startsWith("@@")) {
 			decrypt(existing).then((plain) => {
 				if (plain !== existing) {
-					_textareaSetter?.call(real, plain);
-					real.dispatchEvent(new Event("input", {
-						bubbles: true
-					}));
+					// ONLY write plaintext to the shadow overlay, NEVER to the real input
 					secureEdit.value = plain;
 				}
 			});
 		} else {
 			secureEdit.value = existing;
 		}
+
+
 		// ── Intercept every submit / confirm button inside the same dialog ──
-		const dialog = real.closest('[role="dialog"]') || real.closest(".RyZMwx")?.closest("form") || real.closest("form");
-		const encryptAndForward = async () => {
-			if (secureEdit._isSending) return;
-			const text = secureEdit.value.trim();
-			if (!text) return;
-			secureEdit._isSending = true;
-			const prev = secureEdit.value;
-			secureEdit.value = "🔒 Encrypting...";
-			try {
-				const out = await encrypt(text);
-				// Wipe plaintext from overlay before touching the real input
-				secureEdit.value = "";
-				unlockInput(real);
-				_textareaSetter?.call(real, out);
-				real.dispatchEvent(new Event("input", {
-					bubbles: true
-				}));
-				real.dispatchEvent(new Event("change", {
-					bubbles: true
-				}));
-			} catch (e) {
-				console.error("[Bale Bridge] Edit encrypt failed:", e);
-				// Restore plaintext only on failure so user can retry
-				secureEdit.value = prev;
-				alert("Encryption failed!");
-			} finally {
-				secureEdit._isSending = false;
+const encryptAndForward = async (btn) => {
+    if (secureEdit._isSending) return false;
+    const text = secureEdit.value.trim();
+    if (!text) return true; // nothing to encrypt, let it pass
+    secureEdit._isSending = true;
+    const prev = secureEdit.value;
+    secureEdit.value = "🔒 Encrypting...";
+    try {
+        const out = await encrypt(text);
+        secureEdit.value = "";
+        unlockInput(real);
+        _textareaSetter?.call(real, out);
+        real.dispatchEvent(new Event("input", { bubbles: true }));
+        real.dispatchEvent(new Event("change", { bubbles: true }));
+        await new Promise(r => setTimeout(r, 80));
+        btn.click();
+        return false;
+    } catch (e) {
+        console.error("[Bale Bridge] Edit encrypt failed:", e);
+        secureEdit.value = prev;
+        alert("Encryption failed!");
+        return false;
+    } finally {
+        secureEdit._isSending = false;
+    }
+};
+
+const isConfirmBtn = (t) =>
+    t.closest('[data-testid="confirm-button"]') ||
+    (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
+
+const _editClickHandler = (e) => {
+    const btn = isConfirmBtn(e.target);
+    if (!btn) return;
+    if (!secureEdit.value.trim()) return;
+    if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    encryptAndForward(btn);
+};
+document.addEventListener("click", _editClickHandler, true);
+document.addEventListener("mousedown", _editClickHandler, true);
+
+		// Cleanup when the overlay is removed from DOM
+		const _editObserver = new MutationObserver(() => {
+			if (!document.contains(secureEdit)) {
+				document.removeEventListener("click", _editClickHandler, true);
+				document.removeEventListener("mousedown", _editClickHandler, true);
+				_editObserver.disconnect();
 			}
-		};
-		// Intercept mousedown on any send/confirm/submit button in the dialog
-		const root = dialog || document.body;
-		root.addEventListener("mousedown", async (e) => {
-				if (e.button !== 0) return;
-				const btn = e.target.closest('[data-testid="confirm-button"]') || e.target.closest('[aria-label="Send"]') || e.target.closest('[aria-label="send-button"]') || e.target.closest('button[type="submit"]') || e.target.closest(".send-btn");
-				if (!btn) return;
-				if (!secureEdit.value.trim()) return;
-				e.preventDefault();
-				e.stopPropagation();
-				await encryptAndForward();
-				// Only click if real input now holds ciphertext (encrypt succeeded)
-				if (real.value.trim().startsWith("@@")) {
-					await new Promise((r) => setTimeout(r, 60));
-					btn.click();
-				}
-			},
-			true);
+		});
+		_editObserver.observe(document.body, { childList: true, subtree: true });
+
 		// Also support Enter key inside the overlay
 		secureEdit.addEventListener("keydown", (e) => {
 			if (e.key === "Enter" && !e.shiftKey) {
 				e.preventDefault();
 				e.stopPropagation();
-				encryptAndForward();
+				const btn = document.querySelector('[data-testid="confirm-button"]') ||
+							document.querySelector('button[aria-label="Send"]:not(#chat_footer button)');
+				if (btn) encryptAndForward(btn);
 			}
 		});
 	}
+
 	// ─── 9. Send Button Event Interception ───────────────────────────────────
 	const getSecureText = () => {
 		const si = document.getElementById("secure-input-overlay");
