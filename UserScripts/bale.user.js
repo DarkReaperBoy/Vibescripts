@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor/Decryptor (Ultimate Privacy)
 // @namespace    http://tampermonkey.net/
-// @version      10.4
+// @version      11.0
 // @description  Per-chat keys, Shield button, Material UI, Auto-decrypt, Draft blocker. Desktop & Mobile.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -43,11 +43,15 @@
         localStorage.setItem("bale_bridge_settings_" + id, JSON.stringify(s));
     };
 
-    // Returns the active 32-char key, or null if not configured / encryption off.
+    // Returns the active 32-char key, or null if encryption is off or key invalid.
     const getActiveKey = () => {
         const s = getChatSettings();
-        return s.enabled && s.customKey && s.customKey.length === 32 ? s.customKey : null;
+        if (!s.enabled) return null;
+        return s.customKey && s.customKey.length === 32 ? s.customKey : null;
     };
+
+    // Is encryption enabled (regardless of whether key is valid)?
+    const isEncryptionEnabled = () => getChatSettings().enabled;
 
     // ─── 2. Crypto Engine ─────────────────────────────────────────────────────
     const keyCache = new Map();
@@ -60,7 +64,6 @@
         return key;
     }
 
-    // Generates a cryptographically random 32-character key.
     function generateKey() {
         const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~";
         const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -68,41 +71,61 @@
     }
 
     // Base85 (RFC 1924)
-    const B85  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-    const B85D = new Map([...B85].map((c, i) => [c, i]));
+    const B85 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+    const B85D = new Uint8Array(128);
+    for (let i = 0; i < B85.length; i++) B85D[B85.charCodeAt(i)] = i;
 
     function b85enc(buf) {
-        let out = "";
-        for (let i = 0; i < buf.length; i += 4) {
+        const len = buf.length;
+        // Pre-calculate output size for single allocation
+        const fullChunks = (len >>> 2);
+        const remainder = len & 3;
+        const outLen = fullChunks * 5 + (remainder ? remainder + 1 : 0);
+        const chars = new Array(outLen);
+        let pos = 0;
+        for (let i = 0; i < len; i += 4) {
+            const rem = len - i < 4 ? len - i : 4;
             let acc = 0;
-            const rem = Math.min(4, buf.length - i);
-            for (let j = 0; j < 4; j++) acc = (acc << 8) | (i + j < buf.length ? buf[i + j] : 0);
+            for (let j = 0; j < 4; j++) acc = (acc << 8) | (i + j < len ? buf[i + j] : 0);
             acc >>>= 0;
-            const chunk = new Array(5);
-            for (let j = 4; j >= 0; j--) { chunk[j] = B85[acc % 85]; acc = Math.floor(acc / 85); }
-            out += rem < 4 ? chunk.slice(0, rem + 1).join("") : chunk.join("");
+            const count = rem < 4 ? rem + 1 : 5;
+            // Extract digits in reverse into temp, then copy forward
+            const tmp = new Array(5);
+            for (let j = 4; j >= 0; j--) { tmp[j] = B85[acc % 85]; acc = Math.floor(acc / 85); }
+            for (let j = 0; j < count; j++) chars[pos++] = tmp[j];
         }
-        return out;
+        return chars.join("");
     }
 
     function b85dec(str) {
-        str = str.replace(/\s/g, "");
-        const out = [];
-        for (let i = 0; i < str.length; i += 5) {
-            let chunk = str.slice(i, i + 5);
-            const pad  = 5 - chunk.length;
-            chunk = chunk.padEnd(5, "~");
+        const slen = str.length;
+        // Estimate output size
+        const fullChunks = Math.floor(slen / 5);
+        const remChars = slen % 5;
+        const outEst = fullChunks * 4 + (remChars ? remChars - 1 : 0);
+        const out = new Uint8Array(outEst);
+        let wpos = 0;
+        for (let i = 0; i < slen; i += 5) {
+            const end = Math.min(i + 5, slen);
+            const chunkLen = end - i;
+            const pad = 5 - chunkLen;
             let acc = 0;
-            for (let j = 0; j < 5; j++) acc = acc * 85 + B85D.get(chunk[j]);
-            out.push((acc >>> 24) & 0xff, (acc >>> 16) & 0xff, (acc >>> 8) & 0xff, acc & 0xff);
-            if (pad) out.splice(out.length - pad, pad);
+            for (let j = 0; j < 5; j++) {
+                const ci = i + j < slen ? str.charCodeAt(i + j) : 126; // '~'
+                acc = acc * 85 + B85D[ci];
+            }
+            const bytes = 4 - pad;
+            if (bytes >= 1) out[wpos++] = (acc >>> 24) & 0xff;
+            if (bytes >= 2) out[wpos++] = (acc >>> 16) & 0xff;
+            if (bytes >= 3) out[wpos++] = (acc >>> 8) & 0xff;
+            if (bytes >= 4) out[wpos++] = acc & 0xff;
         }
-        return new Uint8Array(out);
+        return out.subarray(0, wpos);
     }
 
     async function compress(text) {
         const cs = new CompressionStream("deflate");
-        const w  = cs.writable.getWriter();
+        const w = cs.writable.getWriter();
         w.write(new TextEncoder().encode(text));
         w.close();
         return new Uint8Array(await new Response(cs.readable).arrayBuffer());
@@ -110,47 +133,42 @@
 
     async function decompress(buf) {
         const ds = new DecompressionStream("deflate");
-        const w  = ds.writable.getWriter();
+        const w = ds.writable.getWriter();
         w.write(buf);
         w.close();
         return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
     }
 
-    // Returns null if no valid key is configured — caller must handle.
     async function encrypt(text) {
         const k = getActiveKey();
         if (!k) return null;
         const iv = crypto.getRandomValues(new Uint8Array(12));
-        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getCryptoKey(k), await compress(text)));
+        const ct = new Uint8Array(await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv }, await getCryptoKey(k), await compress(text)
+        ));
         const payload = new Uint8Array(12 + ct.length);
         payload.set(iv);
         payload.set(ct, 12);
         return "@@" + b85enc(payload);
     }
 
-    // Returns original text unchanged if no valid key is configured or decryption fails.
     async function decrypt(text) {
         if (!text.startsWith("@@")) return text;
         const k = getActiveKey();
         if (!k) return text;
         try {
-            const buf   = b85dec(text.slice(2));
-            const iv    = buf.slice(0, 12), data = buf.slice(12);
-            const useCustom = getChatSettings().enabled && getChatSettings().customKey;
-            let plain;
-            try {
-                plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await getCryptoKey(k), data);
-            } catch (_) {
-                if (!useCustom) throw _;
-                throw _; // no global fallback — if key is wrong, leave ciphertext
-            }
+            const buf = b85dec(text.slice(2));
+            const iv = buf.subarray(0, 12), data = buf.subarray(12);
+            const plain = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv }, await getCryptoKey(k), data
+            );
             return await decompress(new Uint8Array(plain));
         } catch (_) {
             return text;
         }
     }
 
-    // ─── 2b. Chunked Encrypt (split if encrypted output > 4000 chars) ─────────
+    // ─── 2b. Chunked Encrypt ──────────────────────────────────────────────────
     const MAX_ENCRYPTED_LEN = 4000;
     async function encryptChunked(text) {
         const result = await encrypt(text);
@@ -160,34 +178,31 @@
         let splitAt = text.lastIndexOf("\n", mid);
         if (splitAt <= 0) splitAt = text.lastIndexOf(" ", mid);
         if (splitAt <= 0) splitAt = mid;
-        return [
-            ...(await encryptChunked(text.slice(0, splitAt).trim())),
-            ...(await encryptChunked(text.slice(splitAt).trim())),
-        ];
+        const a = await encryptChunked(text.slice(0, splitAt).trim());
+        const b = await encryptChunked(text.slice(splitAt).trim());
+        if (!a || !b) return null;
+        return [...a, ...b];
     }
 
     // ─── 2c. Render Decrypted ─────────────────────────────────────────────────
-    const _URL_RE  = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
+    const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
     const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
-
-    function escapeHtml(s) { return s.replace(/[&<>"]/g, c => _ESC_MAP[c]); }
+    const escapeHtml = (s) => s.replace(/[&<>"]/g, c => _ESC_MAP[c]);
 
     function applyInlineMarkdown(s) {
         return s
-            .replace(/``([^`]+)``|`([^`]+)`/g, (_, a, b) => {
-                const t = a ?? b;
-                return `<code style="background:var(--color-neutrals-n-20,#f4f5f7);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.92em">${t}</code>`;
-            })
+            .replace(/``([^`]+)``|`([^`]+)`/g, (_, a, b) =>
+                `<code style="background:var(--color-neutrals-n-20,#f4f5f7);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.92em">${a ?? b}</code>`)
             .replace(/\|\|(.+?)\|\|/g, (_, t) =>
                 `<span class="bb-spoiler" style="background:var(--color-neutrals-n-400,#42526e);color:transparent;border-radius:3px;padding:0 3px;cursor:pointer;user-select:none" title="Click to reveal">${t}</span>`)
             .replace(/\*\*\*(.+?)\*\*\*/g, (_, t) => `<strong><em>${t}</em></strong>`)
-            .replace(/\*\*(.+?)\*\*/g,     (_, t) => `<strong>${t}</strong>`)
+            .replace(/\*\*(.+?)\*\*/g, (_, t) => `<strong>${t}</strong>`)
             .replace(/(?<![_a-zA-Z0-9])__(.+?)__(?![_a-zA-Z0-9])/g, (_, t) => `<u>${t}</u>`)
-            .replace(/\*([^*\n]+)\*/g,     (_, t) => `<em>${t}</em>`)
+            .replace(/\*([^*\n]+)\*/g, (_, t) => `<em>${t}</em>`)
             .replace(/(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?=[^a-zA-Z0-9_]|$)/g, (_, p, t) => `${p}<em>${t}</em>`)
-            .replace(/~~(.+?)~~/g,         (_, t) => `<del>${t}</del>`)
-            .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-                (_, label, url) => `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`);
+            .replace(/~~(.+?)~~/g, (_, t) => `<del>${t}</del>`)
+            .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, url) =>
+                `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`);
     }
 
     function processLine(line) {
@@ -207,10 +222,10 @@
 
     function renderDecrypted(plain) {
         const lines = plain.split("\n");
-        const out   = [];
+        const out = [];
         let i = 0;
-        const bidiBlock = (html, extra = "") =>
-            `<span dir="auto" style="display:block;unicode-bidi:plaintext${extra}">${html}</span>`;
+        const bidiBlock = (html) =>
+            `<span dir="auto" style="display:block;unicode-bidi:plaintext">${html}</span>`;
 
         while (i < lines.length) {
             const line = lines[i];
@@ -239,18 +254,15 @@
             if (hm) {
                 const sz = ["1.25em", "1.1em", "1em"][Math.min(hm[1].length, 3) - 1];
                 out.push(bidiBlock(`<span style="font-weight:700;font-size:${sz}">${processLine(hm[2])}</span>`));
-                i++;
-                continue;
+                i++; continue;
             }
             if (/^([-*_])\1{2,}$/.test(line.trim())) {
                 out.push(`<span style="display:block;border-top:1px solid var(--color-neutrals-n-100,#ccc);margin:6px 0"></span>`);
-                i++;
-                continue;
+                i++; continue;
             }
             if (line.trim() === "") {
                 out.push(`<span style="display:block;height:.4em"></span>`);
-                i++;
-                continue;
+                i++; continue;
             }
             out.push(bidiBlock(processLine(line)));
             i++;
@@ -260,31 +272,36 @@
 
     // ─── 3. DOM Scanner (Auto-decrypt) ────────────────────────────────────────
     function scanTree(root) {
-        for (const el of root.getElementsByTagName("*")) {
-            if (el.id === "secure-input-overlay" || el.id === "secure-edit-overlay" ||
-                el.id === "editable-message-text" || el.id === "main-message-input" ||
-                el.id === "bb-no-key-notice") continue;
+        const els = root.getElementsByTagName("*");
+        for (let idx = 0, len = els.length; idx < len; idx++) {
+            const el = els[idx];
             if (el._isDecrypted || el._isDecrypting) continue;
-            const text = el.textContent.trim();
-            if (!text.startsWith("@@") || text.length <= 20) continue;
+            const id = el.id;
+            if (id === "secure-input-overlay" || id === "secure-edit-overlay" ||
+                id === "editable-message-text" || id === "main-message-input" ||
+                id === "bb-no-key-notice") continue;
+            const text = el.textContent;
+            if (text.length <= 20 || text.charCodeAt(0) !== 64 || text.charCodeAt(1) !== 64) continue;
+            const trimmed = text.trim();
+            if (!trimmed.startsWith("@@") || trimmed.length <= 20) continue;
             let skip = false;
             for (const c of el.children) {
-                if (c.textContent.trim() === text) { skip = true; break; }
+                if (c.textContent.trim() === trimmed) { skip = true; break; }
             }
             if (skip) continue;
             el._isDecrypting = true;
-            decrypt(text).then((plain) => {
-                if (plain !== text) {
+            decrypt(trimmed).then((plain) => {
+                if (plain !== trimmed) {
                     if (!el._bbOverflowSet) {
-                        el.style.overflow    = "hidden";
+                        el.style.overflow = "hidden";
                         el.style.overflowWrap = "anywhere";
-                        el.style.wordBreak   = "break-word";
-                        el.style.maxWidth    = "100%";
-                        el._bbOverflowSet    = true;
+                        el.style.wordBreak = "break-word";
+                        el.style.maxWidth = "100%";
+                        el._bbOverflowSet = true;
                     }
                     el.innerHTML = renderDecrypted(plain) +
                         `<span style="display:inline-block;font-size:9px;opacity:0.4;letter-spacing:0.02em;font-style:italic;margin-inline-start:5px;vertical-align:middle;line-height:1;white-space:nowrap">🔒 encrypted</span>`;
-                    el.style.color  = "inherit";
+                    el.style.color = "inherit";
                     el._isDecrypted = true;
                 }
             }).finally(() => { el._isDecrypting = false; });
@@ -294,14 +311,14 @@
     // ─── 4. Input Helpers ─────────────────────────────────────────────────────
     const getRealInput = () =>
         document.getElementById("editable-message-text") || document.getElementById("main-message-input");
-
+    const isMobileInput = (el) => el?.tagName === "TEXTAREA";
     const _textareaSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
 
     // ─── 5. Styles ────────────────────────────────────────────────────────────
     document.addEventListener("click", (e) => {
         const sp = e.target.closest(".bb-spoiler");
         if (!sp) return;
-        sp.style.color      = "inherit";
+        sp.style.color = "inherit";
         sp.style.background = "var(--color-neutrals-n-40,#dfe1e6)";
     }, true);
 
@@ -317,17 +334,17 @@
         #secure-input-overlay:focus{box-shadow:0 4px 16px rgba(0,171,128,.3);border-color:var(--color-primary-p-60,#00916d)}
         div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:var(--color-neutrals-n-300,#888);pointer-events:none;display:block}
 
-        /* ── No-key notice ────────────────────────────────────────────────── */
         #bb-no-key-notice {
             display:none;align-items:flex-start;gap:10px;
             width:100%;box-sizing:border-box;padding:10px 14px;margin-right:10px;
             background:#fff8e1;border:2px solid #f9a825;border-radius:16px;
             font-family:inherit;font-size:13px;color:#4a3400;line-height:1.5;
+            position:relative;z-index:101;
         }
         #bb-no-key-notice .bb-notice-icon{font-size:20px;flex-shrink:0;margin-top:1px}
         #bb-no-key-notice .bb-notice-body{flex:1}
         #bb-no-key-notice strong{display:block;font-size:13px;margin-bottom:3px;color:#b45309}
-        #bb-no-key-notice .bb-notice-btn {
+        #bb-no-key-notice .bb-notice-btn{
             display:inline-block;margin-top:7px;padding:5px 12px;border-radius:8px;border:none;
             background:#f9a825;color:#fff;font-size:12px;font-weight:700;cursor:pointer;
             transition:background .15s;
@@ -408,27 +425,32 @@
 
     const showMenu = (x, y) => Object.assign(popupMenu.style, {
         display: "flex",
-        left:    Math.min(x, innerWidth  - 210) + "px",
-        top:     Math.min(y, innerHeight - 120) + "px",
+        left: Math.min(x, innerWidth - 210) + "px",
+        top: Math.min(y, innerHeight - 120) + "px",
     });
-    document.addEventListener("click", (e) => { if (!popupMenu.contains(e.target)) popupMenu.style.display = "none"; });
-    document.getElementById("bale-menu-enc").onclick   = () => { popupMenu.style.display = "none"; window._bbSend?.(true); };
+    document.addEventListener("click", (e) => {
+        if (!popupMenu.contains(e.target)) popupMenu.style.display = "none";
+    });
+    document.getElementById("bale-menu-enc").onclick = () => { popupMenu.style.display = "none"; window._bbSend?.(true); };
     document.getElementById("bale-menu-plain").onclick = () => { popupMenu.style.display = "none"; window._bbSend?.(false); };
 
     // ─── 7. Settings Modal ────────────────────────────────────────────────────
     function openSettingsModal() {
+        // Remove any existing modal first
+        document.getElementById("bb-modal-overlay")?.remove();
+
         const s = getChatSettings();
         document.body.insertAdjacentHTML("beforeend", `
             <div id="bb-modal-overlay">
                 <div id="bb-modal-card">
                     <h3 class="bb-modal-title">Shield Settings 🛡️</h3>
-                    <p class="bb-modal-desc">Configure encryption for this specific chat. A 32-character key is required to send messages.</p>
+                    <p class="bb-modal-desc">Configure encryption for this chat. When enabled, a 32-character key is required.</p>
                     <label class="bb-toggle-lbl">
                         <input type="checkbox" id="bb-enable-enc" ${s.enabled ? "checked" : ""}
                             style="width:16px;height:16px;accent-color:var(--color-primary-p-50,#00ab80)">
                         <span>Enable Encryption Here</span>
                     </label>
-                    <div style="margin-top:16px;border-top:1px solid var(--color-neutrals-n-20,#f4f5f7);padding-top:16px">
+                    <div id="bb-key-section" style="margin-top:16px;border-top:1px solid var(--color-neutrals-n-20,#f4f5f7);padding-top:16px">
                         <label style="font-size:12px;color:var(--color-neutrals-n-500,#151515);font-weight:600">
                             Encryption Key <span style="color:#d32f2f">*</span>
                         </label>
@@ -437,79 +459,86 @@
                                 placeholder="Enter exactly 32 characters…"
                                 maxlength="32"
                                 value="${s.customKey || ""}">
-                            <button class="bb-icon-btn" id="bb-toggle-vis"  title="Show / hide key">👁</button>
-                            <button class="bb-icon-btn" id="bb-copy-key"    title="Copy key">📋</button>
+                            <button class="bb-icon-btn" id="bb-toggle-vis" title="Show / hide key">👁</button>
+                            <button class="bb-icon-btn" id="bb-copy-key" title="Copy key">📋</button>
                         </div>
                         <div class="bb-key-tools">
                             <button class="bb-tool-btn" id="bb-gen-key">⚡ Generate Random Key</button>
                         </div>
                         <div class="bb-key-meta">
-                            <span class="bb-key-error"   id="bb-key-error"></span>
+                            <span class="bb-key-error" id="bb-key-error"></span>
                             <span class="bb-key-counter" id="bb-key-counter">0 / 32</span>
                         </div>
                     </div>
                     <div class="bb-actions">
                         <button class="bb-btn bb-btn-cancel" id="bb-btn-cancel">Cancel</button>
-                        <button class="bb-btn bb-btn-save"   id="bb-btn-save">Save</button>
+                        <button class="bb-btn bb-btn-save" id="bb-btn-save">Save</button>
                     </div>
                 </div>
             </div>`);
 
-        const overlay  = document.getElementById("bb-modal-overlay");
+        const overlay = document.getElementById("bb-modal-overlay");
         const keyInput = document.getElementById("bb-custom-key");
-        const counter  = document.getElementById("bb-key-counter");
-        const errorEl  = document.getElementById("bb-key-error");
-        const saveBtn  = document.getElementById("bb-btn-save");
+        const keySection = document.getElementById("bb-key-section");
+        const counter = document.getElementById("bb-key-counter");
+        const errorEl = document.getElementById("bb-key-error");
+        const saveBtn = document.getElementById("bb-btn-save");
         const enableCb = document.getElementById("bb-enable-enc");
-        const copyBtn  = document.getElementById("bb-copy-key");
-        const genBtn   = document.getElementById("bb-gen-key");
-        const visBtn   = document.getElementById("bb-toggle-vis");
+        const copyBtn = document.getElementById("bb-copy-key");
+        const genBtn = document.getElementById("bb-gen-key");
+        const visBtn = document.getElementById("bb-toggle-vis");
 
         const validate = () => {
-            const len     = keyInput.value.length;
+            const len = keyInput.value.length;
             const enabled = enableCb.checked;
             counter.textContent = `${len} / 32`;
-            counter.className   = "bb-key-counter" + (len === 32 ? " exact" : "");
-            if (!enabled) { errorEl.textContent = ""; saveBtn.disabled = false; return; }
-            if (len === 0)       { errorEl.textContent = "A key is required when encryption is enabled."; saveBtn.disabled = true; }
-            else if (len !== 32) { errorEl.textContent = `Key must be exactly 32 characters (currently ${len}).`; saveBtn.disabled = true; }
-            else                 { errorEl.textContent = ""; saveBtn.disabled = false; }
+            counter.className = "bb-key-counter" + (len === 32 ? " exact" : "");
+
+            // Show/hide key section based on encryption toggle
+            keySection.style.display = enabled ? "" : "none";
+
+            if (!enabled) {
+                // Encryption disabled — always valid, can save freely
+                errorEl.textContent = "";
+                saveBtn.disabled = false;
+                return;
+            }
+            if (len === 0) {
+                errorEl.textContent = "A key is required when encryption is enabled.";
+                saveBtn.disabled = true;
+            } else if (len !== 32) {
+                errorEl.textContent = `Key must be exactly 32 characters (currently ${len}).`;
+                saveBtn.disabled = true;
+            } else {
+                errorEl.textContent = "";
+                saveBtn.disabled = false;
+            }
         };
 
         keyInput.addEventListener("input", validate);
         enableCb.addEventListener("change", validate);
         validate();
 
-        // Show / hide key
         visBtn.addEventListener("click", () => {
             const hidden = keyInput.type === "password";
             keyInput.type = hidden ? "text" : "password";
             visBtn.textContent = hidden ? "🙈" : "👁";
         });
 
-        // Copy key to clipboard
-        const flashCopy = (btn, icon) => {
-            btn.textContent = icon;
-            btn.classList.add("copied");
-            setTimeout(() => { btn.textContent = btn === copyBtn ? "📋" : "📋 Copied!"; btn.classList.remove("copied"); }, 1500);
-        };
         copyBtn.addEventListener("click", () => {
             if (!keyInput.value) return;
-            navigator.clipboard.writeText(keyInput.value).then(() => flashCopy(copyBtn, "✅"));
+            navigator.clipboard.writeText(keyInput.value).then(() => {
+                copyBtn.textContent = "✅";
+                copyBtn.classList.add("copied");
+                setTimeout(() => { copyBtn.textContent = "📋"; copyBtn.classList.remove("copied"); }, 1500);
+            });
         });
 
-        // Generate random key
         genBtn.addEventListener("click", () => {
             keyInput.value = generateKey();
-            keyInput.type  = "text"; // reveal so user can see/verify
+            keyInput.type = "text";
             visBtn.textContent = "🙈";
             validate();
-        });
-
-        // Copy from gen button (same area, just wire the tool button variant)
-        genBtn.addEventListener("dblclick", () => {
-            if (!keyInput.value) return;
-            navigator.clipboard.writeText(keyInput.value);
         });
 
         document.getElementById("bb-btn-cancel").onclick = () => overlay.remove();
@@ -534,40 +563,49 @@
     });
 
     function syncInputVisibility() {
-        const real   = getRealInput();
+        const real = getRealInput();
         const secure = document.getElementById("secure-input-overlay");
         const notice = document.getElementById("bb-no-key-notice");
-        const btn    = document.getElementById("bb-settings-btn");
+        const btn = document.getElementById("bb-settings-btn");
         if (!real) return;
 
-        const active = !!getActiveKey();
+        const encEnabled = isEncryptionEnabled();
+        const hasKey = !!getActiveKey();
 
-        if (active) {
-            if (secure) { secure.style.display = ""; }
-            if (notice) { notice.style.display = "none"; }
+        if (!encEnabled) {
+            // Encryption OFF → show native input, hide everything else
+            unlockInput(real);
+            if (secure) secure.style.display = "none";
+            if (notice) notice.style.display = "none";
+            if (btn) btn.style.color = "#5E6C84"; // gray = inactive
+        } else if (hasKey) {
+            // Encryption ON + valid key → show secure input
             lockInput(real);
+            if (secure) secure.style.display = "";
+            if (notice) notice.style.display = "none";
             if (btn) btn.style.color = "var(--color-primary-p-50, #00ab80)";
         } else {
-            // No valid key — lock real input, hide secure overlay, show notice
+            // Encryption ON + no valid key → show notice, block everything
             lockInput(real);
-            if (secure) { secure.style.display = "none"; }
-            if (notice) { notice.style.display = "flex"; }
-            if (btn) btn.style.color = "#f9a825"; // amber = warning state
+            if (secure) secure.style.display = "none";
+            if (notice) notice.style.display = "flex";
+            if (btn) btn.style.color = "#f9a825"; // amber = warning
         }
     }
 
     function ensureSecureInput() {
         const realInput = getRealInput();
         if (!realInput) return;
-        const mobile  = realInput.tagName === "TEXTAREA";
+        const mobile = isMobileInput(realInput);
         const wrapper = realInput.parentElement;
 
+        // ── Shield button ──────────────────────────────────────────────────
         const emojiBtn = document.querySelector('[aria-label="emoji-icon"]') || document.querySelector(".MmBErq");
         if (emojiBtn) emojiBtn.style.display = "none";
 
         if (emojiBtn && !document.getElementById("bb-settings-btn")) {
             const shieldBtn = document.createElement("div");
-            shieldBtn.id        = "bb-settings-btn";
+            shieldBtn.id = "bb-settings-btn";
             shieldBtn.className = emojiBtn.className;
             shieldBtn.setAttribute("role", "button");
             shieldBtn.style.cssText = "display:flex;align-items:center;justify-content:center;cursor:pointer;transition:color .2s";
@@ -583,7 +621,7 @@
             emojiBtn.parentElement.insertBefore(shieldBtn, emojiBtn);
         }
 
-        // ── No-key notice (inserted once, shown/hidden by syncInputVisibility) ──
+        // ── No-key notice ──────────────────────────────────────────────────
         if (!document.getElementById("bb-no-key-notice")) {
             const notice = document.createElement("div");
             notice.id = "bb-no-key-notice";
@@ -591,15 +629,15 @@
                 <div class="bb-notice-icon">⚠️</div>
                 <div class="bb-notice-body">
                     <strong>Encryption key not set — sending is blocked.</strong>
-                    You must configure a 32-character encryption key before you can send any message.
-                    Right-click the send button to explicitly send an unencrypted message if absolutely necessary.
+                    Tap the 🔒 lock button to generate a key and share it with your contact, paste a key you received, or disable encryption for this chat.
                     <br>
                     <button class="bb-notice-btn" id="bb-notice-set-key">🛡 Set Encryption Key</button>
                 </div>`;
             wrapper.insertBefore(notice, realInput);
-            document.getElementById("bb-notice-set-key").onclick = openSettingsModal;
+            notice.querySelector("#bb-notice-set-key").onclick = openSettingsModal;
         }
 
+        // Already built — refresh
         const existingOverlay = document.getElementById("secure-input-overlay");
         if (existingOverlay) {
             window._bbSend = existingOverlay._triggerSend;
@@ -607,35 +645,43 @@
             return;
         }
 
+        // ── Hijack real input ──────────────────────────────────────────────
         if (!realInput._hasStrictHijack) {
             realInput._hasStrictHijack = true;
             realInput.addEventListener("focus", () => {
-                if (!isSyncing) { realInput.blur(); document.getElementById("secure-input-overlay")?.focus(); }
+                if (!isSyncing && isEncryptionEnabled()) {
+                    realInput.blur();
+                    document.getElementById("secure-input-overlay")?.focus();
+                }
             });
             ["keydown", "keypress", "keyup", "paste", "drop"].forEach((evt) =>
                 realInput.addEventListener(evt, (e) => {
-                    if (!isSyncing) { e.preventDefault(); e.stopPropagation(); }
+                    if (!isSyncing && isEncryptionEnabled()) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }
                 }, true));
         }
 
+        // ── Build secure overlay ───────────────────────────────────────────
         let secureInput;
         if (mobile) {
-            secureInput             = document.createElement("textarea");
-            secureInput.id          = "secure-input-overlay";
-            secureInput.dir         = "auto";
+            secureInput = document.createElement("textarea");
+            secureInput.id = "secure-input-overlay";
+            secureInput.dir = "auto";
             secureInput.placeholder = "🔒 پیام امن...";
-            secureInput.rows        = 1;
+            secureInput.rows = 1;
             secureInput.addEventListener("input", () => {
                 secureInput.style.height = "auto";
                 secureInput.style.height = Math.min(secureInput.scrollHeight, 150) + "px";
             });
         } else {
-            secureInput                     = document.createElement("div");
-            secureInput.id                  = "secure-input-overlay";
-            secureInput.contentEditable     = "true";
-            secureInput.dir                 = "auto";
+            secureInput = document.createElement("div");
+            secureInput.id = "secure-input-overlay";
+            secureInput.contentEditable = "true";
+            secureInput.dir = "auto";
             secureInput.dataset.placeholder = "🔒 پیام امن...";
-            wrapper.style.overflow          = "visible";
+            wrapper.style.overflow = "visible";
         }
         secureInput.className = realInput.className;
         wrapper.insertBefore(secureInput, realInput);
@@ -646,17 +692,17 @@
         const syncHasText = (hasText) => {
             if (hasText === lastHasText) return;
             lastHasText = hasText;
-            isSyncing   = true;
+            isSyncing = true;
             if (mobile) {
                 _textareaSetter?.call(realInput, hasText ? " " : "");
                 realInput.dispatchEvent(new Event("input", { bubbles: true }));
             } else {
-                const sel   = window.getSelection();
+                const sel = window.getSelection();
                 const range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
                 realInput.focus();
                 document.execCommand("selectAll", false, null);
                 document.execCommand("insertText", false, hasText ? " " : "");
-                realInput.dispatchEvent(new Event("input",  { bubbles: true }));
+                realInput.dispatchEvent(new Event("input", { bubbles: true }));
                 realInput.dispatchEvent(new Event("change", { bubbles: true }));
                 secureInput.focus();
                 if (range) { sel.removeAllRanges(); sel.addRange(range); }
@@ -678,13 +724,10 @@
             }
             await new Promise(r => setTimeout(r, 50));
             const sendBtn = document.querySelector('[aria-label="send-button"]');
-            if (sendBtn) {
-                sendBtn.click();
-            } else {
-                realInput.dispatchEvent(new KeyboardEvent("keydown", {
-                    bubbles: true, cancelable: true, key: "Enter", keyCode: 13,
-                }));
-            }
+            if (sendBtn) sendBtn.click();
+            else realInput.dispatchEvent(new KeyboardEvent("keydown", {
+                bubbles: true, cancelable: true, key: "Enter", keyCode: 13,
+            }));
             await new Promise(r => setTimeout(r, 200));
             if (mobile) {
                 _textareaSetter?.call(realInput, "");
@@ -703,7 +746,6 @@
             const text = getText();
             if (!text) return;
 
-            // Encrypted send (default): requires a valid key.
             if (doEncrypt) {
                 if (!getActiveKey()) { openSettingsModal(); return; }
                 isSending = true;
@@ -711,7 +753,7 @@
                 setText("🔒 Encrypting...");
                 try {
                     const chunks = await encryptChunked(text);
-                    if (chunks === null) { setText(text); openSettingsModal(); return; }
+                    if (!chunks) { setText(text); openSettingsModal(); return; }
                     for (const chunk of chunks) await sendOneChunk(chunk);
                     setText("");
                     lastHasText = false;
@@ -727,8 +769,7 @@
                 return;
             }
 
-            // Unencrypted send — explicit opt-in via context menu only.
-            // Confirm to make it hard to do accidentally.
+            // Plaintext send — explicit confirmation
             if (!confirm("⚠️ You are about to send this message WITHOUT encryption.\n\nThis may expose sensitive information. Are you sure?")) return;
             isSending = true;
             isSyncing = true;
@@ -754,7 +795,7 @@
             if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 e.stopPropagation();
-                triggerSend(true); // Enter always attempts encrypted; opens modal if no key
+                triggerSend(true);
             }
         });
         syncInputVisibility();
@@ -766,11 +807,11 @@
         if (!real || real._bbEditHooked) return;
         real._bbEditHooked = true;
 
-        const secureEdit         = document.createElement("textarea");
-        secureEdit.id            = "secure-edit-overlay";
-        secureEdit.className     = real.className;
-        secureEdit.placeholder   = "🔒 " + (real.placeholder || "ویرایش امن...");
-        secureEdit.dir           = real.dir || "auto";
+        const secureEdit = document.createElement("textarea");
+        secureEdit.id = "secure-edit-overlay";
+        secureEdit.className = real.className;
+        secureEdit.placeholder = "🔒 " + (real.placeholder || "ویرایش امن...");
+        secureEdit.dir = real.dir || "auto";
         secureEdit.style.cssText = real.style.cssText;
         secureEdit.addEventListener("input", () => {
             secureEdit.style.height = "auto";
@@ -781,7 +822,6 @@
         secureEdit.focus();
 
         const existing = real.value.trim();
-        // SECURITY: Wipe real input immediately — prevents Bale draft sync leaking plaintext.
         _textareaSetter?.call(real, "");
         real.dispatchEvent(new Event("input", { bubbles: true }));
 
@@ -792,29 +832,27 @@
         }
 
         const encryptAndForward = async (btn) => {
-            if (secureEdit._isSending) return false;
+            if (secureEdit._isSending) return;
             const text = secureEdit.value.trim();
-            if (!text) return true;
-            if (!getActiveKey()) { openSettingsModal(); return false; }
+            if (!text) return;
+            if (!getActiveKey()) { openSettingsModal(); return; }
             secureEdit._isSending = true;
             const prev = secureEdit.value;
             secureEdit.value = "🔒 Encrypting...";
             try {
                 const out = await encrypt(text);
-                if (out === null) { secureEdit.value = prev; openSettingsModal(); return false; }
+                if (!out) { secureEdit.value = prev; openSettingsModal(); return; }
                 secureEdit.value = "";
                 unlockInput(real);
                 _textareaSetter?.call(real, out);
-                real.dispatchEvent(new Event("input",  { bubbles: true }));
+                real.dispatchEvent(new Event("input", { bubbles: true }));
                 real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, 80));
                 btn.click();
-                return false;
             } catch (e) {
                 console.error("[Bale Bridge] Edit encrypt failed:", e);
                 secureEdit.value = prev;
                 alert("Encryption failed!");
-                return false;
             } finally {
                 secureEdit._isSending = false;
             }
@@ -824,7 +862,7 @@
             t.closest('[data-testid="confirm-button"]') ||
             (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
 
-        const _editClickHandler = (e) => {
+        const editClickHandler = (e) => {
             const btn = isConfirmBtn(e.target);
             if (!btn || !secureEdit.value.trim()) return;
             if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
@@ -832,24 +870,24 @@
             e.stopPropagation();
             encryptAndForward(btn);
         };
-        document.addEventListener("click",     _editClickHandler, true);
-        document.addEventListener("mousedown", _editClickHandler, true);
+        document.addEventListener("click", editClickHandler, true);
+        document.addEventListener("mousedown", editClickHandler, true);
 
-        const _editObserver = new MutationObserver(() => {
+        const editObserver = new MutationObserver(() => {
             if (!document.contains(secureEdit)) {
-                document.removeEventListener("click",     _editClickHandler, true);
-                document.removeEventListener("mousedown", _editClickHandler, true);
-                _editObserver.disconnect();
+                document.removeEventListener("click", editClickHandler, true);
+                document.removeEventListener("mousedown", editClickHandler, true);
+                editObserver.disconnect();
             }
         });
-        _editObserver.observe(document.body, { childList: true, subtree: true });
+        editObserver.observe(document.body, { childList: true, subtree: true });
 
         secureEdit.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 e.stopPropagation();
                 const btn = document.querySelector('[data-testid="confirm-button"]') ||
-                            document.querySelector('button[aria-label="Send"]:not(#chat_footer button)');
+                    document.querySelector('button[aria-label="Send"]:not(#chat_footer button)');
                 if (btn) encryptAndForward(btn);
             }
         });
@@ -862,18 +900,19 @@
     };
     const isSendBtn = (t) => !!t.closest('[aria-label="send-button"]');
 
-    // Left-click send button: always attempt encrypted (opens modal if no key).
     document.addEventListener("mousedown", (e) => {
         if (e.button !== 0 || isSending || !isSendBtn(e.target)) return;
+        // Only intercept when encryption is enabled
+        if (!isEncryptionEnabled()) return;
         if (!getSecureText()) return;
         e.preventDefault();
         e.stopPropagation();
         window._bbSend?.(true);
     }, true);
 
-    // Right-click / long-press send button: show context menu (only escape hatch for plaintext).
     document.addEventListener("contextmenu", (e) => {
-        if (!isSendBtn(e.target) || isSending || !getSecureText()) return;
+        if (!isSendBtn(e.target) || isSending) return;
+        if (!isEncryptionEnabled() || !getSecureText()) return;
         e.preventDefault();
         e.stopPropagation();
         showMenu(e.clientX, e.clientY);
@@ -881,16 +920,15 @@
 
     let touchTimer;
     document.addEventListener("touchstart", (e) => {
-        if (!isSendBtn(e.target) || isSending || !getSecureText()) return;
+        if (!isSendBtn(e.target) || isSending) return;
+        if (!isEncryptionEnabled() || !getSecureText()) return;
         touchTimer = setTimeout(() => {
             e.preventDefault();
             showMenu(e.touches[0].clientX, e.touches[0].clientY);
         }, 500);
     }, { passive: false, capture: true });
-
-    const clearTouchTimer = () => clearTimeout(touchTimer);
-    document.addEventListener("touchend",  clearTouchTimer, true);
-    document.addEventListener("touchmove", clearTouchTimer, true);
+    document.addEventListener("touchend", () => clearTimeout(touchTimer), true);
+    document.addEventListener("touchmove", () => clearTimeout(touchTimer), true);
 
     // ─── 10. MutationObserver & SPA URL Tracker ───────────────────────────────
     let scanTO, lastUrl = location.href;
@@ -902,7 +940,7 @@
             ensureEditInput();
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
-                _settingsCache   = null;
+                _settingsCache = null;
                 _settingsCacheId = null;
                 syncInputVisibility();
             }
