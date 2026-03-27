@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor/Decryptor (Ultimate Privacy)
 // @namespace    http://tampermonkey.net/
-// @version      10.0
+// @version      10.1
 // @description  Per-chat keys, Shield button, Material UI, Auto-decrypt, Draft blocker. Desktop & Mobile.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -24,16 +24,26 @@
 		const p = new URLSearchParams(location.search);
 		return (p.get("uid") || p.get("groupId") || p.get("channelId") || location.pathname.split("/").pop() || "global");
 	};
+
+	// OPT: lightweight two-field memory cache — avoids localStorage.getItem +
+	//      JSON.parse on every DOM-scan, keystroke, and send call.
+	let _settingsCacheId = null, _settingsCache = null;
 	const getChatSettings = () => {
-		const s = localStorage.getItem("bale_bridge_settings_" + getChatId());
-		return s ? JSON.parse(s) : {
-			enabled: true,
-			customKey: ""
-		};
+		const id = getChatId();
+		if (id === _settingsCacheId && _settingsCache !== null) return _settingsCache;
+		const s = localStorage.getItem("bale_bridge_settings_" + id);
+		_settingsCache = s ? JSON.parse(s) : { enabled: true, customKey: "" };
+		_settingsCacheId = id;
+		return _settingsCache;
 	};
-	const saveChatSettings = (s) => localStorage.setItem("bale_bridge_settings_" + getChatId(), JSON.stringify(s), );
+	const saveChatSettings = (s) => {
+		const id = getChatId();
+		_settingsCache = s;
+		_settingsCacheId = id;
+		localStorage.setItem("bale_bridge_settings_" + id, JSON.stringify(s));
+	};
 	// ─── 2. Crypto Engine ─────────────────────────────────────────────────────
-	const GLOBAL_KEY = "G6f$b&qyA1%JGT$t5b0Y*15RwN!6B1vg";
+	const GLOBAL_KEY = "g6F$b&qyA1%JgT$t5b0Y*15RwN!6B1vg";
 	const keyCache = new Map();
 	async function getCryptoKey(k = GLOBAL_KEY) {
 		if (keyCache.has(k)) return keyCache.get(k);
@@ -54,19 +64,22 @@
 	const B85 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
 	const B85D = new Map([...B85].map((c, i) => [c, i]));
 
+	// OPT: replaced prepend-string loop (`chunk = B85[x] + chunk`) with an
+	//      index-assigned fixed-length array.  Prepending a string copies all
+	//      existing characters on every iteration (O(n²) per chunk); assigning
+	//      by index is O(1) per character.
 	function b85enc(buf) {
 		let out = "";
 		for (let i = 0; i < buf.length; i += 4) {
-			let acc = 0,
-				rem = Math.min(4, buf.length - i);
+			let acc = 0, rem = Math.min(4, buf.length - i);
 			for (let j = 0; j < 4; j++) acc = (acc << 8) | (i + j < buf.length ? buf[i + j] : 0);
 			acc >>>= 0;
-			let chunk = "";
-			for (let j = 0; j < 5; j++) {
-				chunk = B85[acc % 85] + chunk;
+			const chunk = new Array(5);
+			for (let j = 4; j >= 0; j--) {
+				chunk[j] = B85[acc % 85];
 				acc = Math.floor(acc / 85);
 			}
-			out += rem < 4 ? chunk.slice(0, rem + 1) : chunk;
+			out += rem < 4 ? chunk.slice(0, rem + 1).join("") : chunk.join("");
 		}
 		return out;
 	}
@@ -75,8 +88,7 @@
 		str = str.replace(/\s/g, "");
 		const out = [];
 		for (let i = 0; i < str.length; i += 5) {
-			let chunk = str.slice(i, i + 5),
-				pad = 5 - chunk.length;
+			let chunk = str.slice(i, i + 5), pad = 5 - chunk.length;
 			chunk = chunk.padEnd(5, "~");
 			let acc = 0;
 			for (let j = 0; j < 5; j++) acc = acc * 85 + B85D.get(chunk[j]);
@@ -119,8 +131,7 @@
 		if (!text.startsWith("@@")) return text;
 		try {
 			const buf = b85dec(text.slice(2));
-			const iv = buf.slice(0, 12),
-				data = buf.slice(12);
+			const iv = buf.slice(0, 12), data = buf.slice(12);
 			const s = getChatSettings();
 			let plain;
 			try {
@@ -158,8 +169,11 @@
 	// ─── 2c. Render Decrypted (Discord-grade markdown + RTL/LTR bidi + links) ──
 	const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
 
+	// OPT: single-pass regex with a lookup table replaces four separate
+	//      .replace() calls, each of which scanned the entire string.
+	const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
 	function escapeHtml(s) {
-		return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+		return s.replace(/[&<>"]/g, c => _ESC_MAP[c]);
 	}
 
 	function applyInlineMarkdown(s) {
@@ -264,12 +278,28 @@
 			if (el._isDecrypted || el._isDecrypting) continue;
 			const text = el.textContent.trim();
 			if (!text.startsWith("@@") || text.length <= 20) continue;
-			if ([...el.children].some((c) => c.textContent.trim() === text)) continue;
+			// OPT: replaced `[...el.children].some(...)` which spreads the live
+			//      HTMLCollection into a new Array on every visited element.
+			//      A for...of loop over the collection avoids that allocation.
+			let skip = false;
+			for (const c of el.children) {
+				if (c.textContent.trim() === text) { skip = true; break; }
+			}
+			if (skip) continue;
 			el._isDecrypting = true;
 			decrypt(text).then((plain) => {
 				if (plain !== text) {
-					const badge = `<span style="display:inline-block;margin-top:4px;font-size:10px;` + `opacity:0.5;letter-spacing:0.03em;font-style:italic">🔒 encrypted</span>`;
-					el.innerHTML = renderDecrypted(plain) + "<br>" + badge;
+					// Contain decrypted content — skip if already applied
+					if (!el._bbOverflowSet) {
+						el.style.overflow = "hidden";
+						el.style.overflowWrap = "anywhere";
+						el.style.wordBreak = "break-word";
+						el.style.maxWidth = "100%";
+						el._bbOverflowSet = true;
+					}
+					// Compact badge: inline lock + label, no extra line
+					const badge = `<span style="display:inline-block;font-size:9px;` + `opacity:0.4;letter-spacing:0.02em;font-style:italic;margin-inline-start:5px;vertical-align:middle;line-height:1;white-space:nowrap">🔒 encrypted</span>`;
+					el.innerHTML = renderDecrypted(plain) + badge;
 					el.style.color = "inherit";
 					el._isDecrypted = true;
 				}
@@ -287,21 +317,7 @@
 	// trigger onChange on controlled inputs.
 	const _textareaSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value", )?.set;
 
-	function reactSet(el, value) {
-		if (isMobileInput(el)) {
-			_textareaSetter?.call(el, value);
-		} else {
-			el.focus();
-			document.execCommand("selectAll", false, null);
-			document.execCommand("insertText", false, value);
-		}
-		el.dispatchEvent(new Event("input", {
-			bubbles: true
-		}));
-		el.dispatchEvent(new Event("change", {
-			bubbles: true
-		}));
-	}
+
 	// ─── 5. Styles ────────────────────────────────────────────────────────────
 	document.addEventListener("click", (e) => {
 		const sp = e.target.closest(".bb-spoiler");
@@ -448,9 +464,7 @@
 		};
 	}
 	// ─── 8. Secure Input & Shield Button ──────────────────────────────────────
-	let isSending = false,
-		lastHasText = false,
-		isSyncing = false;
+	let isSending = false, lastHasText = false, isSyncing = false;
 	const lockInput = (el) => Object.assign(el.style, {
 		position: "absolute",
 		opacity: "0",
@@ -724,50 +738,49 @@
 			secureEdit.value = existing;
 		}
 
-
 		// ── Intercept every submit / confirm button inside the same dialog ──
-const encryptAndForward = async (btn) => {
-    if (secureEdit._isSending) return false;
-    const text = secureEdit.value.trim();
-    if (!text) return true; // nothing to encrypt, let it pass
-    secureEdit._isSending = true;
-    const prev = secureEdit.value;
-    secureEdit.value = "🔒 Encrypting...";
-    try {
-        const out = await encrypt(text);
-        secureEdit.value = "";
-        unlockInput(real);
-        _textareaSetter?.call(real, out);
-        real.dispatchEvent(new Event("input", { bubbles: true }));
-        real.dispatchEvent(new Event("change", { bubbles: true }));
-        await new Promise(r => setTimeout(r, 80));
-        btn.click();
-        return false;
-    } catch (e) {
-        console.error("[Bale Bridge] Edit encrypt failed:", e);
-        secureEdit.value = prev;
-        alert("Encryption failed!");
-        return false;
-    } finally {
-        secureEdit._isSending = false;
-    }
-};
+		const encryptAndForward = async (btn) => {
+			if (secureEdit._isSending) return false;
+			const text = secureEdit.value.trim();
+			if (!text) return true; // nothing to encrypt, let it pass
+			secureEdit._isSending = true;
+			const prev = secureEdit.value;
+			secureEdit.value = "🔒 Encrypting...";
+			try {
+				const out = await encrypt(text);
+				secureEdit.value = "";
+				unlockInput(real);
+				_textareaSetter?.call(real, out);
+				real.dispatchEvent(new Event("input", { bubbles: true }));
+				real.dispatchEvent(new Event("change", { bubbles: true }));
+				await new Promise(r => setTimeout(r, 80));
+				btn.click();
+				return false;
+			} catch (e) {
+				console.error("[Bale Bridge] Edit encrypt failed:", e);
+				secureEdit.value = prev;
+				alert("Encryption failed!");
+				return false;
+			} finally {
+				secureEdit._isSending = false;
+			}
+		};
 
-const isConfirmBtn = (t) =>
-    t.closest('[data-testid="confirm-button"]') ||
-    (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
+		const isConfirmBtn = (t) =>
+			t.closest('[data-testid="confirm-button"]') ||
+			(t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
 
-const _editClickHandler = (e) => {
-    const btn = isConfirmBtn(e.target);
-    if (!btn) return;
-    if (!secureEdit.value.trim()) return;
-    if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
-    e.preventDefault();
-    e.stopPropagation();
-    encryptAndForward(btn);
-};
-document.addEventListener("click", _editClickHandler, true);
-document.addEventListener("mousedown", _editClickHandler, true);
+		const _editClickHandler = (e) => {
+			const btn = isConfirmBtn(e.target);
+			if (!btn) return;
+			if (!secureEdit.value.trim()) return;
+			if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
+			e.preventDefault();
+			e.stopPropagation();
+			encryptAndForward(btn);
+		};
+		document.addEventListener("click", _editClickHandler, true);
+		document.addEventListener("mousedown", _editClickHandler, true);
 
 		// Cleanup when the overlay is removed from DOM
 		const _editObserver = new MutationObserver(() => {
@@ -829,8 +842,7 @@ document.addEventListener("mousedown", _editClickHandler, true);
 	document.addEventListener("touchend", () => clearTimeout(touchTimer), true);
 	document.addEventListener("touchmove", () => clearTimeout(touchTimer), true);
 	// ─── 10. MutationObserver & SPA URL Tracker ───────────────────────────────
-	let scanTO = null,
-		lastUrl = location.href;
+	let scanTO = null, lastUrl = location.href;
 	new MutationObserver(() => {
 		clearTimeout(scanTO);
 		scanTO = setTimeout(() => {
@@ -839,6 +851,10 @@ document.addEventListener("mousedown", _editClickHandler, true);
 			ensureEditInput();
 			if (location.href !== lastUrl) {
 				lastUrl = location.href;
+				// OPT: invalidate settings cache on navigation so getChatSettings()
+				//      re-reads the correct per-chat entry from localStorage.
+				_settingsCache = null;
+				_settingsCacheId = null;
 				syncInputVisibility();
 			}
 		}, 100);
