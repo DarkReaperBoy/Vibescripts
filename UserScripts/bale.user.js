@@ -220,12 +220,12 @@
         return parts.join("");
     }
 
-    function renderDecrypted(plain) {
+function renderDecrypted(plain) {
         const lines = plain.split("\n");
-        const out = [];
+        const out =[];
         let i = 0;
         const bidiBlock = (html) =>
-            `<span dir="auto" style="display:block;unicode-bidi:plaintext">${html}</span>`;
+            `<span dir="auto" class="bb-block">${html}</span>`;
 
         while (i < lines.length) {
             const line = lines[i];
@@ -233,35 +233,35 @@
                 const qLines = [];
                 while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">"))
                     qLines.push(lines[i++].replace(/^> ?/, ""));
-                out.push(`<span dir="auto" style="display:block;border-inline-start:3px solid var(--color-primary-p-50,#00ab80);padding:2px 10px;margin:2px 0;font-style:italic;opacity:.9;unicode-bidi:plaintext">${qLines.map(processLine).join("<br>")}</span>`);
+                out.push(`<span dir="auto" class="bb-quote">${qLines.map(processLine).join("<br>")}</span>`);
                 continue;
             }
             if (/^[-*+] /.test(line)) {
-                const items = [];
+                const items =[];
                 while (i < lines.length && /^[-*+] /.test(lines[i]))
-                    items.push(`<li style="margin:2px 0;padding-inline-start:2px">${processLine(lines[i++].slice(2))}</li>`);
-                out.push(`<ul dir="auto" style="margin:4px 0;padding-inline-start:22px;list-style:disc;unicode-bidi:plaintext">${items.join("")}</ul>`);
+                    items.push(`<li class="bb-li">${processLine(lines[i++].slice(2))}</li>`);
+                out.push(`<ul dir="auto" class="bb-ul">${items.join("")}</ul>`);
                 continue;
             }
             if (/^\d+\. /.test(line)) {
-                const items = [];
+                const items =[];
                 while (i < lines.length && /^\d+\. /.test(lines[i]))
-                    items.push(`<li style="margin:2px 0;padding-inline-start:2px">${processLine(lines[i++].replace(/^\d+\. /, ""))}</li>`);
-                out.push(`<ol dir="auto" style="margin:4px 0;padding-inline-start:22px;list-style:decimal;unicode-bidi:plaintext">${items.join("")}</ol>`);
+                    items.push(`<li class="bb-li">${processLine(lines[i++].replace(/^\d+\. /, ""))}</li>`);
+                out.push(`<ol dir="auto" class="bb-ol">${items.join("")}</ol>`);
                 continue;
             }
             const hm = line.match(/^(#{1,3}) (.+)/);
             if (hm) {
-                const sz = ["1.25em", "1.1em", "1em"][Math.min(hm[1].length, 3) - 1];
+                const sz =["1.25em", "1.1em", "1em"][Math.min(hm[1].length, 3) - 1];
                 out.push(bidiBlock(`<span style="font-weight:700;font-size:${sz}">${processLine(hm[2])}</span>`));
                 i++; continue;
             }
             if (/^([-*_])\1{2,}$/.test(line.trim())) {
-                out.push(`<span style="display:block;border-top:1px solid var(--color-neutrals-n-100,#ccc);margin:6px 0"></span>`);
+                out.push(`<span class="bb-hr"></span>`);
                 i++; continue;
             }
             if (line.trim() === "") {
-                out.push(`<span style="display:block;height:.4em"></span>`);
+                out.push(`<span class="bb-spacer"></span>`);
                 i++; continue;
             }
             out.push(bidiBlock(processLine(line)));
@@ -292,33 +292,16 @@
             el._isDecrypting = true;
 decrypt(trimmed).then((plain) => {
                 if (plain !== trimmed) {
-                    // Check if we are inside a Reply Preview or the Sidebar's chat list
-                    const isPreview = el.closest && (el.closest('[data-sentry-component="Preview"]') || el.closest('.dialog-item-content'));
-
-                    if (isPreview) {
-                        // Compact, clamped view for previews (max 2 lines)
-                        el.style.display = "-webkit-box";
-                        el.style.webkitLineClamp = "2";
-                        el.style.webkitBoxOrient = "vertical";
+                    if (!el._bbOverflowSet) {
                         el.style.overflow = "hidden";
-                        el.style.whiteSpace = "normal";
+                        el.style.overflowWrap = "anywhere";
                         el.style.wordBreak = "break-word";
-                        // Collapse all newlines and spaces into single spaces
-                        el.textContent = plain.replace(/\s+/g, ' '); 
-                        el.innerHTML += ` <span style="font-size:10px;opacity:0.6">🔒</span>`;
-                    } else {
-                        // Full rich formatting view for normal messages
-                        if (!el._bbOverflowSet) {
-                            el.style.overflow = "hidden";
-                            el.style.overflowWrap = "anywhere";
-                            el.style.wordBreak = "break-word";
-                            el.style.maxWidth = "100%";
-                            el._bbOverflowSet = true;
-                        }
-                        el.innerHTML = renderDecrypted(plain) +
-                            `<span style="display:inline-block;font-size:9px;opacity:0.4;letter-spacing:0.02em;font-style:italic;margin-inline-start:5px;vertical-align:middle;line-height:1;white-space:nowrap">🔒 encrypted</span>`;
+                        el.style.maxWidth = "100%";
+                        el.classList.add("bb-msg-container");
+                        el._bbOverflowSet = true;
                     }
-                    
+                    el.innerHTML = renderDecrypted(plain) +
+                        `<span style="display:inline-block;font-size:9px;opacity:0.4;letter-spacing:0.02em;font-style:italic;margin-inline-start:5px;vertical-align:middle;line-height:1;white-space:nowrap">🔒 encrypted</span>`;
                     el.style.color = "inherit";
                     el._isDecrypted = true;
                 }
@@ -428,9 +411,44 @@ decrypt(trimmed).then((plain) => {
         .bb-key-meta{display:flex;justify-content:space-between;align-items:center;margin-top:6px;font-size:11px}
         .bb-key-counter{color:var(--color-neutrals-n-300,#888)}
         .bb-key-counter.exact{color:var(--color-primary-p-50,#00ab80);font-weight:600}
-        .bb-key-error{color:#d32f2f;font-weight:500;font-size:11px;min-height:16px}
+.bb-key-error{color:#d32f2f;font-weight:500;font-size:11px;min-height:16px}
         @keyframes bb-fade{from{opacity:0}to{opacity:1}}
         @keyframes bb-pop{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+
+        .bb-block { display: block; unicode-bidi: plaintext; }
+        .bb-quote { display: block; border-inline-start: 3px solid var(--color-primary-p-50,#00ab80); padding: 2px 10px; margin: 2px 0; font-style: italic; opacity: 0.9; unicode-bidi: plaintext; }
+        .bb-ul { margin: 4px 0; padding-inline-start: 22px; list-style: disc; unicode-bidi: plaintext; }
+        .bb-ol { margin: 4px 0; padding-inline-start: 22px; list-style: decimal; unicode-bidi: plaintext; }
+        .bb-li { margin: 2px 0; padding-inline-start: 2px; }
+        .bb-hr { display: block; border-top: 1px solid var(--color-neutrals-n-100,#ccc); margin: 6px 0; }
+        .bb-spacer { display: block; height: 0.4em; }
+
+        /* Smart Compact mode for Reply Previews & Sidebar */
+        .BAsWs0 .bb-block, .MRlMpm .bb-block, .dialog-item-content .bb-block, .aqFHpt .bb-block,
+        .BAsWs0 .bb-quote, .MRlMpm .bb-quote, .dialog-item-content .bb-quote, .aqFHpt .bb-quote,
+        .BAsWs0 .bb-ul, .MRlMpm .bb-ul, .dialog-item-content .bb-ul, .aqFHpt .bb-ul,
+        .BAsWs0 .bb-ol, .MRlMpm .bb-ol, .dialog-item-content .bb-ol, .aqFHpt .bb-ol,
+        .BAsWs0 .bb-li, .MRlMpm .bb-li, .dialog-item-content .bb-li, .aqFHpt .bb-li {
+            display: inline !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: none !important;
+        }
+        .BAsWs0 .bb-spacer, .MRlMpm .bb-spacer, .dialog-item-content .bb-spacer, .aqFHpt .bb-spacer,
+        .BAsWs0 .bb-hr, .MRlMpm .bb-hr, .dialog-item-content .bb-hr, .aqFHpt .bb-hr {
+            display: none !important;
+        }
+        .BAsWs0 .bb-li::after, .MRlMpm .bb-li::after, .dialog-item-content .bb-li::after, .aqFHpt .bb-li::after {
+            content: " \\00a0•\\00a0 ";
+        }
+        
+        /* Apply 2-line clamp to the whole preview automatically */
+        .BAsWs0 .bb-msg-container, .MRlMpm .bb-msg-container, .dialog-item-content .bb-msg-container, .aqFHpt .bb-msg-container {
+            display: -webkit-box !important;
+            -webkit-line-clamp: 2 !important;
+            -webkit-box-orient: vertical !important;
+            white-space: normal !important;
+        }
     </style>`);
 
     // ─── 6. Context Menu ──────────────────────────────────────────────────────
