@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge Encryptor/Decryptor (Ultimate Privacy)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Per-chat encryption keys, Shield button, Markdown UI, Auto-decrypt, Draft blocker. Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -358,9 +358,9 @@ function openSettings() {
 
 // ── Shield icons ──
 const ICONS = {
-    active: `<svg width="24" height="24" fill="#00ab80" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>`,
-    missingKey: `<svg width="24" height="24" fill="#d32f2f" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h1.39v4.19H10.6v-4.19H12zM12 9.17c-.77 0-1.39-.62-1.39-1.39 0-.77.62-1.39 1.39-1.39.77 0 1.39.62 1.39 1.39 0 .77-.62 1.39-1.39 1.39z"/></svg>`,
-    disabled: `<svg width="24" height="24" fill="#888" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 19.93c-3.95-1.17-6.9-5.11-7.7-9.43l7.7-3.42 7.7 3.42c-.8 4.32-3.75 8.26-7.7 9.43z"/></svg>`
+    active: `<svg viewBox="0 0 24 24" fill="#00ab80"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>`,
+    missingKey: `<svg viewBox="0 0 24 24" fill="#d32f2f"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h1.39v4.19H10.6v-4.19H12zM12 9.17c-.77 0-1.39-.62-1.39-1.39 0-.77.62-1.39 1.39-1.39.77 0 1.39.62 1.39 1.39 0 .77-.62 1.39-1.39 1.39z"/></svg>`,
+    disabled: `<svg viewBox="0 0 24 24" fill="#888"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 19.93c-3.95-1.17-6.9-5.11-7.7-9.43l7.7-3.42 7.7 3.42c-.8 4.32-3.75 8.26-7.7 9.43z"/></svg>`
 };
 
 // ── Find elements (cross-platform) ──
@@ -373,7 +373,6 @@ function findInputContainer() {
 }
 
 function findInputWrapper() {
-    // The scrollable wrapper that contains the textarea
     return document.querySelector(".input-message-input.scrollable");
 }
 
@@ -404,7 +403,6 @@ function setSendButtonState(hasText) {
         if (mic) mic.setAttribute("hidden", "true");
         let send = btn.querySelector(".rbico-send");
         if (send) send.removeAttribute("hidden");
-        // Handle ripple visibility for mobile
         let rrRipple = btn.querySelector(".rr.c-ripple");
         let ttRipple = btn.querySelector(".tt.c-ripple");
         if (rrRipple) rrRipple.removeAttribute("hidden");
@@ -446,7 +444,6 @@ function refreshUI() {
         else { shieldBtn.innerHTML = ICONS.disabled; shieldBtn.title = "Encryption Disabled - Click to enable"; }
     }
 
-    // For mobile, the textarea IS the input (no separate scrollable wrapper)
     let hideTarget = inputWrapper || textarea;
 
     if (on) {
@@ -513,6 +510,62 @@ button.toggle-emoticons { display: none !important; }
     overflow: hidden !important;
 }
 
+/* ── Shield button — dynamic hitbox per platform ── */
+#bb-settings-btn.bb-shield-btn {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    margin: 0;
+    position: relative;
+    box-sizing: border-box;
+}
+
+/* Invisible expanded touch target via pseudo-element */
+#bb-settings-btn.bb-shield-btn::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    /* Desktop: modest expansion */
+    width: 48px;
+    height: 48px;
+    min-width: 48px;
+    min-height: 48px;
+}
+
+/* SVG icon sizing — desktop */
+#bb-settings-btn.bb-shield-btn svg {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
+/* Mobile: larger visible button + much larger touch target */
+.is-mobile #bb-settings-btn.bb-shield-btn {
+    width: 52px;
+    height: 52px;
+    min-width: 52px;
+    min-height: 52px;
+}
+
+.is-mobile #bb-settings-btn.bb-shield-btn::after {
+    width: 64px;
+    height: 64px;
+    min-width: 64px;
+    min-height: 64px;
+}
+
+/* SVG icon sizing — mobile */
+.is-mobile #bb-settings-btn.bb-shield-btn svg {
+    width: 28px;
+    height: 28px;
+}
+
 /* Secure input overlay */
 #secure-input-overlay {
     flex: 1; width: 100%; box-sizing: border-box;
@@ -538,17 +591,13 @@ button.toggle-emoticons { display: none !important; }
     color: #888; pointer-events: none; display: block;
 }
 
-/* Mobile adjustments */
+/* Mobile adjustments for overlay */
 .is-mobile #secure-input-overlay {
     min-height: 36px;
     padding: 8px 12px;
-    font-size: 16px; /* prevent iOS zoom */
+    font-size: 16px;
     border-radius: 20px;
     margin: 3px 0;
-}
-.is-mobile #bb-settings-btn {
-    width: 36px !important;
-    height: 36px !important;
 }
 
 /* No-key warning notice */
@@ -701,7 +750,6 @@ document.addEventListener("touchstart", e => {
 
     touchHandled = false;
 
-    // Long press for context menu
     longPressTimer = setTimeout(() => {
         touchHandled = true;
         e.preventDefault();
@@ -722,7 +770,6 @@ document.addEventListener("touchend", e => {
         return;
     }
 
-    // Normal tap = encrypted send
     e.preventDefault();
     e.stopPropagation();
     window._bbSendMessage?.(true);
@@ -733,12 +780,10 @@ document.addEventListener("touchmove", () => {
     touchHandled = false;
 }, true);
 
-// ── Also intercept click on send button (mobile sometimes fires click after touch) ──
 document.addEventListener("click", e => {
     if (isSendTarget(e.target) && !isSending && isEnabled() && overlayHasContent()) {
         e.preventDefault();
         e.stopPropagation();
-        // Don't double-send; touchend already handles it
     }
 }, true);
 
@@ -811,15 +856,25 @@ function injectUI() {
         let emojiBtn = findEmojiButton();
         let shieldBtn = document.createElement("button");
         shieldBtn.id = "bb-settings-btn";
-        shieldBtn.className = "btn-icon rp";
-        shieldBtn.style.cssText = "display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all 0.2s;background:none;border:none;outline:none;width:44px;height:44px;flex-shrink:0;";
+        shieldBtn.className = "btn-icon rp bb-shield-btn";
+        shieldBtn.style.cssText = [
+            "display:flex",
+            "align-items:center",
+            "justify-content:center",
+            "cursor:pointer",
+            "transition:all 0.2s",
+            "background:none",
+            "border:none",
+            "outline:none",
+            "flex-shrink:0",
+            "position:relative",
+            "box-sizing:border-box"
+        ].join(";") + ";";
         shieldBtn.onclick = openSettings;
 
-        // On mobile, emoji button might be inside new-message-wrapper
         if (emojiBtn?.parentElement) {
             emojiBtn.parentElement.insertBefore(shieldBtn, emojiBtn);
         } else {
-            // Fallback: insert into new-message-wrapper or input-message-container
             let wrapper = findNewMessageWrapper() || inputContainer;
             wrapper.insertBefore(shieldBtn, wrapper.firstChild);
         }
@@ -837,7 +892,6 @@ function injectUI() {
                 <br>
                 <button class="bb-notice-btn" id="bb-notice-set-key">🛡 Set Encryption Key</button>
             </div>`;
-        // Insert before the input wrapper or textarea
         let insertTarget = inputWrapper || textarea;
         insertTarget.parentElement.insertBefore(notice, insertTarget);
         notice.querySelector("#bb-notice-set-key").onclick = openSettings;
@@ -862,7 +916,6 @@ function injectUI() {
         });
     }
 
-    // Also block the parent scrollable input wrapper on mobile
     if (inputWrapper && !inputWrapper._hasStrictHijack) {
         inputWrapper._hasStrictHijack = true;
         inputWrapper.addEventListener("focus", e => {
@@ -886,13 +939,10 @@ function injectUI() {
     secureInput.dir = "auto";
     secureInput.dataset.placeholder = "🔒 پیام امن...";
 
-    // Insert the overlay into the DOM
-    // On mobile, insert next to the textarea's container
     let insertParent = inputWrapper?.parentElement || textarea.parentElement;
     let insertBefore = inputWrapper || textarea;
     insertParent.insertBefore(secureInput, insertBefore);
 
-    // Prevent event propagation on the secure input
     ["keydown", "keypress", "keyup", "paste", "drop"].forEach(evt => {
         secureInput.addEventListener(evt, e => { e.stopPropagation(); });
     });
@@ -903,7 +953,6 @@ function injectUI() {
     function syncHasContent(has) {
         if (has !== hasContent) {
             hasContent = has;
-            // We need to make the real textarea think there's content for the send button
             textarea.textContent = has ? "." : "";
             textarea.dispatchEvent(new Event("input", { bubbles: true }));
             setSendButtonState(has);
@@ -913,7 +962,6 @@ function injectUI() {
     async function injectAndSend(msgText) {
         isBypass = true;
 
-        // Unhide the real input temporarily
         let hideTarget = inputWrapper || textarea;
         hideTarget.classList.remove("rb-locked-input");
         hideTarget.style.cssText = "position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
@@ -927,7 +975,6 @@ function injectUI() {
         textarea.dispatchEvent(new KeyboardEvent("keydown", enterEvt));
         textarea.dispatchEvent(new KeyboardEvent("keyup", enterEvt));
 
-        // Wait for send button to be ready
         let sendBtn = null;
         for (let attempt = 0; attempt < 20; attempt++) {
             await delay(50);
@@ -947,7 +994,6 @@ function injectUI() {
             sendBtn.dispatchEvent(new MouseEvent("click", evtOpts));
             sendBtn.click();
 
-            // On mobile, also try touching the send ripple
             if (isMobile()) {
                 let ripple = sendBtn.querySelector(".rr.c-ripple");
                 if (ripple) {
@@ -959,7 +1005,6 @@ function injectUI() {
                 }
             }
         } else {
-            // Fallback: fire Enter on textarea
             textarea.focus();
             ["keydown", "keypress", "keyup"].forEach(name => {
                 textarea.dispatchEvent(new KeyboardEvent(name, enterEvt));
@@ -968,13 +1013,11 @@ function injectUI() {
 
         await delay(300);
 
-        // Clear textarea
         textarea.focus();
         document.execCommand("selectAll", false, null);
         document.execCommand("insertText", false, "");
         textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
-        // Restore locked state
         hideTarget.style.cssText = "";
         hideTarget.classList.add("rb-locked-input");
         isBypass = false;
@@ -1058,13 +1101,11 @@ function injectUI() {
             decryptMessages();
             injectUI();
 
-            // Keep send button in sync
             if (isEnabled() && !isSending) {
                 let ov = document.getElementById("secure-input-overlay");
                 if (ov) setSendButtonState(ov.innerText.trim().length > 0);
             }
 
-            // Handle navigation
             if (location.href !== lastHref) {
                 lastHref = location.href;
                 cachedSettings = null;
