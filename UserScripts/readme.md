@@ -6,8 +6,9 @@
 - [Glwiz](http://glwiz.com/) - [userscript](https://raw.githubusercontent.com/DarkReaperBoy/Userscript/refs/heads/main/UserScripts/glwiz.user.js)
 - [OneTV](https://webapp.onetv.app/)
 
-# Persian Chat:
-- [Bale.ai](https://web.bale.ai) - [userscript](https://raw.githubusercontent.com/DarkReaperBoy/Userscript/refs/heads/main/UserScripts/bale.user.js)
+# Persian Chat (secured as could, alpha quality):
+- [Bale](https://web.bale.ai) - [userscript](https://raw.githubusercontent.com/DarkReaperBoy/Userscript/refs/heads/main/UserScripts/bale.user.js)
+- [Rubika](https://web.rubika.ir/) - [userscript](https://raw.githubusercontent.com/DarkReaperBoy/Vibescripts/refs/heads/main/UserScripts/rubika.user.js)
 
 -----------
 N/A:
