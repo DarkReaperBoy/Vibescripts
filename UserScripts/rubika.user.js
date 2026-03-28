@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge Encryptor/Decryptor (Ultimate Privacy)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.3
 // @description  Per-chat encryption keys, Shield button, Markdown UI, Auto-decrypt, Draft blocker. Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -20,12 +20,10 @@ const URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
 let cachedChatId = null;
 let cachedSettings = null;
 
-// ── Platform detection ──
 function isMobile() {
     return document.body.classList.contains("is-mobile");
 }
 
-// ── Chat ID ──
 function getChatId() {
     let h = location.hash;
     if (h.startsWith("#c=")) return h.slice(3);
@@ -33,7 +31,6 @@ function getChatId() {
     return p.get("uid") || p.get("groupId") || p.get("channelId") || location.pathname.split("/").pop() || "global";
 }
 
-// ── Settings ──
 function getSettings() {
     let id = getChatId();
     if (id === cachedChatId && cachedSettings !== null) return cachedSettings;
@@ -59,7 +56,42 @@ function isEnabled() {
     return getSettings().enabled;
 }
 
-// ── Crypto helpers ──
+// ── Try all stored keys for preview decryption ──
+function getAllStoredKeys() {
+    let keys = new Set();
+    let current = getKey();
+    if (current) keys.add(current);
+    for (let i = 0; i < localStorage.length; i++) {
+        let k = localStorage.key(i);
+        if (k && k.startsWith(SETTINGS_PREFIX)) {
+            try {
+                let s = JSON.parse(localStorage.getItem(k));
+                if (s && s.enabled && s.customKey && s.customKey.length === 32) {
+                    keys.add(s.customKey);
+                }
+            } catch {}
+        }
+    }
+    return [...keys];
+}
+
+async function tryDecryptWithAllKeys(text) {
+    if (!text.startsWith("@@")) return text;
+    let keys = getAllStoredKeys();
+    if (!keys.length) return text;
+    for (let k of keys) {
+        try {
+            let data = base85decode(text.slice(2));
+            let iv = data.subarray(0, 12);
+            let ct = data.subarray(12);
+            let aesKey = await deriveKey(k);
+            let dec = await crypto.subtle.decrypt({ name: ALGO, iv }, aesKey, ct);
+            return await decompress(new Uint8Array(dec));
+        } catch {}
+    }
+    return text;
+}
+
 const keyCache = new Map();
 
 async function deriveKey(k) {
@@ -87,7 +119,6 @@ async function decompress(data) {
     return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
 }
 
-// ── Base85 ──
 const B85_DECODE = new Uint8Array(128);
 for (let i = 0; i < BASE85_CHARS.length; i++) B85_DECODE[BASE85_CHARS.charCodeAt(i)] = i;
 
@@ -126,7 +157,6 @@ function base85decode(str) {
     return out.subarray(0, idx);
 }
 
-// ── Encrypt / Decrypt ──
 async function encrypt(text) {
     let k = getKey();
     if (!k) return null;
@@ -167,7 +197,6 @@ async function splitEncrypt(text) {
     return a && b ? [...a, ...b] : null;
 }
 
-// ── Markdown rendering ──
 function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 
 function renderInline(s) {
@@ -248,7 +277,6 @@ function renderMarkdown(text) {
     return result.join("");
 }
 
-// ── Context menu ──
 let ctxMenu = null;
 
 function showCtxMenu(x, y) {
@@ -261,7 +289,6 @@ function showCtxMenu(x, y) {
 
 function hideCtxMenu() { ctxMenu.style.display = "none"; }
 
-// ── Settings modal ──
 function openSettings() {
     document.getElementById("bb-modal-overlay")?.remove();
     let s = getSettings();
@@ -356,14 +383,12 @@ function openSettings() {
     };
 }
 
-// ── Shield icons ──
 const ICONS = {
     active: `<svg viewBox="0 0 24 24" fill="#00ab80"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>`,
     missingKey: `<svg viewBox="0 0 24 24" fill="#d32f2f"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h1.39v4.19H10.6v-4.19H12zM12 9.17c-.77 0-1.39-.62-1.39-1.39 0-.77.62-1.39 1.39-1.39.77 0 1.39.62 1.39 1.39 0 .77-.62 1.39-1.39 1.39z"/></svg>`,
     disabled: `<svg viewBox="0 0 24 24" fill="#888"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 19.93c-3.95-1.17-6.9-5.11-7.7-9.43l7.7-3.42 7.7 3.42c-.8 4.32-3.75 8.26-7.7 9.43z"/></svg>`
 };
 
-// ── Find elements (cross-platform) ──
 function findTextarea() {
     return document.querySelector(".composer_rich_textarea[contenteditable]");
 }
@@ -390,7 +415,6 @@ function findNewMessageWrapper() {
     return document.querySelector(".new-message-wrapper");
 }
 
-// ── Send button state ──
 function setSendButtonState(hasText) {
     let btn = findSendButton();
     if (!btn) return;
@@ -422,7 +446,6 @@ function setSendButtonState(hasText) {
     }
 }
 
-// ── UI refresh ──
 function refreshUI() {
     let inputContainer = findInputContainer();
     if (!inputContainer) return;
@@ -463,7 +486,6 @@ function refreshUI() {
     }
 }
 
-// ── State flags ──
 let isSending = false;
 let hasContent = false;
 let isBypass = false;
@@ -480,7 +502,6 @@ function isSendTarget(el) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Draft blocker ──
 (function() {
     let origSend = WebSocket.prototype.send;
     WebSocket.prototype.send = function(data) {
@@ -492,12 +513,9 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
     };
 })();
 
-// ── Styles ──
 document.head.insertAdjacentHTML("beforeend", `<style>
-/* Hide original emoji button */
 button.toggle-emoticons { display: none !important; }
 
-/* Hide original input when encryption is active */
 .rb-locked-input {
     position: absolute !important;
     left: -9999px !important;
@@ -510,19 +528,13 @@ button.toggle-emoticons { display: none !important; }
     overflow: hidden !important;
 }
 
-/* ── Shield button — dynamic hitbox per platform ── */
 #bb-settings-btn.bb-shield-btn {
-    width: 44px;
-    height: 44px;
-    min-width: 44px;
-    min-height: 44px;
-    padding: 0;
-    margin: 0;
     position: relative;
     box-sizing: border-box;
+    min-width: 40px;
+    min-height: 40px;
 }
 
-/* Invisible expanded touch target via pseudo-element */
 #bb-settings-btn.bb-shield-btn::after {
     content: "";
     position: absolute;
@@ -530,43 +542,24 @@ button.toggle-emoticons { display: none !important; }
     left: 50%;
     transform: translate(-50%, -50%);
     border-radius: 50%;
-    /* Desktop: modest expansion */
-    width: 48px;
-    height: 48px;
-    min-width: 48px;
-    min-height: 48px;
+    width: max(120%, 48px);
+    height: max(120%, 48px);
 }
 
-/* SVG icon sizing — desktop */
+@media (pointer: coarse) {
+    #bb-settings-btn.bb-shield-btn::after {
+        width: max(135%, 56px);
+        height: max(135%, 56px);
+    }
+}
+
 #bb-settings-btn.bb-shield-btn svg {
-    width: 24px;
-    height: 24px;
+    width: clamp(20px, 55%, 28px);
+    height: clamp(20px, 55%, 28px);
     flex-shrink: 0;
     pointer-events: none;
 }
 
-/* Mobile: larger visible button + much larger touch target */
-.is-mobile #bb-settings-btn.bb-shield-btn {
-    width: 52px;
-    height: 52px;
-    min-width: 52px;
-    min-height: 52px;
-}
-
-.is-mobile #bb-settings-btn.bb-shield-btn::after {
-    width: 64px;
-    height: 64px;
-    min-width: 64px;
-    min-height: 64px;
-}
-
-/* SVG icon sizing — mobile */
-.is-mobile #bb-settings-btn.bb-shield-btn svg {
-    width: 28px;
-    height: 28px;
-}
-
-/* Secure input overlay */
 #secure-input-overlay {
     flex: 1; width: 100%; box-sizing: border-box;
     min-height: 40px; max-height: 150px; overflow-y: auto;
@@ -591,7 +584,6 @@ button.toggle-emoticons { display: none !important; }
     color: #888; pointer-events: none; display: block;
 }
 
-/* Mobile adjustments for overlay */
 .is-mobile #secure-input-overlay {
     min-height: 36px;
     padding: 8px 12px;
@@ -600,7 +592,6 @@ button.toggle-emoticons { display: none !important; }
     margin: 3px 0;
 }
 
-/* No-key warning notice */
 #bb-no-key-notice {
     display: none; align-items: flex-start; gap: 10px; flex: 1;
     width: 100%; box-sizing: border-box; padding: 10px 14px;
@@ -621,7 +612,20 @@ button.toggle-emoticons { display: none !important; }
 }
 #bb-no-key-notice .bb-notice-btn:hover { background: #b71c1c; }
 
-/* Context menu */
+/* Decrypted preview badge in reply & chat list */
+.bb-preview-lock {
+    font-size: 11px;
+    font-style: italic;
+    opacity: 0.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.bb-preview-lock.bb-decrypted {
+    opacity: 0.85;
+    font-style: normal;
+}
+
 #bale-bridge-menu {
     position: fixed; z-index: 999999; background: #fff;
     border: 1px solid #dfe1e6; border-radius: 12px;
@@ -638,7 +642,6 @@ button.toggle-emoticons { display: none !important; }
 .bale-menu-item:hover { background: #f4f5f7; }
 .bale-menu-item:active { background: #e8e8e8; }
 
-/* Settings modal */
 #bb-modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,.4);
     backdrop-filter: blur(3px);
@@ -706,13 +709,11 @@ button.toggle-emoticons { display: none !important; }
 @keyframes bb-pop { from { opacity: 0; transform: scale(.95); } to { opacity: 1; transform: scale(1); } }
 </style>`);
 
-// ── Spoiler click handler ──
 document.addEventListener("click", e => {
     let sp = e.target.closest(".bb-spoiler");
     if (sp) { sp.style.color = "inherit"; sp.style.background = "#dfe1e6"; }
 }, true);
 
-// ── Context menu setup ──
 ctxMenu = document.createElement("div");
 ctxMenu.id = "bale-bridge-menu";
 ctxMenu.innerHTML = `
@@ -725,7 +726,6 @@ document.getElementById("bale-menu-plain").onclick = () => { hideCtxMenu(); wind
 
 document.addEventListener("click", e => { if (!ctxMenu.contains(e.target)) hideCtxMenu(); });
 
-// ── Desktop: mouse events for send button ──
 document.addEventListener("mousedown", e => {
     if (e.button === 0 && !isSending && isSendTarget(e.target) && isEnabled() && overlayHasContent()) {
         e.preventDefault(); e.stopPropagation();
@@ -740,7 +740,6 @@ document.addEventListener("contextmenu", e => {
     }
 }, true);
 
-// ── Mobile: touch events for send button ──
 let longPressTimer = null;
 let touchHandled = false;
 
@@ -787,7 +786,7 @@ document.addEventListener("click", e => {
     }
 }, true);
 
-// ── Auto-decrypt messages ──
+// ── Auto-decrypt main messages ──
 function decryptMessages() {
     let nodes = document.body.querySelectorAll("div[rb-copyable]");
     for (let node of nodes) {
@@ -842,6 +841,116 @@ function decryptMessages() {
     }
 }
 
+// ── Auto-decrypt reply previews & chat list previews ──
+function decryptPreviews() {
+
+    // ── 1. Reply subtitle previews inside message bubbles ──
+    document.querySelectorAll(".reply-subtitle .im_short_message_text").forEach(node => {
+        let text = node.textContent.trim();
+        if (!text.startsWith("@@") || text.length <= 5 || node._bbDecrypting) return;
+        node._bbDecrypting = true;
+
+        // Strip trailing truncation dots added by Rubika
+        let raw = text.replace(/\.{2,}$/, "").replace(/\u2026$/, "").replace(/\s/g, "");
+
+        // Try all stored keys (reply might reference a message from current chat)
+        tryDecryptWithAllKeys(raw).then(dec => {
+            if (dec !== raw) {
+                let preview = dec.replace(/\n/g, " ");
+                if (preview.length > 60) preview = preview.slice(0, 60) + "…";
+                node.textContent = "🔒 " + preview;
+                node.classList.add("bb-preview-lock", "bb-decrypted");
+            } else {
+                node.textContent = "🔒 Encrypted message";
+                node.classList.add("bb-preview-lock");
+            }
+        }).catch(() => {
+            node.textContent = "🔒 Encrypted message";
+            node.classList.add("bb-preview-lock");
+        }).finally(() => { node._bbDecrypting = false; });
+    });
+
+    // ── 2. Reply subtitle without .im_short_message_text ──
+    //    (some Rubika versions render reply text differently)
+    document.querySelectorAll(".reply-subtitle").forEach(container => {
+        if (container._bbPreviewDone) return;
+        // Skip if already has a processed child
+        if (container.querySelector(".bb-preview-lock")) return;
+
+        let fullText = container.textContent.trim();
+        if (!fullText.startsWith("@@") || fullText.length <= 5) return;
+
+        // Find the deepest text-bearing element
+        let target = container.querySelector(".im_short_message_text");
+        if (target) return; // handled above
+
+        // Walk to find leaf text node parent
+        let walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        let textNode;
+        while ((textNode = walker.nextNode())) {
+            let t = textNode.textContent.trim();
+            if (t.startsWith("@@") && t.length > 5) {
+                let span = textNode.parentElement;
+                if (span._bbDecrypting) break;
+                span._bbDecrypting = true;
+                container._bbPreviewDone = true;
+
+                let raw = t.replace(/\.{2,}$/, "").replace(/\u2026$/, "").replace(/\s/g, "");
+
+                tryDecryptWithAllKeys(raw).then(dec => {
+                    if (dec !== raw) {
+                        let preview = dec.replace(/\n/g, " ");
+                        if (preview.length > 60) preview = preview.slice(0, 60) + "…";
+                        span.textContent = "🔒 " + preview;
+                        span.classList.add("bb-preview-lock", "bb-decrypted");
+                    } else {
+                        span.textContent = "🔒 Encrypted message";
+                        span.classList.add("bb-preview-lock");
+                    }
+                }).catch(() => {
+                    span.textContent = "🔒 Encrypted message";
+                    span.classList.add("bb-preview-lock");
+                }).finally(() => { span._bbDecrypting = false; });
+                break;
+            }
+        }
+    });
+
+    // ── 3. Chat list / sidebar previews ──
+    document.querySelectorAll(".user-last-message").forEach(container => {
+        if (container.querySelector(".bb-preview-lock")) return;
+
+        let spans = container.querySelectorAll("span");
+        for (let span of spans) {
+            // Only target leaf spans (no child elements)
+            if (span.children.length > 0) continue;
+            let text = span.textContent.trim();
+            if (!text.startsWith("@@") || text.length <= 5 || span._bbDecrypting) continue;
+            span._bbDecrypting = true;
+
+            let raw = text.replace(/\s/g, "");
+
+            // Try all stored keys since sidebar shows all chats
+            tryDecryptWithAllKeys(raw).then(dec => {
+                if (dec !== raw) {
+                    let preview = dec.replace(/\n/g, " ");
+                    if (preview.length > 45) preview = preview.slice(0, 45) + "…";
+                    span.textContent = "🔒 " + preview;
+                    span.classList.add("bb-preview-lock", "bb-decrypted");
+                } else {
+                    span.textContent = "🔒 Encrypted";
+                    span.classList.add("bb-preview-lock");
+                }
+            }).catch(() => {
+                span.textContent = "🔒 Encrypted";
+                span.classList.add("bb-preview-lock");
+            }).finally(() => { span._bbDecrypting = false; });
+
+            break; // one match per container
+        }
+    });
+}
+
 // ── Inject secure input UI ──
 function injectUI() {
     let inputContainer = findInputContainer();
@@ -851,25 +960,12 @@ function injectUI() {
     let inputWrapper = findInputWrapper();
     if (!textarea) return;
 
-    // Create shield button if not exists
     if (!document.getElementById("bb-settings-btn")) {
         let emojiBtn = findEmojiButton();
         let shieldBtn = document.createElement("button");
         shieldBtn.id = "bb-settings-btn";
         shieldBtn.className = "btn-icon rp bb-shield-btn";
-        shieldBtn.style.cssText = [
-            "display:flex",
-            "align-items:center",
-            "justify-content:center",
-            "cursor:pointer",
-            "transition:all 0.2s",
-            "background:none",
-            "border:none",
-            "outline:none",
-            "flex-shrink:0",
-            "position:relative",
-            "box-sizing:border-box"
-        ].join(";") + ";";
+        shieldBtn.style.cssText = "display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all 0.2s;background:none;border:none;outline:none;flex-shrink:0;";
         shieldBtn.onclick = openSettings;
 
         if (emojiBtn?.parentElement) {
@@ -880,7 +976,6 @@ function injectUI() {
         }
     }
 
-    // Create no-key notice if not exists
     if (!document.getElementById("bb-no-key-notice")) {
         let notice = document.createElement("div");
         notice.id = "bb-no-key-notice";
@@ -897,7 +992,6 @@ function injectUI() {
         notice.querySelector("#bb-notice-set-key").onclick = openSettings;
     }
 
-    // Create secure overlay if not exists
     let overlay = document.getElementById("secure-input-overlay");
     if (overlay) {
         window._bbSendMessage = overlay._triggerSend;
@@ -905,7 +999,6 @@ function injectUI() {
         return;
     }
 
-    // Prevent textarea from getting focus when encryption is on
     if (!textarea._hasStrictHijack) {
         textarea._hasStrictHijack = true;
         textarea.addEventListener("focus", () => {
@@ -1099,6 +1192,7 @@ function injectUI() {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
             decryptMessages();
+            decryptPreviews();
             injectUI();
 
             if (isEnabled() && !isSending) {
