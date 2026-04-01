@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      12.0
-// @description  Hardened: XSS-safe rendering, constant-time ops, race-condition guards, memory management, input validation.
+// @version      13.0
+// @description  Dark Glassmorphism UI, Fixed Send, ECDH Bridge, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -13,608 +13,320 @@
 (function () {
     "use strict";
 
-    // ─── 0. Constants & Frozen Configuration ──────────────────────────────────
-    // Freeze all configuration to prevent prototype pollution or runtime tampering.
-    const CONFIG = Object.freeze({
-        KEY_LENGTH: 32,
-        MAX_ENCRYPTED_LEN: 4000,
-        HANDSHAKE_EXPIRY_SEC: 300,
-        TOAST_DURATION: 5000,
-        SCAN_DEBOUNCE_MS: 120,
-        LONG_PRESS_MS: 400,
-        SEND_DELAY_MS: 80,
-        POST_SEND_DELAY_MS: 200,
-        MAX_PROCESSED_HASHES: 50,
-        KEY_CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
-        // Base85 alphabet — frozen to prevent mutation
-        B85_ALPHABET: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
-        HS_TYPE_REQUEST: 0x01,
-        HS_TYPE_RESPONSE: 0x02,
-        ENCRYPTED_PREFIX: "@@",
-        HANDSHAKE_PREFIX: "!!",
+    // ─── 0. CONFIG ────────────────────────────────────────────────────────────
+    const CFG = Object.freeze({
+        KEY_LEN: 32,
+        MAX_ENC_LEN: 4000,
+        HS_EXPIRY: 300,
+        TOAST_DUR: 5000,
+        SCAN_MS: 120,
+        LONG_PRESS: 400,
+        SEND_DLY: 80,
+        POST_DLY: 200,
+        MAX_HASHES: 50,
+        MAX_CHUNK_DEPTH: 10,
+        KEY_CACHE_MAX: 16,
+        CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
+        B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
+        HS_REQ: 0x01,
+        HS_RES: 0x02,
+        PFX_ENC: "@@",
+        PFX_HS: "!!",
     });
 
-    // ─── 0a. WebSocket Draft Blocker ──────────────────────────────────────────
-    // SECURITY: Use a captured reference so bypassing our override requires
-    // access to the original symbol, not just reassigning .send.
-    // We also guard against non-string/buffer types and avoid silent swallowing
-    // of legitimate messages.
+    // ─── 0a. Accent palette ───────────────────────────────────────────────────
+    const PAL = Object.freeze({
+        accent:    "#00e6a0",
+        accentDim: "#00c488",
+        accentGlow:"rgba(0,230,160,.25)",
+        bg:        "#0d1117",
+        card:      "#161b22",
+        surface:   "#1c2128",
+        border:    "#30363d",
+        borderLit: "#3d444d",
+        text:      "#e6edf3",
+        textDim:   "#8b949e",
+        textMuted: "#484f58",
+        danger:    "#f85149",
+        dangerDim: "#da3633",
+        warn:      "#d29922",
+        warnBg:    "rgba(210,153,34,.12)",
+        glass:     "rgba(22,27,34,.82)",
+        glassBorder:"rgba(240,246,252,.08)",
+    });
+
+    // ─── 0b. WebSocket Draft Blocker ──────────────────────────────────────────
     const _origWsSend = WebSocket.prototype.send;
-    const _draftBlockerRegex = /EditParameter.*drafts_|drafts_.*EditParameter/;
+    const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
 
-    Object.defineProperty(WebSocket.prototype, "send", {
-        configurable: false, // Prevent re-override
-        enumerable: true,
-        writable: false,
-        value: function (data) {
-            try {
-                let text = "";
-                if (typeof data === "string") {
-                    text = data;
-                } else if (data instanceof ArrayBuffer) {
-                    text = new TextDecoder().decode(data);
-                } else if (ArrayBuffer.isView(data)) {
-                    text = new TextDecoder().decode(data);
-                }
-                // Block draft sync messages that leak plaintext to server
-                if (text && _draftBlockerRegex.test(text)) {
-                    return undefined;
-                }
-            } catch {
-                // If we can't decode, let it through — don't block legitimate binary frames
-            }
-            return _origWsSend.call(this, data);
-        },
-    });
-
-    // ─── 1. Settings (Per-Chat) with Validation ──────────────────────────────
-    /**
-     * SECURITY: Chat ID extraction is sanitized to prevent path traversal
-     * in localStorage keys. We whitelist alphanumeric + limited punctuation.
-     */
-    const SAFE_ID_RE = /^[a-zA-Z0-9_\-]+$/;
-
-    const getChatId = () => {
-        const p = new URLSearchParams(location.search);
-        const raw =
-            p.get("uid") ||
-            p.get("groupId") ||
-            p.get("channelId") ||
-            location.pathname.split("/").pop() ||
-            "global";
-        // Sanitize: only allow safe characters to prevent localStorage key injection
-        return SAFE_ID_RE.test(raw) ? raw : "global";
+    WebSocket.prototype.send = function (data) {
+        try {
+            let t = "";
+            if (typeof data === "string") t = data;
+            else if (data instanceof ArrayBuffer) t = new TextDecoder().decode(data);
+            else if (ArrayBuffer.isView(data)) t = new TextDecoder().decode(data);
+            if (t && _draftRx.test(t)) return;
+        } catch (_) {}
+        return _origWsSend.apply(this, arguments);
     };
 
-    // Settings cache — invalidated on URL change
-    let _settingsCacheId = null;
-    let _settingsCache = null;
+    // ─── 1. Settings ──────────────────────────────────────────────────────────
+    const SAFE_ID = /^[a-zA-Z0-9_\-]+$/;
+    const getChatId = () => {
+        const p = new URLSearchParams(location.search);
+        const raw = p.get("uid") || p.get("groupId") || p.get("channelId") || location.pathname.split("/").pop() || "global";
+        return SAFE_ID.test(raw) ? raw : "global";
+    };
 
-    const DEFAULT_SETTINGS = Object.freeze({ enabled: true, customKey: "" });
-
+    let _scId = null, _sc = null;
     const getChatSettings = () => {
         const id = getChatId();
-        if (id === _settingsCacheId && _settingsCache !== null) {
-            return _settingsCache;
-        }
+        if (id === _scId && _sc) return _sc;
         try {
             const raw = localStorage.getItem("bale_bridge_settings_" + id);
             if (raw) {
-                const parsed = JSON.parse(raw);
-                // Validate shape — reject malformed data
-                if (
-                    typeof parsed === "object" &&
-                    parsed !== null &&
-                    typeof parsed.enabled === "boolean" &&
-                    typeof parsed.customKey === "string" &&
-                    parsed.customKey.length <= CONFIG.KEY_LENGTH
-                ) {
-                    _settingsCache = { enabled: parsed.enabled, customKey: parsed.customKey };
-                    _settingsCacheId = id;
-                    return _settingsCache;
+                const o = JSON.parse(raw);
+                if (o && typeof o.enabled === "boolean" && typeof o.customKey === "string" && o.customKey.length <= CFG.KEY_LEN) {
+                    _sc = { enabled: o.enabled, customKey: o.customKey };
+                    _scId = id;
+                    return _sc;
                 }
             }
-        } catch {
-            // Corrupted data — fall through to default
-        }
-        _settingsCache = { ...DEFAULT_SETTINGS };
-        _settingsCacheId = id;
-        return _settingsCache;
+        } catch (_) {}
+        _sc = { enabled: true, customKey: "" };
+        _scId = id;
+        return _sc;
     };
 
     const saveChatSettings = (s) => {
-        // Validate before saving
-        if (typeof s.enabled !== "boolean" || typeof s.customKey !== "string") {
-            throw new TypeError("Invalid settings shape");
-        }
-        if (s.customKey.length > 0 && s.customKey.length !== CONFIG.KEY_LENGTH) {
-            throw new RangeError(`Key must be exactly ${CONFIG.KEY_LENGTH} characters`);
-        }
         const id = getChatId();
-        _settingsCache = { enabled: s.enabled, customKey: s.customKey };
-        _settingsCacheId = id;
-        localStorage.setItem("bale_bridge_settings_" + id, JSON.stringify(_settingsCache));
+        _sc = { enabled: !!s.enabled, customKey: String(s.customKey || "") };
+        _scId = id;
+        localStorage.setItem("bale_bridge_settings_" + id, JSON.stringify(_sc));
     };
 
     const getActiveKey = () => {
         const s = getChatSettings();
-        if (!s.enabled) return null;
-        return s.customKey && s.customKey.length === CONFIG.KEY_LENGTH ? s.customKey : null;
+        return s.enabled && s.customKey && s.customKey.length === CFG.KEY_LEN ? s.customKey : null;
     };
-
-    const isEncryptionEnabled = () => getChatSettings().enabled;
-
-    const getSecurityFingerprint = () => {
+    const isEncOn = () => getChatSettings().enabled;
+    const getFingerprint = () => {
         const k = getActiveKey();
-        if (!k || k.length !== CONFIG.KEY_LENGTH) return "NONE";
-        return k.substring(0, 5).toUpperCase();
+        return k ? k.substring(0, 5).toUpperCase() : "NONE";
     };
 
-    // ─── 2. Crypto Engine (AES-GCM) ──────────────────────────────────────────
-    /**
-     * SECURITY FIX: The key cache uses a WeakRef-like approach via a bounded Map
-     * to prevent unbounded memory growth. Keys are evicted when cache exceeds limit.
-     *
-     * SECURITY FIX: Key material is derived from the full 32-byte input, not
-     * zero-padded (the original code zero-padded short keys, weakening security).
-     */
-    const KEY_CACHE_MAX = 16;
+    // ─── 2. Crypto ────────────────────────────────────────────────────────────
     const keyCache = new Map();
-
-    async function getCryptoKey(keyStr) {
-        if (keyCache.has(keyStr)) return keyCache.get(keyStr);
-
-        // Enforce exact key length — no zero-padding of short keys
-        const encoded = new TextEncoder().encode(keyStr);
-        if (encoded.length !== CONFIG.KEY_LENGTH) {
-            throw new RangeError("Key must encode to exactly 32 bytes");
-        }
-
-        const key = await crypto.subtle.importKey(
-            "raw",
-            encoded,
-            { name: "AES-GCM" },
-            false,
-            ["encrypt", "decrypt"]
-        );
-
-        // Bounded cache: evict oldest entry if full
-        if (keyCache.size >= KEY_CACHE_MAX) {
-            const firstKey = keyCache.keys().next().value;
-            keyCache.delete(firstKey);
-        }
-        keyCache.set(keyStr, key);
+    async function getCryptoKey(k) {
+        if (keyCache.has(k)) return keyCache.get(k);
+        const enc = new TextEncoder().encode(k);
+        if (enc.length !== CFG.KEY_LEN) throw new RangeError("Bad key length");
+        const key = await crypto.subtle.importKey("raw", enc, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+        if (keyCache.size >= CFG.KEY_CACHE_MAX) keyCache.delete(keyCache.keys().next().value);
+        keyCache.set(k, key);
         return key;
     }
 
-    /**
-     * SECURITY FIX: Key generation uses rejection sampling to eliminate
-     * modular bias. `byte % 76` introduces bias since 256 % 76 ≠ 0.
-     * We reject bytes >= 76 * floor(256/76) = 76 * 3 = 228.
-     */
     function generateKey() {
-        const chars = CONFIG.KEY_CHARS;
-        const charLen = chars.length; // 76
-        const maxUnbiased = Math.floor(256 / charLen) * charLen; // 228
-        const result = new Array(CONFIG.KEY_LENGTH);
-        let filled = 0;
-
-        while (filled < CONFIG.KEY_LENGTH) {
-            const batch = crypto.getRandomValues(new Uint8Array(CONFIG.KEY_LENGTH * 2));
-            for (let i = 0; i < batch.length && filled < CONFIG.KEY_LENGTH; i++) {
-                if (batch[i] < maxUnbiased) {
-                    result[filled++] = chars[batch[i] % charLen];
-                }
-            }
+        const c = CFG.CHARS, cl = c.length, mx = Math.floor(256 / cl) * cl;
+        const r = []; let f = 0;
+        while (f < CFG.KEY_LEN) {
+            const b = crypto.getRandomValues(new Uint8Array(CFG.KEY_LEN * 2));
+            for (let i = 0; i < b.length && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl];
         }
-        return result.join("");
+        return r.join("");
     }
 
-    // ─── Base85 Codec (with input validation) ────────────────────────────────
-    const B85 = CONFIG.B85_ALPHABET;
-    const B85D = new Uint8Array(128).fill(255); // 255 = invalid sentinel
+    // Base85
+    const B85 = CFG.B85, B85D = new Uint8Array(128).fill(255);
     for (let i = 0; i < B85.length; i++) B85D[B85.charCodeAt(i)] = i;
 
     function b85enc(buf) {
-        if (!(buf instanceof Uint8Array)) {
-            throw new TypeError("b85enc expects Uint8Array");
-        }
-        const len = buf.length;
-        const fullChunks = len >>> 2;
-        const remainder = len & 3;
-        const outLen = fullChunks * 5 + (remainder ? remainder + 1 : 0);
-        const chars = new Array(outLen);
-        let pos = 0;
-
+        const len = buf.length, out = [];
         for (let i = 0; i < len; i += 4) {
             const rem = Math.min(len - i, 4);
             let acc = 0;
-            for (let j = 0; j < 4; j++) {
-                acc = (acc << 8) | (i + j < len ? buf[i + j] : 0);
-            }
+            for (let j = 0; j < 4; j++) acc = (acc << 8) | (i + j < len ? buf[i + j] : 0);
             acc >>>= 0;
-            const count = rem < 4 ? rem + 1 : 5;
-            const tmp = new Array(5);
-            for (let j = 4; j >= 0; j--) {
-                tmp[j] = B85[acc % 85];
-                acc = Math.floor(acc / 85);
-            }
-            for (let j = 0; j < count; j++) chars[pos++] = tmp[j];
+            const cnt = rem < 4 ? rem + 1 : 5, tmp = Array(5);
+            for (let j = 4; j >= 0; j--) { tmp[j] = B85[acc % 85]; acc = Math.floor(acc / 85); }
+            for (let j = 0; j < cnt; j++) out.push(tmp[j]);
         }
-        return chars.join("");
+        return out.join("");
     }
 
     function b85dec(str) {
-        if (typeof str !== "string") {
-            throw new TypeError("b85dec expects string");
-        }
-        const slen = str.length;
-        if (slen === 0) return new Uint8Array(0);
-
-        const fullChunks = Math.floor(slen / 5);
-        const remChars = slen % 5;
-        // Validate: remainder of 1 is invalid in base85
-        if (remChars === 1) {
-            throw new RangeError("Invalid base85 string length");
-        }
-        const outEst = fullChunks * 4 + (remChars ? remChars - 1 : 0);
-        const out = new Uint8Array(outEst);
-        let wpos = 0;
-
-        for (let i = 0; i < slen; i += 5) {
-            const end = Math.min(i + 5, slen);
-            const chunkLen = end - i;
-            const pad = 5 - chunkLen;
+        const sl = str.length; if (!sl) return new Uint8Array(0);
+        const rm = sl % 5; if (rm === 1) throw new RangeError("Bad b85 length");
+        const full = Math.floor(sl / 5), est = full * 4 + (rm ? rm - 1 : 0), out = new Uint8Array(est);
+        let w = 0;
+        for (let i = 0; i < sl; i += 5) {
+            const end = Math.min(i + 5, sl), pad = 5 - (end - i);
             let acc = 0;
             for (let j = 0; j < 5; j++) {
-                const ci = i + j < slen ? str.charCodeAt(i + j) : 126; // '~'
-                // Validate character is within ASCII range and in alphabet
-                if (ci >= 128 || B85D[ci] === 255) {
-                    throw new RangeError(`Invalid base85 character at position ${i + j}`);
-                }
+                const ci = i + j < sl ? str.charCodeAt(i + j) : 126;
+                if (ci >= 128 || B85D[ci] === 255) throw new RangeError("Bad b85 char at " + (i + j));
                 acc = acc * 85 + B85D[ci];
             }
             const bytes = 4 - pad;
-            if (bytes >= 1) out[wpos++] = (acc >>> 24) & 0xff;
-            if (bytes >= 2) out[wpos++] = (acc >>> 16) & 0xff;
-            if (bytes >= 3) out[wpos++] = (acc >>> 8) & 0xff;
-            if (bytes >= 4) out[wpos++] = acc & 0xff;
+            if (bytes >= 1) out[w++] = (acc >>> 24) & 0xff;
+            if (bytes >= 2) out[w++] = (acc >>> 16) & 0xff;
+            if (bytes >= 3) out[w++] = (acc >>> 8) & 0xff;
+            if (bytes >= 4) out[w++] = acc & 0xff;
         }
-        return out.subarray(0, wpos);
+        return out.subarray(0, w);
     }
 
-    // ─── Compression (with graceful fallback) ────────────────────────────────
+    // Compression
     async function compress(text) {
-        if (typeof CompressionStream === "undefined") {
-            return new TextEncoder().encode(text);
-        }
-        const cs = new CompressionStream("deflate");
-        const writer = cs.writable.getWriter();
-        const encoded = new TextEncoder().encode(text);
-        await writer.write(encoded);
-        await writer.close();
+        if (typeof CompressionStream === "undefined") return new TextEncoder().encode(text);
+        const cs = new CompressionStream("deflate"), w = cs.writable.getWriter();
+        w.write(new TextEncoder().encode(text)); w.close();
         return new Uint8Array(await new Response(cs.readable).arrayBuffer());
     }
-
     async function decompress(buf) {
-        if (typeof DecompressionStream === "undefined") {
-            return new TextDecoder().decode(buf);
-        }
+        if (typeof DecompressionStream === "undefined") return new TextDecoder().decode(buf);
         try {
-            const ds = new DecompressionStream("deflate");
-            const writer = ds.writable.getWriter();
-            await writer.write(buf);
-            await writer.close();
+            const ds = new DecompressionStream("deflate"), w = ds.writable.getWriter();
+            w.write(buf); w.close();
             return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
-        } catch {
-            // Fallback: data might not be compressed (backward compat)
-            return new TextDecoder().decode(buf);
-        }
+        } catch (_) { return new TextDecoder().decode(buf); }
     }
 
-    // ─── Encrypt / Decrypt ───────────────────────────────────────────────────
     async function encrypt(text) {
-        const k = getActiveKey();
-        if (!k) return null;
+        const k = getActiveKey(); if (!k) return null;
         const iv = crypto.getRandomValues(new Uint8Array(12));
-        const compressed = await compress(text);
-        const ct = new Uint8Array(
-            await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv },
-                await getCryptoKey(k),
-                compressed
-            )
-        );
-        const payload = new Uint8Array(12 + ct.length);
-        payload.set(iv);
-        payload.set(ct, 12);
-        return CONFIG.ENCRYPTED_PREFIX + b85enc(payload);
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getCryptoKey(k), await compress(text)));
+        const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
+        return CFG.PFX_ENC + b85enc(p);
     }
 
     async function decrypt(text) {
-        if (!text.startsWith(CONFIG.ENCRYPTED_PREFIX)) return text;
-        const k = getActiveKey();
-        if (!k) return text;
+        if (!text.startsWith(CFG.PFX_ENC)) return text;
+        const k = getActiveKey(); if (!k) return text;
         try {
-            const buf = b85dec(text.slice(CONFIG.ENCRYPTED_PREFIX.length));
-            if (buf.length < 13) return text; // IV(12) + at least 1 byte ciphertext
-            const iv = buf.subarray(0, 12);
-            const data = buf.subarray(12);
-            const plain = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv },
-                await getCryptoKey(k),
-                data
-            );
-            return await decompress(new Uint8Array(plain));
-        } catch {
-            return text; // Decryption failed — show ciphertext
-        }
+            const buf = b85dec(text.slice(2));
+            if (buf.length < 13) return text;
+            return await decompress(new Uint8Array(await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: buf.subarray(0, 12) }, await getCryptoKey(k), buf.subarray(12))));
+        } catch (_) { return text; }
     }
 
-    /**
-     * BUG FIX: The original recursion could produce exponential chunk counts
-     * for adversarial inputs. We now limit recursion depth.
-     */
     async function encryptChunked(text, depth = 0) {
-        if (depth > 10) {
-            console.warn("[BB] Chunk depth exceeded, message too large");
-            return null;
-        }
-        const result = await encrypt(text);
-        if (result === null) return null;
-        if (result.length <= CONFIG.MAX_ENCRYPTED_LEN) return [result];
-
+        if (depth > CFG.MAX_CHUNK_DEPTH) return null;
+        const r = await encrypt(text); if (!r) return null;
+        if (r.length <= CFG.MAX_ENC_LEN) return [r];
         const mid = Math.floor(text.length / 2);
-        let splitAt = text.lastIndexOf("\n", mid);
-        if (splitAt <= 0) splitAt = text.lastIndexOf(" ", mid);
-        if (splitAt <= 0) splitAt = mid;
-
-        const a = await encryptChunked(text.slice(0, splitAt).trim(), depth + 1);
-        const b = await encryptChunked(text.slice(splitAt).trim(), depth + 1);
-        if (!a || !b) return null;
-        return [...a, ...b];
+        let sp = text.lastIndexOf("\n", mid);
+        if (sp <= 0) sp = text.lastIndexOf(" ", mid);
+        if (sp <= 0) sp = mid;
+        const a = await encryptChunked(text.slice(0, sp).trim(), depth + 1);
+        const b = await encryptChunked(text.slice(sp).trim(), depth + 1);
+        return a && b ? [...a, ...b] : null;
     }
 
-    // ─── 3. ECDH Handshake ────────────────────────────────────────────────────
-    /**
-     * SECURITY FIX: Handshake uses a mutex (`_hsBusy`) but the original code
-     * had a race where two concurrent `_handleHS` calls could both pass the
-     * check. We now use a proper async lock.
-     *
-     * SECURITY FIX: Private key in sessionStorage is still JWK plaintext.
-     * In a userscript context there's no better option, but we add a comment
-     * noting the limitation and clear keys promptly.
-     */
+    // ─── 3. ECDH ──────────────────────────────────────────────────────────────
     let _hsLock = Promise.resolve();
-
     function withHsLock(fn) {
+        let unlock;
         const prev = _hsLock;
-        let resolve;
-        _hsLock = new Promise((r) => (resolve = r));
-        return prev
-            .then(() => fn())
-            .finally(() => resolve());
+        _hsLock = new Promise(r => unlock = r);
+        return prev.then(() => fn()).finally(() => unlock());
     }
 
-    async function _hsNewPair() {
-        return crypto.subtle.generateKey(
-            { name: "ECDH", namedCurve: "P-256" },
-            true,
-            ["deriveBits"]
-        );
-    }
+    const _hsNewPair = () => crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const _hsPubRaw = async (k) => new Uint8Array(await crypto.subtle.exportKey("raw", k));
+    const _hsPubImport = (b) => crypto.subtle.importKey("raw", b, { name: "ECDH", namedCurve: "P-256" }, false, []);
 
-    async function _hsPubRaw(pubKey) {
-        return new Uint8Array(await crypto.subtle.exportKey("raw", pubKey));
-    }
-
-    async function _hsPubImport(bytes) {
-        // Validate P-256 uncompressed public key length (65 bytes: 0x04 || x || y)
-        if (bytes.length !== 65 || bytes[0] !== 0x04) {
-            throw new RangeError("Invalid P-256 public key format");
-        }
-        return crypto.subtle.importKey(
-            "raw",
-            bytes,
-            { name: "ECDH", namedCurve: "P-256" },
-            false,
-            []
-        );
-    }
-
-    /**
-     * SECURITY FIX: Key derivation uses HKDF instead of raw SHA-256 for
-     * better key separation. The original `hash[i] % chars.length` also
-     * had modular bias — we now use rejection sampling.
-     */
-    async function _hsDeriveKeyStr(myPriv, theirPubBytes) {
+    async function _hsDeriveKey(myPriv, theirPubBytes) {
         const theirPub = await _hsPubImport(theirPubBytes);
-        const sharedBits = await crypto.subtle.deriveBits(
-            { name: "ECDH", public: theirPub },
-            myPriv,
-            256
-        );
-
-        // Use HKDF for proper key derivation
-        const ikm = await crypto.subtle.importKey(
-            "raw",
-            sharedBits,
-            "HKDF",
-            false,
-            ["deriveBits"]
-        );
-        const derivedBits = new Uint8Array(
-            await crypto.subtle.deriveBits(
-                {
-                    name: "HKDF",
-                    hash: "SHA-256",
-                    salt: new TextEncoder().encode("bale-bridge-v12"),
+        const shared = await crypto.subtle.deriveBits({ name: "ECDH", public: theirPub }, myPriv, 256);
+        let hash;
+        if (crypto.subtle.importKey && typeof crypto.subtle.deriveBits === 'function') {
+            try {
+                const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+                hash = new Uint8Array(await crypto.subtle.deriveBits({
+                    name: "HKDF", hash: "SHA-256",
+                    salt: new TextEncoder().encode("bale-bridge-v13"),
                     info: new TextEncoder().encode("aes-key"),
-                },
-                ikm,
-                512 // Derive extra bits for rejection sampling
-            )
-        );
-
-        // Rejection sampling to eliminate modular bias
-        const chars = CONFIG.KEY_CHARS;
-        const charLen = chars.length;
-        const maxUnbiased = Math.floor(256 / charLen) * charLen;
-        let keyStr = "";
-        let idx = 0;
-
-        while (keyStr.length < CONFIG.KEY_LENGTH) {
-            if (idx >= derivedBits.length) {
-                // Extremely unlikely with 64 bytes of input for 32 chars
-                throw new Error("Insufficient entropy for key derivation");
+                }, ikm, 512));
+            } catch (_) {
+                hash = new Uint8Array(await crypto.subtle.digest("SHA-256", shared));
+                const pad = new Uint8Array(64); pad.set(hash); hash = pad;
             }
-            if (derivedBits[idx] < maxUnbiased) {
-                keyStr += chars[derivedBits[idx] % charLen];
-            }
+        } else {
+            hash = new Uint8Array(await crypto.subtle.digest("SHA-256", shared));
+            const pad = new Uint8Array(64); pad.set(hash); hash = pad;
+        }
+        const c = CFG.CHARS, cl = c.length, mx = Math.floor(256 / cl) * cl;
+        let key = "", idx = 0;
+        while (key.length < CFG.KEY_LEN) {
+            if (idx >= hash.length) throw new Error("Not enough entropy");
+            if (hash[idx] < mx) key += c[hash[idx] % cl];
             idx++;
         }
-        return keyStr;
+        return key;
     }
 
-    // ─── Toast Notification ──────────────────────────────────────────────────
-    function _showToast(msg, dur = CONFIG.TOAST_DURATION) {
+    function toast(msg, dur = CFG.TOAST_DUR) {
         const el = document.createElement("div");
-        el.textContent = msg; // textContent — safe from XSS
+        el.textContent = msg;
         Object.assign(el.style, {
-            position: "fixed",
-            bottom: "88px",
-            left: "50%",
-            transform: "translateX(-50%) translateY(16px)",
-            background: "rgba(0,0,0,.85)",
-            color: "#fff",
-            padding: "12px 24px",
-            borderRadius: "24px",
-            fontSize: "14px",
-            fontFamily: "inherit",
-            zIndex: "9999999",
-            opacity: "0",
-            pointerEvents: "none",
-            transition: "opacity .2s, transform .2s",
-            whiteSpace: "nowrap",
-            boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+            position:"fixed",bottom:"88px",left:"50%",transform:"translateX(-50%) translateY(16px)",
+            background:PAL.glass,color:PAL.text,padding:"12px 24px",borderRadius:"24px",
+            fontSize:"14px",fontFamily:"inherit",zIndex:"9999999",opacity:"0",pointerEvents:"none",
+            transition:"all .3s cubic-bezier(.2,.8,.2,1)",whiteSpace:"nowrap",
+            boxShadow:`0 8px 32px rgba(0,0,0,.5), inset 0 0 0 1px ${PAL.glassBorder}`,
+            backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)",border:`1px solid ${PAL.glassBorder}`,
         });
         document.body.appendChild(el);
-        requestAnimationFrame(() => {
-            el.style.opacity = "1";
-            el.style.transform = "translateX(-50%) translateY(0)";
-        });
-        setTimeout(() => {
-            el.style.opacity = "0";
-            el.style.transform = "translateX(-50%) translateY(10px)";
-            setTimeout(() => el.remove(), 300);
-        }, dur);
+        requestAnimationFrame(() => { el.style.opacity = "1"; el.style.transform = "translateX(-50%) translateY(0)"; });
+        setTimeout(() => { el.style.opacity = "0"; el.style.transform = "translateX(-50%) translateY(10px)"; setTimeout(() => el.remove(), 300); }, dur);
     }
 
-    // ─── Handshake Visualization (Safe DOM construction) ─────────────────────
-    /**
-     * SECURITY FIX: The original used innerHTML for handshake badges.
-     * We now construct DOM nodes programmatically to prevent XSS.
-     */
-    function _visualizeHs(el, text) {
-        el.textContent = ""; // Clear safely
+    function _vizHs(el, text) {
+        el.textContent = "";
         const badge = document.createElement("span");
         badge.textContent = text;
         Object.assign(badge.style, {
-            display: "inline-block",
-            margin: "2px 0",
-            padding: "3px 8px",
-            fontSize: "11px",
-            fontWeight: "600",
-            fontFamily: "monospace",
-            color: "var(--color-primary-p-50,#00ab80)",
-            background: "var(--color-neutrals-n-20,#f4f5f7)",
-            borderRadius: "12px",
-            border: "1px solid var(--color-primary-p-50,#00ab80)",
-            opacity: "0.85",
-            userSelect: "none",
+            display:"inline-block",margin:"2px 0",padding:"4px 12px",fontSize:"11px",fontWeight:"600",
+            fontFamily:"monospace",color:PAL.accent,background:PAL.surface,borderRadius:"20px",
+            border:`1px solid ${PAL.accent}`,opacity:"0.9",userSelect:"none",
+            boxShadow:`0 0 12px ${PAL.accentGlow}`,
         });
         el.appendChild(badge);
-        el.style.display = "block";
-        el.style.textAlign = "center";
+        el.style.display = "block"; el.style.textAlign = "center";
         el._isDecrypted = true;
     }
 
-    // ─── Hash Tracking (Bounded) ─────────────────────────────────────────────
-    function markHashProcessed(chatId, hash) {
-        const pKey = "bb_phs_" + chatId;
+    // Hash tracking
+    function markHash(cid, h) {
+        const k = "bb_phs_" + cid;
         try {
-            const processed = JSON.parse(localStorage.getItem(pKey) || "[]");
-            if (!Array.isArray(processed)) {
-                localStorage.setItem(pKey, JSON.stringify([hash]));
-                return;
-            }
-            if (!processed.includes(hash)) {
-                processed.push(hash);
-                while (processed.length > CONFIG.MAX_PROCESSED_HASHES) {
-                    processed.shift();
-                }
-                localStorage.setItem(pKey, JSON.stringify(processed));
-            }
-        } catch {
-            localStorage.setItem(pKey, JSON.stringify([hash]));
-        }
+            const a = JSON.parse(localStorage.getItem(k) || "[]");
+            if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; }
+            if (!a.includes(h)) { a.push(h); while (a.length > CFG.MAX_HASHES) a.shift(); localStorage.setItem(k, JSON.stringify(a)); }
+        } catch (_) { localStorage.setItem(k, JSON.stringify([h])); }
     }
+    function isHashed(cid, h) { try { const a = JSON.parse(localStorage.getItem("bb_phs_" + cid) || "[]"); return Array.isArray(a) && a.includes(h); } catch (_) { return false; } }
+    function cHash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
 
-    function isHashProcessed(chatId, hash) {
-        try {
-            const arr = JSON.parse(localStorage.getItem("bb_phs_" + chatId) || "[]");
-            return Array.isArray(arr) && arr.includes(hash);
-        } catch {
-            return false;
-        }
-    }
+    function tsBytes() { const t = Math.floor(Date.now() / 1000); return new Uint8Array([(t>>>24)&0xff,(t>>>16)&0xff,(t>>>8)&0xff,t&0xff]); }
+    function readTs(b) { return ((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3])>>>0; }
 
-    function computeHash(str) {
-        let h = 0;
-        for (let i = 0; i < str.length; i++) {
-            h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-        }
-        return h;
-    }
-
-    function getTimestampBytes() {
-        const ts = Math.floor(Date.now() / 1000);
-        return new Uint8Array([
-            (ts >>> 24) & 0xff,
-            (ts >>> 16) & 0xff,
-            (ts >>> 8) & 0xff,
-            ts & 0xff,
-        ]);
-    }
-
-    function readTimestamp(buf) {
-        if (buf.length < 4) throw new RangeError("Timestamp buffer too short");
-        return ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
-    }
-
-    // ─── Raw Send Helper ─────────────────────────────────────────────────────
-    const _textareaSetter = Object.getOwnPropertyDescriptor(
-        HTMLTextAreaElement.prototype,
-        "value"
-    )?.set;
-
-    const getRealInput = () =>
-        document.getElementById("editable-message-text") ||
-        document.getElementById("main-message-input");
-
-    const isMobileInput = (el) => el?.tagName === "TEXTAREA";
+    // ─── Send helpers ─────────────────────────────────────────────────────────
+    const _taSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    const getRealInput = () => document.getElementById("editable-message-text") || document.getElementById("main-message-input");
+    const isMobile = (el) => el?.tagName === "TEXTAREA";
 
     async function _sendRaw(text) {
-        const real = getRealInput();
-        if (!real) return;
-        const mobile = isMobileInput(real);
-        const wasSync = isSyncing;
+        const real = getRealInput(); if (!real) return;
+        const mob = isMobile(real), wasSyncing = isSyncing;
         isSyncing = true;
-
         unlockInput(real);
 
-        if (mobile) {
-            _textareaSetter?.call(real, text);
+        if (mob) {
+            _taSetter?.call(real, text);
             real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
         } else {
             real.focus();
@@ -622,1723 +334,745 @@
             document.execCommand("insertText", false, text);
             real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
         }
+        await new Promise(r => setTimeout(r, CFG.SEND_DLY));
 
-        await new Promise((r) => setTimeout(r, CONFIG.SEND_DELAY_MS));
-
-        let sendBtn =
-            document.querySelector('[aria-label="send-button"]') ||
-            document.querySelector(".RaTWwR");
+        let btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
-
-        if (sendBtn) {
-            // Try React props click first
-            const btnPropsKey = Object.keys(sendBtn).find((k) =>
-                k.startsWith("__reactProps$")
-            );
-            if (btnPropsKey) {
-                const onClick = sendBtn[btnPropsKey]?.onClick;
-                if (typeof onClick === "function") {
-                    try {
-                        onClick({
-                            preventDefault: () => {},
-                            stopPropagation: () => {},
-                        });
-                        sent = true;
-                    } catch {
-                        // Fall through to DOM events
-                    }
-                }
+        if (btn) {
+            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
+            if (rk && typeof btn[rk]?.onClick === 'function') {
+                try { btn[rk].onClick({ preventDefault(){}, stopPropagation(){} }); sent = true; } catch(_){}
             }
             if (!sent) {
-                for (const type of [
-                    "mousedown",
-                    "pointerdown",
-                    "mouseup",
-                    "pointerup",
-                    "click",
-                ]) {
-                    sendBtn.dispatchEvent(
-                        new MouseEvent(type, {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window,
-                        })
-                    );
-                }
+                for (const t of ["mousedown","pointerdown","mouseup","pointerup","click"])
+                    btn.dispatchEvent(new MouseEvent(t, { bubbles:true, cancelable:true, view:window }));
                 sent = true;
             }
         }
+        if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles:true, cancelable:true, key:"Enter", code:"Enter", keyCode:13, which:13 }));
 
-        if (!sent && real) {
-            real.dispatchEvent(
-                new KeyboardEvent("keydown", {
-                    bubbles: true,
-                    cancelable: true,
-                    key: "Enter",
-                    code: "Enter",
-                    keyCode: 13,
-                    which: 13,
-                })
-            );
-        }
+        await new Promise(r => setTimeout(r, CFG.POST_DLY));
 
-        await new Promise((r) => setTimeout(r, CONFIG.POST_SEND_DELAY_MS));
-
-        // Clear input after send
-        if (mobile) {
-            if (real.value !== "") {
-                _textareaSetter?.call(real, "");
-                real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-            }
+        if (mob) {
+            if (real.value !== "") { _taSetter?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles:true, cancelable:true })); }
         } else {
             if (real.innerText.trim() !== "") {
-                real.focus();
-                document.execCommand("selectAll", false, null);
-                document.execCommand("delete", false, null);
-                real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+                real.focus(); document.execCommand("selectAll", false, null); document.execCommand("delete", false, null);
+                real.dispatchEvent(new Event("input", { bubbles:true, cancelable:true }));
             }
         }
-
-        if (isEncryptionEnabled()) lockInput(real);
-        isSyncing = wasSync;
+        if (isEncOn()) lockInput(real);
+        isSyncing = wasSyncing;
     }
 
-    // ─── Handshake Protocol ──────────────────────────────────────────────────
+    // ─── Handshake Protocol ───────────────────────────────────────────────────
     async function startHandshake() {
         return withHsLock(async () => {
             try {
-                const chatId = getChatId();
-                const pair = await _hsNewPair();
-                const pub = await _hsPubRaw(pair.publicKey);
-
-                // NOTE: Storing private key as JWK in sessionStorage is not ideal,
-                // but userscript context has no better secure storage option.
-                // Key is cleared immediately after use.
-                const exportedPriv = await crypto.subtle.exportKey("jwk", pair.privateKey);
-                sessionStorage.setItem(
-                    "bb_pending_hs_" + chatId,
-                    JSON.stringify(exportedPriv)
-                );
-
-                const payload = new Uint8Array(1 + 4 + pub.length);
-                payload[0] = CONFIG.HS_TYPE_REQUEST;
-                payload.set(getTimestampBytes(), 1);
-                payload.set(pub, 5);
-
-                const b64 = btoa(String.fromCharCode.apply(null, payload));
-                const msg = CONFIG.HANDSHAKE_PREFIX + b64;
-
-                markHashProcessed(chatId, computeHash(b64));
-                await _sendRaw(msg);
-                _showToast("⏳ Requesting secure bridge. Waiting for friend to accept...");
-            } catch (e) {
-                console.error("[BB] Bridge setup failed:", e);
-                _showToast("❌ Bridge setup failed. Please try again.");
-            }
+                const cid = getChatId(), pair = await _hsNewPair(), pub = await _hsPubRaw(pair.publicKey);
+                const priv = await crypto.subtle.exportKey("jwk", pair.privateKey);
+                sessionStorage.setItem("bb_hs_" + cid, JSON.stringify(priv));
+                const pay = new Uint8Array(1 + 4 + pub.length);
+                pay[0] = CFG.HS_REQ; pay.set(tsBytes(), 1); pay.set(pub, 5);
+                const b64 = btoa(String.fromCharCode(...pay));
+                markHash(cid, cHash(b64));
+                await _sendRaw(CFG.PFX_HS + b64);
+                toast("⏳ Requesting bridge. Waiting for friend...");
+            } catch (e) { console.error("[BB] HS start fail", e); toast("❌ Bridge setup failed"); }
         });
     }
 
-    /**
-     * SECURITY FIX: Accept button is built with DOM APIs, not innerHTML.
-     */
-    function renderAcceptButton(el, theirPub, msgHash, chatId) {
-        el.textContent = "";
-        el._isDecrypted = true;
-
-        const container = document.createElement("div");
-        Object.assign(container.style, {
-            border: "2px solid var(--color-primary-p-50,#00ab80)",
-            padding: "10px",
-            borderRadius: "12px",
-            background: "var(--color-neutrals-surface,#fff)",
-            display: "inline-block",
-            fontFamily: "inherit",
-            margin: "4px 0",
+    function renderAcceptBtn(el, theirPub, mh, cid) {
+        el.textContent = ""; el._isDecrypted = true;
+        const box = document.createElement("div");
+        Object.assign(box.style, {
+            border:`2px solid ${PAL.accent}`,padding:"14px 18px",borderRadius:"16px",
+            background:PAL.card,display:"inline-block",fontFamily:"inherit",margin:"4px 0",
+            boxShadow:`0 0 20px ${PAL.accentGlow}`,maxWidth:"320px",
         });
-
-        const title = document.createElement("strong");
-        title.textContent = "🛡️ Secure Bridge Request";
-        Object.assign(title.style, {
-            color: "var(--color-primary-p-50,#00ab80)",
-            display: "block",
-            marginBottom: "4px",
-            fontSize: "14px",
+        const t = document.createElement("strong");
+        t.textContent = "🛡️ Secure Bridge Request";
+        Object.assign(t.style, { color:PAL.accent,display:"block",marginBottom:"6px",fontSize:"14px" });
+        const d = document.createElement("span");
+        d.textContent = "Your friend wants to enable End-to-End Encryption.";
+        Object.assign(d.style, { fontSize:"12px",color:PAL.textDim,display:"block",marginBottom:"10px",lineHeight:"1.4" });
+        const b = document.createElement("button");
+        b.textContent = "Accept & Connect";
+        Object.assign(b.style, {
+            background:`linear-gradient(135deg, ${PAL.accent}, ${PAL.accentDim})`,color:PAL.bg,border:"none",
+            padding:"8px 16px",borderRadius:"10px",cursor:"pointer",fontWeight:"bold",fontSize:"13px",
+            transition:"all .2s",boxShadow:`0 4px 16px ${PAL.accentGlow}`,
         });
-
-        const desc = document.createElement("span");
-        desc.textContent = "Your friend wants to enable End-to-End Encryption.";
-        Object.assign(desc.style, {
-            fontSize: "12px",
-            color: "var(--color-neutrals-n-500,#555)",
-            display: "block",
-            marginBottom: "8px",
-        });
-
-        const btn = document.createElement("button");
-        btn.textContent = "Accept & Connect";
-        btn.className = "bb-accept-hs-btn";
-        Object.assign(btn.style, {
-            background: "var(--color-primary-p-50,#00ab80)",
-            color: "#fff",
-            border: "none",
-            padding: "6px 12px",
-            borderRadius: "6px",
-            cursor: "pointer",
-            fontWeight: "bold",
-            fontSize: "13px",
-            transition: "background 0.2s",
-        });
-
-        btn.addEventListener("click", async (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            btn.disabled = true;
-            btn.textContent = "Connecting...";
+        b.onmouseenter = () => b.style.transform = "scale(1.03)";
+        b.onmouseleave = () => b.style.transform = "";
+        b.onclick = async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            b.disabled = true; b.textContent = "⏳ Connecting..."; b.style.opacity = ".7";
             try {
                 await withHsLock(async () => {
-                    const pair = await _hsNewPair();
-                    const myPub = await _hsPubRaw(pair.publicKey);
-                    const key = await _hsDeriveKeyStr(pair.privateKey, theirPub);
-
-                    saveChatSettings({ enabled: true, customKey: key });
-                    syncInputVisibility();
-
-                    const rPay = new Uint8Array(1 + 4 + myPub.length);
-                    rPay[0] = CONFIG.HS_TYPE_RESPONSE;
-                    rPay.set(getTimestampBytes(), 1);
-                    rPay.set(myPub, 5);
-
-                    const rB64 = btoa(String.fromCharCode.apply(null, rPay));
-                    const rMsg = CONFIG.HANDSHAKE_PREFIX + rB64;
-
-                    markHashProcessed(chatId, msgHash);
-                    markHashProcessed(chatId, computeHash(rB64));
-
-                    await _sendRaw(rMsg);
-                    _visualizeHs(el, "✅ Bridge Accepted");
-                    _showToast(
-                        "🛡️ Bridge secured! Fingerprint: " + getSecurityFingerprint(),
-                        7000
-                    );
+                    const pair = await _hsNewPair(), myPub = await _hsPubRaw(pair.publicKey);
+                    const key = await _hsDeriveKey(pair.privateKey, theirPub);
+                    saveChatSettings({ enabled:true, customKey:key }); syncVis();
+                    const rp = new Uint8Array(1+4+myPub.length);
+                    rp[0] = CFG.HS_RES; rp.set(tsBytes(),1); rp.set(myPub,5);
+                    const rb = btoa(String.fromCharCode(...rp));
+                    markHash(cid, mh); markHash(cid, cHash(rb));
+                    await _sendRaw(CFG.PFX_HS + rb);
+                    _vizHs(el, "✅ Bridge Accepted");
+                    toast("🛡️ Secured! Fingerprint: " + getFingerprint(), 7000);
                 });
-            } catch (err) {
-                console.error("[BB] Accept failed:", err);
-                btn.disabled = false;
-                btn.textContent = "Error! Try Again";
-            }
-        });
-
-        container.appendChild(title);
-        container.appendChild(desc);
-        container.appendChild(btn);
-        el.appendChild(container);
-        el.style.display = "block";
+            } catch (err) { console.error("[BB] Accept fail", err); b.disabled = false; b.textContent = "Retry"; b.style.opacity = "1"; }
+        };
+        box.appendChild(t); box.appendChild(d); box.appendChild(b);
+        el.appendChild(box); el.style.display = "block";
     }
 
     async function _handleHS(b64, el) {
-        const chatId = getChatId();
-        const msgHash = computeHash(b64);
-
-        if (isHashProcessed(chatId, msgHash)) {
-            _visualizeHs(el, "🤝 Bridge Request Processed");
-            return;
-        }
-
+        const cid = getChatId(), mh = cHash(b64);
+        if (isHashed(cid, mh)) { _vizHs(el, "🤝 Processed"); return; }
         return withHsLock(async () => {
-            // Re-check after acquiring lock (another concurrent call may have processed it)
-            if (isHashProcessed(chatId, msgHash)) {
-                _visualizeHs(el, "🤝 Bridge Request Processed");
-                return;
-            }
-
+            if (isHashed(cid, mh)) { _vizHs(el, "🤝 Processed"); return; }
             try {
-                // Validate base64 before decoding
-                if (!/^[A-Za-z0-9+/=]+$/.test(b64)) {
-                    _visualizeHs(el, "❌ Invalid handshake data");
-                    return;
-                }
-
-                const binary = atob(b64);
-                const raw = new Uint8Array(binary.length);
-                for (let i = 0; i < binary.length; i++) raw[i] = binary.charCodeAt(i);
-
-                // Validate minimum payload size: type(1) + timestamp(4) + pubkey(65) = 70
-                if (raw.length < 70) {
-                    _visualizeHs(el, "❌ Malformed handshake");
-                    markHashProcessed(chatId, msgHash);
-                    return;
-                }
-
-                const type = raw[0];
-                const ts = readTimestamp(raw.subarray(1, 5));
-                const theirPub = raw.subarray(5);
-
-                // Validate timestamp
-                const now = Math.floor(Date.now() / 1000);
-                const age = now - ts;
-                if (age > CONFIG.HANDSHAKE_EXPIRY_SEC || age < -60) {
-                    // Also reject future timestamps (clock skew tolerance: 60s)
-                    markHashProcessed(chatId, msgHash);
-                    _visualizeHs(el, "⌛ Expired Bridge Request");
-                    return;
-                }
-
-                if (type === CONFIG.HS_TYPE_REQUEST) {
-                    if (!el._hsBound) {
-                        renderAcceptButton(el, theirPub, msgHash, chatId);
-                        el._hsBound = true;
-                    }
-                } else if (type === CONFIG.HS_TYPE_RESPONSE) {
-                    const privJwkStr = sessionStorage.getItem("bb_pending_hs_" + chatId);
-                    if (!privJwkStr) {
-                        markHashProcessed(chatId, msgHash);
-                        _visualizeHs(el, "❌ Orphaned Bridge Accept");
-                        return;
-                    }
-
-                    let privJwk;
-                    try {
-                        privJwk = JSON.parse(privJwkStr);
-                    } catch {
-                        markHashProcessed(chatId, msgHash);
-                        _visualizeHs(el, "❌ Corrupt key data");
-                        return;
-                    }
-
-                    const privKey = await crypto.subtle.importKey(
-                        "jwk",
-                        privJwk,
-                        { name: "ECDH", namedCurve: "P-256" },
-                        false,
-                        ["deriveBits"]
-                    );
-
-                    const key = await _hsDeriveKeyStr(privKey, theirPub);
-
-                    // Clear private key immediately after use
-                    sessionStorage.removeItem("bb_pending_hs_" + chatId);
-
-                    saveChatSettings({ enabled: true, customKey: key });
-                    syncInputVisibility();
-
-                    markHashProcessed(chatId, msgHash);
-                    _visualizeHs(el, "✅ Bridge Completed");
-                    _showToast(
-                        "🛡️ Bridge secured! Verify Code: " + getSecurityFingerprint(),
-                        7000
-                    );
-
-                    // Send verification message after short delay
+                const bin = atob(b64), raw = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+                if (raw.length < 70) { markHash(cid,mh); _vizHs(el,"❌ Malformed"); return; }
+                const type = raw[0], ts = readTs(raw.subarray(1,5)), them = raw.subarray(5);
+                const age = Math.floor(Date.now()/1000) - ts;
+                if (age > CFG.HS_EXPIRY || age < -60) { markHash(cid,mh); _vizHs(el,"⌛ Expired"); return; }
+                if (type === CFG.HS_REQ) {
+                    if (!el._hsBound) { renderAcceptBtn(el, them, mh, cid); el._hsBound = true; }
+                } else if (type === CFG.HS_RES) {
+                    const ps = sessionStorage.getItem("bb_hs_" + cid);
+                    if (!ps) { markHash(cid,mh); _vizHs(el,"❌ Orphaned"); return; }
+                    let pj; try { pj = JSON.parse(ps); } catch(_) { markHash(cid,mh); _vizHs(el,"❌ Corrupt key"); return; }
+                    const pk = await crypto.subtle.importKey("jwk", pj, { name:"ECDH", namedCurve:"P-256" }, false, ["deriveBits"]);
+                    const key = await _hsDeriveKey(pk, them);
+                    sessionStorage.removeItem("bb_hs_" + cid);
+                    saveChatSettings({ enabled:true, customKey:key }); syncVis();
+                    markHash(cid, mh);
+                    _vizHs(el, "✅ Bridge Complete");
+                    toast("🛡️ Secured! Code: " + getFingerprint(), 7000);
                     setTimeout(async () => {
                         try {
-                            const fp = getSecurityFingerprint();
-                            const msg = [
-                                "✅ Secure Bridge Established!",
-                                "",
-                                "🛡️ MITM Check: Both of you should see the exact identical code below:",
-                                "",
-                                "# " + fp,
-                                "",
-                                "If your friend sees a different code, someone is intercepting this chat.",
-                            ].join("\n");
-                            const successEnc = await encryptChunked(msg);
-                            if (successEnc) {
-                                for (const chunk of successEnc) await _sendRaw(chunk);
-                            }
-                        } catch (e) {
-                            console.error("[BB] Verification message failed:", e);
-                        }
+                            const fp = getFingerprint();
+                            const msg = `✅ Secure Bridge Established!\n\n🛡️ MITM Check — both sides must see:\n\n# ${fp}\n\nDifferent code = interception.`;
+                            const chunks = await encryptChunked(msg);
+                            if (chunks) for (const c of chunks) await _sendRaw(c);
+                        } catch(_){}
                     }, 1000);
-                } else {
-                    markHashProcessed(chatId, msgHash);
-                    _visualizeHs(el, "❌ Unknown handshake type");
-                }
-            } catch (e) {
-                console.error("[BB] Handshake error:", e);
-                _visualizeHs(el, "❌ Handshake failed");
-            }
+                } else { markHash(cid,mh); _vizHs(el,"❌ Unknown type"); }
+            } catch (e) { console.error("[BB] HS error", e); _vizHs(el, "❌ Failed"); }
         });
     }
 
-    // ─── 4. DOM Scanner & XSS-Safe Rendering ─────────────────────────────────
-    const _ESC_MAP = Object.freeze({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;",
-    });
-    const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => _ESC_MAP[c]);
+    // ─── 4. DOM Scanner & Renderer ────────────────────────────────────────────
+    const ESC = Object.freeze({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"});
+    const esc = s => s.replace(/[&<>"']/g, c => ESC[c]);
 
-    function sanitizeUrl(url) {
-        try {
-            const parsed = new URL(url);
-            if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-                return escapeHtml(parsed.href); // Use parsed.href to normalize
-            }
-        } catch {
-            // Invalid URL
-        }
-        return "#";
+    function safeUrl(url) {
+        try { const u = new URL(url); if (u.protocol === "http:" || u.protocol === "https:") return esc(u.href); } catch(_){} return "#";
     }
 
-    /**
-     * SECURITY: Markdown rendering. All user text is escaped before being
-     * inserted into HTML templates. The rendering functions only add structural
-     * HTML tags around already-escaped content.
-     */
-    function applyInlineMarkdown(escaped) {
-        // Note: `escaped` is already HTML-escaped. The regex patterns only match
-        // markdown syntax characters that survive escaping.
-        return escaped
-            .replace(
-                /``([^`]+)``|`([^`]+)`/g,
-                (_, a, b) =>
-                    `<code style="background:var(--color-neutrals-n-20,#f4f5f7);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.92em">${a ?? b}</code>`
-            )
-            .replace(
-                /\|\|(.+?)\|\|/g,
-                (_, t) =>
-                    `<span class="bb-spoiler" style="background:var(--color-neutrals-n-400,#42526e);color:transparent;border-radius:3px;padding:0 3px;cursor:pointer;user-select:none" title="Click to reveal">${t}</span>`
-            )
-            .replace(
-                /\*\*\*(.+?)\*\*\*/g,
-                (_, t) => `<strong><em>${t}</em></strong>`
-            )
-            .replace(/\*\*(.+?)\*\*/g, (_, t) => `<strong>${t}</strong>`)
-            .replace(
-                /(?<![_a-zA-Z0-9])__(.+?)__(?![_a-zA-Z0-9])/g,
-                (_, t) => `<u>${t}</u>`
-            )
-            .replace(/\*([^*\n]+)\*/g, (_, t) => `<em>${t}</em>`)
-            .replace(
-                /(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?=[^a-zA-Z0-9_]|$)/g,
-                (_, p, t) => `${p}<em>${t}</em>`
-            )
-            .replace(/~~(.+?)~~/g, (_, t) => `<del>${t}</del>`)
-            .replace(
-                /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-                (_, label, url) =>
-                    `<a href="${sanitizeUrl(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`
-            );
+    function inlineMd(s) {
+        return s
+            .replace(/``([^`]+)``|`([^`]+)`/g, (_,a,b) => `<code class="bb-code">${a??b}</code>`)
+            .replace(/\|\|(.+?)\|\|/g, (_,t) => `<span class="bb-spoiler" title="Click to reveal">${t}</span>`)
+            .replace(/\*\*\*(.+?)\*\*\*/g, (_,t) => `<strong><em>${t}</em></strong>`)
+            .replace(/\*\*(.+?)\*\*/g, (_,t) => `<strong>${t}</strong>`)
+            .replace(/(?<![_a-zA-Z0-9])__(.+?)__(?![_a-zA-Z0-9])/g, (_,t) => `<u>${t}</u>`)
+            .replace(/\*([^*\n]+)\*/g, (_,t) => `<em>${t}</em>`)
+            .replace(/(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?=[^a-zA-Z0-9_]|$)/g, (_,p,t) => `${p}<em>${t}</em>`)
+            .replace(/~~(.+?)~~/g, (_,t) => `<del>${t}</del>`)
+            .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_,l,u) => `<a href="${safeUrl(u)}" target="_blank" rel="noopener noreferrer" class="bb-link">${l}</a>`);
     }
 
-    const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
-
-    function processLine(line) {
-        const escaped = escapeHtml(line);
-        const parts = [];
-        let last = 0;
-        _URL_RE.lastIndex = 0;
-        let m;
-        while ((m = _URL_RE.exec(escaped)) !== null) {
-            parts.push(applyInlineMarkdown(escaped.slice(last, m.index)));
-            const safeUrl = sanitizeUrl(m[0]);
-            parts.push(
-                `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline;word-break:break-all">${safeUrl}</a>`
-            );
+    const URL_RX = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
+    function procLine(rawLine) {
+        const parts = []; let last = 0; URL_RX.lastIndex = 0; let m;
+        while ((m = URL_RX.exec(rawLine)) !== null) {
+            parts.push(inlineMd(esc(rawLine.slice(last, m.index))));
+            const su = safeUrl(m[0]);
+            parts.push(`<a href="${su}" target="_blank" rel="noopener noreferrer" class="bb-link" style="word-break:break-all">${su}</a>`);
             last = m.index + m[0].length;
         }
-        parts.push(applyInlineMarkdown(escaped.slice(last)));
+        parts.push(inlineMd(esc(rawLine.slice(last))));
         return parts.join("");
     }
 
-    function renderDecrypted(plain) {
-        const lines = plain.split("\n");
-        const out = [];
-        let i = 0;
-        const bidiBlock = (html) =>
-            `<span dir="auto" class="bb-block">${html}</span>`;
-
+    function renderDec(plain) {
+        const lines = plain.split("\n"), out = []; let i = 0;
+        const blk = h => `<span dir="auto" class="bb-block">${h}</span>`;
         while (i < lines.length) {
-            const line = lines[i];
-
-            // Blockquotes
-            if (line.startsWith("> ") || line === ">") {
-                const qLines = [];
-                while (
-                    i < lines.length &&
-                    (lines[i].startsWith("> ") || lines[i] === ">")
-                ) {
-                    qLines.push(lines[i++].replace(/^> ?/, ""));
-                }
-                out.push(
-                    `<span dir="auto" class="bb-quote">${qLines
-                        .map(processLine)
-                        .join("<br>")}</span>`
-                );
-                continue;
+            const L = lines[i];
+            if (L.startsWith("> ") || L === ">") {
+                const q = [];
+                while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">")) q.push(lines[i++].replace(/^> ?/,""));
+                out.push(`<span dir="auto" class="bb-quote">${q.map(procLine).join("<br>")}</span>`); continue;
             }
-
-            // Unordered lists
-            if (/^[-*+] /.test(line)) {
-                const items = [];
-                while (i < lines.length && /^[-*+] /.test(lines[i])) {
-                    items.push(
-                        `<li class="bb-li">${processLine(lines[i++].slice(2))}</li>`
-                    );
-                }
-                out.push(`<ul dir="auto" class="bb-ul">${items.join("")}</ul>`);
-                continue;
+            if (/^[-*+] /.test(L)) {
+                const it = [];
+                while (i < lines.length && /^[-*+] /.test(lines[i])) it.push(`<li class="bb-li">${procLine(lines[i++].slice(2))}</li>`);
+                out.push(`<ul dir="auto" class="bb-ul">${it.join("")}</ul>`); continue;
             }
-
-            // Ordered lists
-            if (/^\d+\. /.test(line)) {
-                const items = [];
-                while (i < lines.length && /^\d+\. /.test(lines[i])) {
-                    items.push(
-                        `<li class="bb-li">${processLine(
-                            lines[i++].replace(/^\d+\. /, "")
-                        )}</li>`
-                    );
-                }
-                out.push(`<ol dir="auto" class="bb-ol">${items.join("")}</ol>`);
-                continue;
+            if (/^\d+\. /.test(L)) {
+                const it = [];
+                while (i < lines.length && /^\d+\. /.test(lines[i])) it.push(`<li class="bb-li">${procLine(lines[i++].replace(/^\d+\. /,""))}</li>`);
+                out.push(`<ol dir="auto" class="bb-ol">${it.join("")}</ol>`); continue;
             }
-
-            // Headers
-            const hm = line.match(/^(#{1,3}) (.+)/);
-            if (hm) {
-                const sz = ["1.25em", "1.1em", "1em"][
-                    Math.min(hm[1].length, 3) - 1
-                ];
-                out.push(
-                    bidiBlock(
-                        `<span style="font-weight:700;font-size:${sz}">${processLine(
-                            hm[2]
-                        )}</span>`
-                    )
-                );
-                i++;
-                continue;
-            }
-
-            // Horizontal rules
-            if (/^([-*_])\1{2,}$/.test(line.trim())) {
-                out.push(`<span class="bb-hr"></span>`);
-                i++;
-                continue;
-            }
-
-            // Empty lines
-            if (line.trim() === "") {
-                out.push(`<span class="bb-spacer"></span>`);
-                i++;
-                continue;
-            }
-
-            // Regular text
-            out.push(bidiBlock(processLine(line)));
-            i++;
+            const hm = L.match(/^(#{1,3}) (.+)/);
+            if (hm) { const sz=["1.25em","1.1em","1em"][Math.min(hm[1].length,3)-1]; out.push(blk(`<span style="font-weight:700;font-size:${sz}">${procLine(hm[2])}</span>`)); i++; continue; }
+            if (/^([-*_])\1{2,}$/.test(L.trim())) { out.push(`<span class="bb-hr"></span>`); i++; continue; }
+            if (L.trim() === "") { out.push(`<span class="bb-spacer"></span>`); i++; continue; }
+            out.push(blk(procLine(L))); i++;
         }
         return out.join("");
     }
 
-    // ─── Tree Scanner ────────────────────────────────────────────────────────
-    /**
-     * BUG FIX: The original scanner iterated a live HTMLCollection while
-     * potentially mutating DOM. We snapshot to an array first.
-     *
-     * SECURITY: We skip elements that are part of our own UI to prevent
-     * self-processing loops.
-     */
-    const SKIP_IDS = new Set([
-        "secure-input-overlay",
-        "secure-edit-overlay",
-        "editable-message-text",
-        "main-message-input",
-        "bb-no-key-notice",
-        "bale-bridge-menu",
-        "bb-modal-overlay",
-    ]);
-
-    // Track in-flight decryption promises to prevent double-processing
-    const _decryptionInFlight = new WeakSet();
+    const SKIP_IDS = new Set(["secure-input-overlay","secure-edit-overlay","editable-message-text","main-message-input","bb-no-key-notice","bale-bridge-menu","bb-modal-overlay"]);
+    const _inflight = new WeakSet();
 
     function scanTree(root) {
-        // Snapshot live collection to avoid mutation issues
         const els = Array.from(root.getElementsByTagName("*"));
-        for (let idx = 0, len = els.length; idx < len; idx++) {
-            const el = els[idx];
-            if (el._isDecrypted || _decryptionInFlight.has(el)) continue;
+        for (const el of els) {
+            if (el._isDecrypted || _inflight.has(el)) continue;
             if (SKIP_IDS.has(el.id)) continue;
+            const txt = el.textContent; if (txt.length <= 20) continue;
+            const trim = txt.trim();
 
-            const text = el.textContent;
-            if (text.length <= 20) continue;
-
-            const trimmed = text.trim();
-
-            // Handshake messages
-            const matchHs = trimmed.match(/^!!([A-Za-z0-9+/=]{40,})$/);
-            if (matchHs) {
-                // Skip if a child already contains the handshake text
-                let childHas = false;
-                for (const c of el.children) {
-                    if (c.textContent.includes("!!")) {
-                        childHas = true;
-                        break;
-                    }
-                }
-                if (childHas) continue;
-
+            const mhs = trim.match(/^!!([A-Za-z0-9+/=]{40,})/);
+            if (mhs) {
+                let skip = false;
+                for (const c of el.children) { if (c.textContent.includes("!!")) { skip = true; break; } }
+                if (skip) continue;
                 el._isDecrypted = true;
-                _handleHS(matchHs[1], el).catch((e) =>
-                    console.error("[BB] HS error:", e)
-                );
+                _handleHS(mhs[1], el).catch(e => console.error("[BB]", e));
                 continue;
             }
-
-            // Encrypted messages
-            if (
-                trimmed.startsWith(CONFIG.ENCRYPTED_PREFIX) &&
-                trimmed.length > 20
-            ) {
-                // Skip if a child element contains the exact same text
-                let childHas = false;
-                for (const c of el.children) {
-                    if (c.textContent.trim() === trimmed) {
-                        childHas = true;
-                        break;
-                    }
-                }
-                if (childHas) continue;
-
-                _decryptionInFlight.add(el);
-                decrypt(trimmed)
-                    .then((plain) => {
-                        if (plain !== trimmed) {
-                            if (!el._bbOverflowSet) {
-                                Object.assign(el.style, {
-                                    overflow: "hidden",
-                                    overflowWrap: "anywhere",
-                                    wordBreak: "break-word",
-                                    maxWidth: "100%",
-                                });
-                                el.classList.add("bb-msg-container");
-                                el._bbOverflowSet = true;
-                            }
-
-                            // Build decrypted content
-                            // SECURITY: renderDecrypted uses escapeHtml on all user text
-                            const rendered = renderDecrypted(plain);
-
-                            // Build the "encrypted" badge with copy button safely
-                            const badgeHtml = `<span style="display:inline-block;font-size:9px;opacity:0.5;letter-spacing:0.02em;font-style:italic;margin-inline-start:5px;vertical-align:middle;line-height:1;white-space:nowrap">
-                                🔒 encrypted
-                                <span class="bb-copy-btn" title="Copy decrypted message" style="cursor:pointer;margin-inline-start:4px;font-size:11px;font-style:normal;transition:opacity 0.2s;">📋</span>
-                            </span>`;
-
-                            el.innerHTML = rendered + badgeHtml;
-                            el.style.color = "inherit";
-                            el._isDecrypted = true;
-
-                            const copyBtn = el.querySelector(".bb-copy-btn");
-                            if (copyBtn) {
-                                copyBtn.addEventListener("click", (e) => {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    navigator.clipboard
-                                        .writeText(plain)
-                                        .then(() => {
-                                            copyBtn.textContent = "✅";
-                                            setTimeout(
-                                                () => (copyBtn.textContent = "📋"),
-                                                1500
-                                            );
-                                        })
-                                        .catch(() => {
-                                            // Clipboard API may not be available
-                                            _showToast("Failed to copy", 2000);
-                                        });
-                                });
-                            }
+            if (trim.startsWith(CFG.PFX_ENC) && trim.length > 20) {
+                let skip = false;
+                for (const c of el.children) { if (c.textContent.trim() === trim) { skip = true; break; } }
+                if (skip) continue;
+                _inflight.add(el);
+                decrypt(trim).then(plain => {
+                    if (plain !== trim) {
+                        if (!el._bbOvf) {
+                            Object.assign(el.style, { overflow:"hidden", overflowWrap:"anywhere", wordBreak:"break-word", maxWidth:"100%" });
+                            el.classList.add("bb-msg-container"); el._bbOvf = true;
                         }
-                    })
-                    .catch((e) => console.error("[BB] Decrypt error:", e))
-                    .finally(() => {
-                        _decryptionInFlight.delete(el);
-                    });
+                        el.innerHTML = renderDec(plain) + `<span class="bb-enc-badge">🔒<span class="bb-copy-btn" title="Copy">📋</span></span>`;
+                        el.style.color = "inherit"; el._isDecrypted = true;
+                        const cb = el.querySelector(".bb-copy-btn");
+                        if (cb) cb.onclick = (e) => { e.preventDefault(); e.stopPropagation(); navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1500); }).catch(()=>{}); };
+                    }
+                }).catch(e => console.error("[BB]", e)).finally(() => _inflight.delete(el));
             }
         }
     }
 
-    // ─── 5. Input Helpers & UI Styles ─────────────────────────────────────────
-    // Spoiler click handler (delegated)
-    document.addEventListener(
-        "click",
-        (e) => {
-            const sp = e.target.closest(".bb-spoiler");
-            if (!sp) return;
-            sp.style.color = "inherit";
-            sp.style.background = "var(--color-neutrals-n-40,#dfe1e6)";
-        },
-        true
-    );
+    // ─── 5. Spoiler handler ───────────────────────────────────────────────────
+    document.addEventListener("click", e => {
+        const sp = e.target.closest(".bb-spoiler");
+        if (sp) { sp.style.color = "inherit"; sp.style.background = PAL.border; }
+    }, true);
 
-    // Inject styles via a single style element
-    const styleEl = document.createElement("style");
-    styleEl.textContent = `
-        #secure-input-overlay {
-            width:100%;box-sizing:border-box;min-height:44px;max-height:150px;overflow-y:auto;
-            background-color:var(--color-neutrals-surface,#fff);border:2px solid var(--color-primary-p-50,#00ab80);
-            box-shadow:0 4px 12px rgba(0,171,128,.15);border-radius:16px;padding:10px 16px;
-            font-family:inherit;font-size:inherit;outline:none;white-space:pre-wrap;word-break:break-word;
-            margin-right:10px;resize:none;color:var(--color-neutrals-n-600,#151515);z-index:100;
-            position:relative;transition:box-shadow .2s ease,border-color .2s ease;display:block;
-        }
-        #secure-input-overlay:focus{box-shadow:0 4px 16px rgba(0,171,128,.3);border-color:var(--color-primary-p-60,#00916d)}
-        div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:var(--color-neutrals-n-300,#888);pointer-events:none;display:block}
+    // ─── 6. Styles ────────────────────────────────────────────────────────────
+    const sty = document.createElement("style");
+    sty.textContent = `
+/* ─── Secure Input ─── */
+#secure-input-overlay {
+    width:100%;box-sizing:border-box;min-height:44px;max-height:150px;overflow-y:auto;
+    background:${PAL.surface};border:2px solid ${PAL.accent};
+    box-shadow:0 0 20px ${PAL.accentGlow}, inset 0 0 0 1px rgba(0,230,160,.05);
+    border-radius:16px;padding:10px 16px;font-family:inherit;font-size:inherit;outline:none;
+    white-space:pre-wrap;word-break:break-word;margin-right:10px;resize:none;
+    color:${PAL.text};z-index:100;position:relative;
+    transition:box-shadow .3s,border-color .3s;display:block;
+}
+#secure-input-overlay:focus {
+    box-shadow:0 0 30px ${PAL.accentGlow}, 0 0 60px rgba(0,230,160,.08);
+    border-color:${PAL.accent};
+}
+div#secure-input-overlay:empty::before {
+    content:attr(data-placeholder);color:${PAL.textMuted};pointer-events:none;display:block;
+}
 
-        #bb-no-key-notice {
-            display:none;align-items:flex-start;gap:10px;
-            width:100%;box-sizing:border-box;padding:10px 14px;margin-right:10px;
-            background:#fff8e1;border:2px solid #f9a825;border-radius:16px;
-            font-family:inherit;font-size:13px;color:#4a3400;line-height:1.5;
-            position:relative;z-index:101;
-        }
-        #bb-no-key-notice .bb-notice-icon{font-size:20px;flex-shrink:0;margin-top:1px}
-        #bb-no-key-notice .bb-notice-body{flex:1}
-        #bb-no-key-notice strong{display:block;font-size:13px;margin-bottom:3px;color:#b45309}
-        #bb-no-key-notice .bb-notice-btn{
-            display:inline-block;margin-top:7px;padding:5px 12px;border-radius:8px;border:none;
-            background:#f9a825;color:#fff;font-size:12px;font-weight:700;cursor:pointer;
-            transition:background .15s;
-        }
-        #bb-no-key-notice .bb-notice-btn:hover{background:#f59e0b}
+/* ─── No-Key Notice ─── */
+#bb-no-key-notice {
+    display:none;align-items:flex-start;gap:10px;width:100%;box-sizing:border-box;
+    padding:12px 16px;margin-right:10px;
+    background:${PAL.warnBg};border:2px solid ${PAL.warn};border-radius:16px;
+    font-family:inherit;font-size:13px;color:${PAL.warn};line-height:1.5;
+    position:relative;z-index:101;backdrop-filter:blur(8px);
+}
+#bb-no-key-notice .bb-notice-icon{font-size:20px;flex-shrink:0;margin-top:1px}
+#bb-no-key-notice .bb-notice-body{flex:1}
+#bb-no-key-notice strong{display:block;font-size:13px;margin-bottom:3px;color:${PAL.warn}}
+#bb-no-key-notice .bb-notice-btn{
+    display:inline-block;margin-top:7px;padding:6px 14px;border-radius:10px;border:none;
+    background:linear-gradient(135deg,${PAL.warn},#e6a817);color:${PAL.bg};
+    font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;
+    box-shadow:0 4px 16px rgba(210,153,34,.25);
+}
+#bb-no-key-notice .bb-notice-btn:hover{transform:scale(1.03);box-shadow:0 6px 20px rgba(210,153,34,.35)}
 
-        #bale-bridge-menu{
-            position:fixed;z-index:999999;background:var(--color-neutrals-surface,#fff);
-            border:1px solid var(--color-neutrals-n-40,#dfe1e6);border-radius:12px;
-            box-shadow:0 8px 24px rgba(0,0,0,.15);display:none;flex-direction:column;overflow:hidden;
-            font-family:inherit;color:var(--color-neutrals-n-500,#091e42);min-width:180px;
-            animation:bb-pop .2s cubic-bezier(.2,.8,.2,1);
-        }
-        .bale-menu-item{padding:14px 18px;cursor:pointer;font-size:14px;font-weight:500;transition:background .15s;display:flex;align-items:center;gap:12px}
-        .bale-menu-item:hover{background:var(--color-neutrals-n-20,#f4f5f7)}
+/* ─── Context Menu ─── */
+#bale-bridge-menu {
+    position:fixed;z-index:999999;
+    background:${PAL.glass};border:1px solid ${PAL.glassBorder};border-radius:16px;
+    box-shadow:0 16px 48px rgba(0,0,0,.5);display:none;flex-direction:column;overflow:hidden;
+    font-family:inherit;color:${PAL.text};min-width:200px;
+    backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+    animation:bb-pop .2s cubic-bezier(.2,.8,.2,1);
+}
+.bale-menu-item {
+    padding:14px 20px;cursor:pointer;font-size:14px;font-weight:500;
+    transition:all .15s;display:flex;align-items:center;gap:12px;
+}
+.bale-menu-item:hover{background:rgba(255,255,255,.06)}
+.bale-menu-item:active{background:rgba(255,255,255,.1)}
 
-        #bb-modal-overlay{
-            position:fixed;inset:0;background:rgba(0,0,0,.4);backdrop-filter:blur(3px);
-            display:flex;align-items:center;justify-content:center;z-index:9999999;
-            animation:bb-fade .2s ease-out;
-        }
-        #bb-modal-card{
-            background:var(--color-neutrals-surface,#fff);padding:24px;border-radius:20px;
-            width:360px;max-width:92vw;box-shadow:0 10px 40px rgba(0,0,0,.25);
-            color:var(--color-neutrals-n-600,#151515);font-family:inherit;
-            animation:bb-pop .3s cubic-bezier(.2,.8,.2,1);
-        }
-        .bb-modal-title{margin:0 0 10px;font-size:18px;font-weight:bold}
-        .bb-modal-desc{margin:0 0 20px;font-size:13px;color:var(--color-neutrals-n-300,#888)}
-        .bb-input{
-            width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--color-neutrals-n-100,#ccc);
-            box-sizing:border-box;background:transparent;color:inherit;
-            font-family:monospace;font-size:13px;transition:border-color .2s;letter-spacing:.04em;
-        }
-        .bb-input:focus{outline:none;border-color:var(--color-primary-p-50,#00ab80)}
-        .bb-key-row{display:flex;gap:8px;align-items:center;margin-top:6px}
-        .bb-key-row .bb-input{flex:1;margin-top:0}
-        .bb-icon-btn{
-            flex-shrink:0;padding:0;width:36px;height:36px;border-radius:8px;border:1px solid var(--color-neutrals-n-100,#ccc);
-            background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;
-            font-size:16px;transition:background .15s,border-color .15s;color:inherit;
-        }
-        .bb-icon-btn:hover{background:var(--color-neutrals-n-20,#f4f5f7);border-color:var(--color-primary-p-50,#00ab80)}
-        .bb-icon-btn.copied{background:#e8f5e9;border-color:#43a047;color:#43a047}
-        .bb-key-tools{display:flex;gap:8px;margin-top:8px}
-        .bb-tool-btn{
-            flex:1;padding:7px 0;border-radius:8px;border:1px solid var(--color-neutrals-n-100,#ccc);
-            background:transparent;cursor:pointer;font-size:12px;font-weight:600;
-            display:flex;align-items:center;justify-content:center;gap:5px;
-            transition:background .15s,border-color .15s;color:inherit;
-        }
-        .bb-tool-btn:hover{background:var(--color-neutrals-n-20,#f4f5f7);border-color:var(--color-primary-p-50,#00ab80)}
-        .bb-toggle-lbl{display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer}
-        .bb-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}
-        .bb-btn{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-size:14px;transition:background .2s,transform .1s}
-        .bb-btn:active{transform:scale(.95)}
-        .bb-btn-cancel{background:transparent;color:var(--color-neutrals-n-300,#888)}
-        .bb-btn-cancel:hover{background:var(--color-neutrals-n-20,#f4f5f7)}
-        .bb-btn-save{background:var(--color-primary-p-50,#00ab80);color:#fff}
-        .bb-btn-save:hover{background:var(--color-primary-p-60,#00916d)}
-        .bb-btn-save:disabled{background:var(--color-neutrals-n-100,#ccc);cursor:not-allowed;transform:none}
-        .bb-key-meta{display:flex;justify-content:space-between;align-items:center;margin-top:6px;font-size:11px}
-        .bb-key-counter{color:var(--color-neutrals-n-300,#888)}
-        .bb-key-counter.exact{color:var(--color-primary-p-50,#00ab80);font-weight:600}
-        .bb-key-error{color:#d32f2f;font-weight:500;font-size:11px;min-height:16px}
+/* ─── Modal ─── */
+#bb-modal-overlay {
+    position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+    display:flex;align-items:center;justify-content:center;z-index:9999999;
+    animation:bb-fade .2s ease-out;
+}
+#bb-modal-card {
+    background:${PAL.card};padding:28px;border-radius:24px;
+    width:380px;max-width:92vw;
+    box-shadow:0 24px 80px rgba(0,0,0,.6), 0 0 0 1px ${PAL.glassBorder};
+    color:${PAL.text};font-family:inherit;
+    animation:bb-pop .3s cubic-bezier(.2,.8,.2,1);
+}
+.bb-modal-title{margin:0 0 8px;font-size:20px;font-weight:700;letter-spacing:-.02em}
+.bb-modal-desc{margin:0 0 20px;font-size:13px;color:${PAL.textDim};line-height:1.5}
+.bb-input {
+    width:100%;padding:10px 14px;border-radius:10px;
+    border:1px solid ${PAL.border};box-sizing:border-box;
+    background:${PAL.surface};color:${PAL.text};
+    font-family:monospace;font-size:13px;transition:all .2s;letter-spacing:.04em;
+}
+.bb-input:focus{outline:none;border-color:${PAL.accent};box-shadow:0 0 0 3px ${PAL.accentGlow}}
+.bb-key-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+.bb-key-row .bb-input{flex:1;margin-top:0}
+.bb-icon-btn {
+    flex-shrink:0;padding:0;width:38px;height:38px;border-radius:10px;
+    border:1px solid ${PAL.border};background:${PAL.surface};cursor:pointer;
+    display:flex;align-items:center;justify-content:center;font-size:16px;
+    transition:all .2s;color:${PAL.text};
+}
+.bb-icon-btn:hover{border-color:${PAL.accent};background:rgba(0,230,160,.08);box-shadow:0 0 12px ${PAL.accentGlow}}
+.bb-icon-btn.copied{border-color:${PAL.accent};background:rgba(0,230,160,.15);color:${PAL.accent}}
+.bb-key-tools{display:flex;gap:8px;margin-top:10px}
+.bb-tool-btn {
+    flex:1;padding:8px 0;border-radius:10px;border:1px solid ${PAL.border};
+    background:${PAL.surface};cursor:pointer;font-size:12px;font-weight:600;
+    display:flex;align-items:center;justify-content:center;gap:6px;
+    transition:all .2s;color:${PAL.text};
+}
+.bb-tool-btn:hover{border-color:${PAL.accent};background:rgba(0,230,160,.06);color:${PAL.accent}}
+.bb-tool-btn.bridge{border-color:${PAL.accent};color:${PAL.accent}}
+.bb-tool-btn.bridge:hover{background:rgba(0,230,160,.12)}
+.bb-toggle-lbl{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer}
+.bb-toggle-lbl input[type="checkbox"]{width:18px;height:18px;accent-color:${PAL.accent};cursor:pointer}
+.bb-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}
+.bb-btn{padding:9px 18px;border-radius:10px;border:none;cursor:pointer;font-weight:600;font-size:14px;transition:all .2s}
+.bb-btn:active{transform:scale(.96)}
+.bb-btn-cancel{background:transparent;color:${PAL.textDim};border:1px solid ${PAL.border}}
+.bb-btn-cancel:hover{background:${PAL.surface};color:${PAL.text}}
+.bb-btn-save{background:linear-gradient(135deg,${PAL.accent},${PAL.accentDim});color:${PAL.bg};box-shadow:0 4px 16px ${PAL.accentGlow}}
+.bb-btn-save:hover{box-shadow:0 6px 24px rgba(0,230,160,.35);transform:translateY(-1px)}
+.bb-btn-save:disabled{background:${PAL.border};color:${PAL.textMuted};cursor:not-allowed;transform:none;box-shadow:none}
+.bb-key-meta{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:11px}
+.bb-key-error{color:${PAL.danger};font-weight:500;font-size:11px;min-height:16px}
+.bb-section-divider{margin-top:18px;border-top:1px solid ${PAL.border};padding-top:18px}
 
-        @keyframes bb-fade{from{opacity:0}to{opacity:1}}
-        @keyframes bb-pop{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+@keyframes bb-fade{from{opacity:0}to{opacity:1}}
+@keyframes bb-pop{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
 
-        .bb-block{display:block;unicode-bidi:plaintext}
-        .bb-quote{display:block;border-inline-start:3px solid var(--color-primary-p-50,#00ab80);padding:2px 10px;margin:2px 0;font-style:italic;opacity:.9;unicode-bidi:plaintext}
-        .bb-ul{margin:4px 0;padding-inline-start:22px;list-style:disc;unicode-bidi:plaintext}
-        .bb-ol{margin:4px 0;padding-inline-start:22px;list-style:decimal;unicode-bidi:plaintext}
-        .bb-li{margin:2px 0;padding-inline-start:2px}
-        .bb-hr{display:block;border-top:1px solid var(--color-neutrals-n-100,#ccc);margin:6px 0}
-        .bb-spacer{display:block;height:0.4em}
+/* ─── Message Rendering ─── */
+.bb-block{display:block;unicode-bidi:plaintext}
+.bb-quote{display:block;border-inline-start:3px solid ${PAL.accent};padding:3px 12px;margin:3px 0;font-style:italic;opacity:.85;unicode-bidi:plaintext;background:rgba(0,230,160,.04);border-radius:0 8px 8px 0}
+.bb-ul{margin:4px 0;padding-inline-start:22px;list-style:disc;unicode-bidi:plaintext}
+.bb-ol{margin:4px 0;padding-inline-start:22px;list-style:decimal;unicode-bidi:plaintext}
+.bb-li{margin:2px 0;padding-inline-start:2px}
+.bb-hr{display:block;border:none;border-top:1px solid ${PAL.border};margin:8px 0}
+.bb-spacer{display:block;height:.4em}
+.bb-code{background:${PAL.surface};border:1px solid ${PAL.border};border-radius:6px;padding:1px 6px;font-family:monospace;font-size:.9em;color:${PAL.accent}}
+.bb-spoiler{background:${PAL.textMuted};color:transparent;border-radius:4px;padding:0 4px;cursor:pointer;user-select:none;transition:all .2s}
+.bb-link{color:${PAL.accent};text-decoration:underline;text-decoration-color:rgba(0,230,160,.3);transition:text-decoration-color .2s}
+.bb-link:hover{text-decoration-color:${PAL.accent}}
+.bb-enc-badge{display:inline-block;font-size:9px;opacity:.45;letter-spacing:.02em;font-style:italic;margin-inline-start:6px;vertical-align:middle;line-height:1;white-space:nowrap}
+.bb-copy-btn{cursor:pointer;margin-inline-start:4px;font-size:11px;font-style:normal;transition:opacity .2s;opacity:.7}
+.bb-copy-btn:hover{opacity:1!important}
 
-        .BAsWs0 .bb-block,.MRlMpm .bb-block,.dialog-item-content .bb-block,.aqFHpt .bb-block,
-        .BAsWs0 .bb-quote,.MRlMpm .bb-quote,.dialog-item-content .bb-quote,.aqFHpt .bb-quote,
-        .BAsWs0 .bb-ul,.MRlMpm .bb-ul,.dialog-item-content .bb-ul,.aqFHpt .bb-ul,
-        .BAsWs0 .bb-ol,.MRlMpm .bb-ol,.dialog-item-content .bb-ol,.aqFHpt .bb-ol,
-        .BAsWs0 .bb-li,.MRlMpm .bb-li,.dialog-item-content .bb-li,.aqFHpt .bb-li{
-            display:inline!important;margin:0!important;padding:0!important;border:none!important
-        }
-        .BAsWs0 .bb-spacer,.MRlMpm .bb-spacer,.dialog-item-content .bb-spacer,.aqFHpt .bb-spacer,
-        .BAsWs0 .bb-hr,.MRlMpm .bb-hr,.dialog-item-content .bb-hr,.aqFHpt .bb-hr,
-        .BAsWs0 .bb-copy-btn,.MRlMpm .bb-copy-btn,.dialog-item-content .bb-copy-btn,.aqFHpt .bb-copy-btn{
-            display:none!important
-        }
-        .bb-copy-btn:hover{opacity:1!important}
-        .BAsWs0 .bb-li::after,.MRlMpm .bb-li::after,.dialog-item-content .bb-li::after,.aqFHpt .bb-li::after{
-            content:" \\00a0•\\00a0 "
-        }
-        .BAsWs0 .bb-msg-container,.MRlMpm .bb-msg-container,.dialog-item-content .bb-msg-container,.aqFHpt .bb-msg-container{
-            display:-webkit-box!important;-webkit-line-clamp:2!important;-webkit-box-orient:vertical!important;white-space:normal!important
-        }
-    `;
-    document.head.appendChild(styleEl);
+/* ─── Chat list previews ─── */
+.BAsWs0 .bb-block,.MRlMpm .bb-block,.dialog-item-content .bb-block,.aqFHpt .bb-block,
+.BAsWs0 .bb-quote,.MRlMpm .bb-quote,.dialog-item-content .bb-quote,.aqFHpt .bb-quote,
+.BAsWs0 .bb-ul,.MRlMpm .bb-ul,.dialog-item-content .bb-ul,.aqFHpt .bb-ul,
+.BAsWs0 .bb-ol,.MRlMpm .bb-ol,.dialog-item-content .bb-ol,.aqFHpt .bb-ol,
+.BAsWs0 .bb-li,.MRlMpm .bb-li,.dialog-item-content .bb-li,.aqFHpt .bb-li{
+    display:inline!important;margin:0!important;padding:0!important;border:none!important;background:none!important
+}
+.BAsWs0 .bb-spacer,.MRlMpm .bb-spacer,.dialog-item-content .bb-spacer,.aqFHpt .bb-spacer,
+.BAsWs0 .bb-hr,.MRlMpm .bb-hr,.dialog-item-content .bb-hr,.aqFHpt .bb-hr,
+.BAsWs0 .bb-copy-btn,.MRlMpm .bb-copy-btn,.dialog-item-content .bb-copy-btn,.aqFHpt .bb-copy-btn{display:none!important}
+.BAsWs0 .bb-li::after,.MRlMpm .bb-li::after,.dialog-item-content .bb-li::after,.aqFHpt .bb-li::after{content:" \\00a0•\\00a0 "}
+.BAsWs0 .bb-msg-container,.MRlMpm .bb-msg-container,.dialog-item-content .bb-msg-container,.aqFHpt .bb-msg-container{
+    display:-webkit-box!important;-webkit-line-clamp:2!important;-webkit-box-orient:vertical!important;white-space:normal!important
+}
+`;
+    document.head.appendChild(sty);
 
-    // ─── 6. Context Menu (Safe DOM construction) ──────────────────────────────
-    const popupMenu = document.createElement("div");
-    popupMenu.id = "bale-bridge-menu";
+    // ─── 7. Context Menu ──────────────────────────────────────────────────────
+    const popMenu = document.createElement("div");
+    popMenu.id = "bale-bridge-menu";
+    const mi1 = document.createElement("div"); mi1.className = "bale-menu-item"; mi1.textContent = "🔒 Send Encrypted";
+    mi1.onclick = () => { popMenu.style.display = "none"; window._bbSend?.(true); };
+    const mi2 = document.createElement("div"); mi2.className = "bale-menu-item"; mi2.textContent = "⚠️ Send Unencrypted";
+    mi2.onclick = () => { popMenu.style.display = "none"; window._bbSend?.(false); };
+    popMenu.appendChild(mi1); popMenu.appendChild(mi2);
+    document.body.appendChild(popMenu);
+    const showMenu = (x, y) => Object.assign(popMenu.style, { display:"flex", left:Math.min(x,innerWidth-220)+"px", top:Math.min(y,innerHeight-130)+"px" });
+    document.addEventListener("click", e => { if (!popMenu.contains(e.target)) popMenu.style.display = "none"; });
 
-    const menuEnc = document.createElement("div");
-    menuEnc.className = "bale-menu-item";
-    menuEnc.textContent = "🔒 Send Encrypted";
-    menuEnc.addEventListener("click", () => {
-        popupMenu.style.display = "none";
-        window._bbSend?.(true);
-    });
-
-    const menuPlain = document.createElement("div");
-    menuPlain.className = "bale-menu-item";
-    menuPlain.textContent = "⚠️ Send Unencrypted";
-    menuPlain.addEventListener("click", () => {
-        popupMenu.style.display = "none";
-        window._bbSend?.(false);
-    });
-
-    popupMenu.appendChild(menuEnc);
-    popupMenu.appendChild(menuPlain);
-    document.body.appendChild(popupMenu);
-
-    const showMenu = (x, y) => {
-        Object.assign(popupMenu.style, {
-            display: "flex",
-            left: Math.min(x, innerWidth - 210) + "px",
-            top: Math.min(y, innerHeight - 120) + "px",
-        });
-    };
-
-    document.addEventListener("click", (e) => {
-        if (!popupMenu.contains(e.target)) popupMenu.style.display = "none";
-    });
-
-    // ─── 7. Settings Modal (Safe DOM construction) ────────────────────────────
-    function openSettingsModal() {
+    // ─── 8. Settings Modal ────────────────────────────────────────────────────
+    function openSettings() {
         document.getElementById("bb-modal-overlay")?.remove();
         const s = getChatSettings();
+        const fp = s.enabled && s.customKey?.length === CFG.KEY_LEN ? s.customKey.substring(0,5).toUpperCase() : "N/A";
 
-        const fp =
-            s.enabled && s.customKey && s.customKey.length === CONFIG.KEY_LENGTH
-                ? s.customKey.substring(0, 5).toUpperCase()
-                : "N/A";
+        const ov = document.createElement("div"); ov.id = "bb-modal-overlay";
+        const cd = document.createElement("div"); cd.id = "bb-modal-card";
 
-        // Build modal with DOM APIs
-        const overlay = document.createElement("div");
-        overlay.id = "bb-modal-overlay";
+        const t = document.createElement("h3"); t.className = "bb-modal-title"; t.textContent = "🛡️ Shield Settings";
+        const d = document.createElement("p"); d.className = "bb-modal-desc"; d.textContent = "Configure encryption for this chat. A 32-character key is required when enabled.";
 
-        const card = document.createElement("div");
-        card.id = "bb-modal-card";
+        const elbl = document.createElement("label"); elbl.className = "bb-toggle-lbl";
+        const ecb = document.createElement("input"); ecb.type = "checkbox"; ecb.checked = s.enabled;
+        const etxt = document.createElement("span"); etxt.textContent = "Enable Encryption";
+        elbl.appendChild(ecb); elbl.appendChild(etxt);
 
-        // Title
-        const title = document.createElement("h3");
-        title.className = "bb-modal-title";
-        title.textContent = "Shield Settings 🛡️";
+        const ksec = document.createElement("div"); ksec.className = "bb-section-divider";
 
-        // Description
-        const desc = document.createElement("p");
-        desc.className = "bb-modal-desc";
-        desc.textContent =
-            "Configure encryption for this chat. When enabled, a 32-character key is required.";
+        const klbl = document.createElement("label");
+        Object.assign(klbl.style, { fontSize:"12px", color:PAL.textDim, fontWeight:"600", display:"block", marginBottom:"2px" });
+        klbl.textContent = "Encryption Key ";
+        const req = document.createElement("span"); req.style.color = PAL.danger; req.textContent = "*"; klbl.appendChild(req);
 
-        // Enable checkbox
-        const enableLabel = document.createElement("label");
-        enableLabel.className = "bb-toggle-lbl";
-        const enableCb = document.createElement("input");
-        enableCb.type = "checkbox";
-        enableCb.id = "bb-enable-enc";
-        enableCb.checked = s.enabled;
-        Object.assign(enableCb.style, {
-            width: "16px",
-            height: "16px",
-            accentColor: "var(--color-primary-p-50,#00ab80)",
-        });
-        const enableText = document.createElement("span");
-        enableText.textContent = "Enable Encryption Here";
-        enableLabel.appendChild(enableCb);
-        enableLabel.appendChild(enableText);
+        const krow = document.createElement("div"); krow.className = "bb-key-row";
+        const kinp = document.createElement("input"); kinp.type = "password"; kinp.className = "bb-input";
+        kinp.placeholder = "Exactly 32 characters…"; kinp.maxLength = 32; kinp.value = s.customKey || "";
 
-        // Key section
-        const keySection = document.createElement("div");
-        keySection.id = "bb-key-section";
-        Object.assign(keySection.style, {
-            marginTop: "16px",
-            borderTop: "1px solid var(--color-neutrals-n-20,#f4f5f7)",
-            paddingTop: "16px",
-        });
+        const vbtn = document.createElement("button"); vbtn.className = "bb-icon-btn"; vbtn.title = "Toggle visibility"; vbtn.textContent = "👁";
+        const cbtn = document.createElement("button"); cbtn.className = "bb-icon-btn"; cbtn.title = "Copy key"; cbtn.textContent = "📋";
+        krow.appendChild(kinp); krow.appendChild(vbtn); krow.appendChild(cbtn);
 
-        // Key label
-        const keyLabel = document.createElement("label");
-        Object.assign(keyLabel.style, {
-            fontSize: "12px",
-            color: "var(--color-neutrals-n-500,#151515)",
-            fontWeight: "600",
-        });
-        keyLabel.textContent = "Encryption Key ";
-        const required = document.createElement("span");
-        required.style.color = "#d32f2f";
-        required.textContent = "*";
-        keyLabel.appendChild(required);
+        const ktools = document.createElement("div"); ktools.className = "bb-key-tools";
+        const gbtn = document.createElement("button"); gbtn.className = "bb-tool-btn"; gbtn.textContent = "⚡ Random Key";
+        const hbtn = document.createElement("button"); hbtn.className = "bb-tool-btn bridge"; hbtn.textContent = "🤝 Auto Bridge";
+        ktools.appendChild(gbtn); ktools.appendChild(hbtn);
 
-        // Key row
-        const keyRow = document.createElement("div");
-        keyRow.className = "bb-key-row";
+        const kmeta = document.createElement("div"); kmeta.className = "bb-key-meta"; kmeta.style.marginTop = "10px";
+        const errEl = document.createElement("span"); errEl.className = "bb-key-error";
+        const fpWrap = document.createElement("span"); fpWrap.style.cssText = `font-size:11px;color:${PAL.textDim}`;
+        fpWrap.textContent = "Fingerprint: ";
+        const fpEl = document.createElement("strong"); fpEl.style.cssText = `font-family:monospace;color:${PAL.accent}`; fpEl.textContent = fp;
+        fpWrap.appendChild(fpEl);
+        kmeta.appendChild(errEl); kmeta.appendChild(fpWrap);
 
-        const keyInput = document.createElement("input");
-        keyInput.type = "password";
-        keyInput.id = "bb-custom-key";
-        keyInput.className = "bb-input";
-        keyInput.placeholder = "Enter exactly 32 characters…";
-        keyInput.maxLength = 32;
-        keyInput.value = s.customKey || "";
+        ksec.appendChild(klbl); ksec.appendChild(krow); ksec.appendChild(ktools); ksec.appendChild(kmeta);
 
-        const visBtn = document.createElement("button");
-        visBtn.className = "bb-icon-btn";
-        visBtn.title = "Show / hide key";
-        visBtn.textContent = "👁";
+        const acts = document.createElement("div"); acts.className = "bb-actions";
+        const canBtn = document.createElement("button"); canBtn.className = "bb-btn bb-btn-cancel"; canBtn.textContent = "Cancel";
+        const savBtn = document.createElement("button"); savBtn.className = "bb-btn bb-btn-save"; savBtn.textContent = "Save";
+        acts.appendChild(canBtn); acts.appendChild(savBtn);
 
-        const copyBtn = document.createElement("button");
-        copyBtn.className = "bb-icon-btn";
-        copyBtn.title = "Copy key";
-        copyBtn.textContent = "📋";
+        cd.appendChild(t); cd.appendChild(d); cd.appendChild(elbl); cd.appendChild(ksec); cd.appendChild(acts);
+        ov.appendChild(cd); document.body.appendChild(ov);
 
-        keyRow.appendChild(keyInput);
-        keyRow.appendChild(visBtn);
-        keyRow.appendChild(copyBtn);
-
-        // Key tools
-        const keyTools = document.createElement("div");
-        keyTools.className = "bb-key-tools";
-
-        const genBtn = document.createElement("button");
-        genBtn.className = "bb-tool-btn";
-        genBtn.textContent = "⚡ Random Key";
-
-        const hsBtn = document.createElement("button");
-        hsBtn.className = "bb-tool-btn";
-        hsBtn.textContent = "🤝 Auto Bridge";
-        Object.assign(hsBtn.style, {
-            borderColor: "var(--color-primary-p-50,#00ab80)",
-            color: "var(--color-primary-p-50,#00ab80)",
-        });
-
-        keyTools.appendChild(genBtn);
-        keyTools.appendChild(hsBtn);
-
-        // Key meta
-        const keyMeta = document.createElement("div");
-        keyMeta.className = "bb-key-meta";
-        keyMeta.style.marginTop = "10px";
-
-        const errorEl = document.createElement("span");
-        errorEl.className = "bb-key-error";
-        errorEl.style.cssText = "color:#d32f2f;font-weight:500;";
-
-        const fpContainer = document.createElement("span");
-        fpContainer.style.cssText =
-            "font-size:11px;color:var(--color-neutrals-n-500,#555);";
-        fpContainer.textContent = "Fingerprint: ";
-        const fpEl = document.createElement("strong");
-        fpEl.style.cssText =
-            "font-family:monospace;color:var(--color-primary-p-50,#00ab80);";
-        fpEl.textContent = fp;
-        fpContainer.appendChild(fpEl);
-
-        keyMeta.appendChild(errorEl);
-        keyMeta.appendChild(fpContainer);
-
-        keySection.appendChild(keyLabel);
-        keySection.appendChild(keyRow);
-        keySection.appendChild(keyTools);
-        keySection.appendChild(keyMeta);
-
-        // Actions
-        const actions = document.createElement("div");
-        actions.className = "bb-actions";
-
-        const cancelBtn = document.createElement("button");
-        cancelBtn.className = "bb-btn bb-btn-cancel";
-        cancelBtn.textContent = "Cancel";
-
-        const saveBtn = document.createElement("button");
-        saveBtn.className = "bb-btn bb-btn-save";
-        saveBtn.textContent = "Save";
-
-        actions.appendChild(cancelBtn);
-        actions.appendChild(saveBtn);
-
-        // Assemble card
-        card.appendChild(title);
-        card.appendChild(desc);
-        card.appendChild(enableLabel);
-        card.appendChild(keySection);
-        card.appendChild(actions);
-        overlay.appendChild(card);
-        document.body.appendChild(overlay);
-
-        // Validation logic
         const validate = () => {
-            const val = keyInput.value;
-            const len = val.length;
-            const enabled = enableCb.checked;
-
-            keySection.style.display = enabled ? "" : "none";
-            fpEl.textContent =
-                len === CONFIG.KEY_LENGTH
-                    ? val.substring(0, 5).toUpperCase()
-                    : "N/A";
-
-            if (!enabled) {
-                errorEl.textContent = "";
-                saveBtn.disabled = false;
-                return;
-            }
-            if (len === 0) {
-                errorEl.textContent = "Key required.";
-                saveBtn.disabled = true;
-            } else if (len !== CONFIG.KEY_LENGTH) {
-                errorEl.textContent = `Must be ${CONFIG.KEY_LENGTH} chars (${len}).`;
-                saveBtn.disabled = true;
-            } else {
-                errorEl.textContent = "";
-                saveBtn.disabled = false;
-            }
+            const val = kinp.value, len = val.length, on = ecb.checked;
+            ksec.style.display = on ? "" : "none";
+            fpEl.textContent = len === CFG.KEY_LEN ? val.substring(0,5).toUpperCase() : "N/A";
+            if (!on) { errEl.textContent = ""; savBtn.disabled = false; return; }
+            if (len === 0) { errEl.textContent = "Key required."; savBtn.disabled = true; }
+            else if (len !== CFG.KEY_LEN) { errEl.textContent = `Need ${CFG.KEY_LEN} chars (${len}).`; savBtn.disabled = true; }
+            else { errEl.textContent = ""; savBtn.disabled = false; }
         };
+        kinp.addEventListener("input", validate); ecb.addEventListener("change", validate); validate();
 
-        keyInput.addEventListener("input", validate);
-        enableCb.addEventListener("change", validate);
-        validate();
-
-        visBtn.addEventListener("click", () => {
-            const hidden = keyInput.type === "password";
-            keyInput.type = hidden ? "text" : "password";
-            visBtn.textContent = hidden ? "🙈" : "👁";
-        });
-
-        copyBtn.addEventListener("click", () => {
-            if (!keyInput.value) return;
-            navigator.clipboard
-                .writeText(keyInput.value)
-                .then(() => {
-                    copyBtn.textContent = "✅";
-                    copyBtn.classList.add("copied");
-                    setTimeout(() => {
-                        copyBtn.textContent = "📋";
-                        copyBtn.classList.remove("copied");
-                    }, 1500);
-                })
-                .catch(() => _showToast("Failed to copy", 2000));
-        });
-
-        genBtn.addEventListener("click", () => {
-            keyInput.value = generateKey();
-            keyInput.type = "text";
-            visBtn.textContent = "🙈";
-            validate();
-        });
-
-        hsBtn.addEventListener("click", () => {
-            overlay.remove();
-            startHandshake();
-        });
-
-        cancelBtn.addEventListener("click", () => overlay.remove());
-
-        saveBtn.addEventListener("click", () => {
-            if (saveBtn.disabled) return;
-            try {
-                saveChatSettings({
-                    enabled: enableCb.checked,
-                    customKey: keyInput.value,
-                });
-            } catch (e) {
-                _showToast("Failed to save: " + e.message, 3000);
-                return;
-            }
-            overlay.remove();
-            syncInputVisibility();
-        });
-
-        // Close on overlay click (not card)
-        overlay.addEventListener("click", (e) => {
-            if (e.target === overlay) overlay.remove();
-        });
+        vbtn.onclick = () => { const h = kinp.type === "password"; kinp.type = h ? "text" : "password"; vbtn.textContent = h ? "🙈" : "👁"; };
+        cbtn.onclick = () => { if (!kinp.value) return; navigator.clipboard.writeText(kinp.value).then(() => { cbtn.textContent = "✅"; cbtn.classList.add("copied"); setTimeout(() => { cbtn.textContent = "📋"; cbtn.classList.remove("copied"); }, 1500); }).catch(()=>{}); };
+        gbtn.onclick = () => { kinp.value = generateKey(); kinp.type = "text"; vbtn.textContent = "🙈"; validate(); };
+        hbtn.onclick = () => { ov.remove(); startHandshake(); };
+        canBtn.onclick = () => ov.remove();
+        savBtn.onclick = () => {
+            if (savBtn.disabled) return;
+            try { saveChatSettings({ enabled: ecb.checked, customKey: kinp.value }); } catch (e) { toast("Save failed: " + e.message, 3000); return; }
+            ov.remove(); syncVis();
+        };
+        ov.addEventListener("click", e => { if (e.target === ov) ov.remove(); });
     }
 
-    // ─── 8. Secure Input & Shield Button ──────────────────────────────────────
-    let isSending = false;
-    let lastHasText = false;
-    let isSyncing = false;
+    // ─── 9. Input System ──────────────────────────────────────────────────────
+    let isSending = false, lastHasText = false, isSyncing = false;
 
-    const lockInput = (el) =>
-        Object.assign(el.style, {
-            position: "absolute",
-            opacity: "0",
-            pointerEvents: "none",
-            height: "0px",
-            width: "0px",
-            overflow: "hidden",
-            zIndex: "-9999",
-        });
+    const lockInput = el => Object.assign(el.style, { position:"absolute",opacity:"0",pointerEvents:"none",height:"0px",width:"0px",overflow:"hidden",zIndex:"-9999" });
+    const unlockInput = el => { el.style.position=""; el.style.opacity="1"; el.style.pointerEvents="auto"; el.style.height=""; el.style.width="100%"; el.style.overflow="auto"; el.style.zIndex=""; };
 
-    const unlockInput = (el) => {
-        el.style.position = "";
-        el.style.opacity = "1";
-        el.style.pointerEvents = "auto";
-        el.style.height = "";
-        el.style.width = "100%";
-        el.style.overflow = "auto";
-        el.style.zIndex = "";
-    };
-
-    function syncInputVisibility() {
-        const real = getRealInput();
-        const secure = document.getElementById("secure-input-overlay");
-        const notice = document.getElementById("bb-no-key-notice");
-        const btn = document.getElementById("bb-settings-btn");
+    function syncVis() {
+        const real = getRealInput(), sec = document.getElementById("secure-input-overlay"),
+              notice = document.getElementById("bb-no-key-notice"), btn = document.getElementById("bb-settings-btn");
         if (!real) return;
-
-        if (!isEncryptionEnabled()) {
+        if (!isEncOn()) {
             unlockInput(real);
-            if (secure) secure.style.display = "none";
+            if (sec) sec.style.display = "none";
             if (notice) notice.style.display = "none";
-            if (btn) btn.style.color = "#5E6C84";
+            if (btn) btn.style.color = PAL.textDim;
         } else if (getActiveKey()) {
             lockInput(real);
-            if (secure) secure.style.display = "";
+            if (sec) sec.style.display = "";
             if (notice) notice.style.display = "none";
-            if (btn) btn.style.color = "var(--color-primary-p-50, #00ab80)";
+            if (btn) btn.style.color = PAL.accent;
         } else {
             lockInput(real);
-            if (secure) secure.style.display = "none";
+            if (sec) sec.style.display = "none";
             if (notice) notice.style.display = "flex";
-            if (btn) btn.style.color = "#f9a825";
+            if (btn) btn.style.color = PAL.warn;
         }
     }
 
     function ensureSecureInput() {
-        const realInput = getRealInput();
-        if (!realInput) return;
-        const mobile = isMobileInput(realInput);
-        const wrapper = realInput.parentElement;
+        const realInput = getRealInput(); if (!realInput) return;
+        const mob = isMobile(realInput), wrapper = realInput.parentElement;
         if (!wrapper) return;
 
-        const emojiBtn =
-            document.querySelector('[aria-label="emoji-icon"]') ||
-            document.querySelector(".MmBErq");
-
-        if (emojiBtn && isEncryptionEnabled()) emojiBtn.style.display = "none";
+        const emojiBtn = document.querySelector('[aria-label="emoji-icon"]') || document.querySelector(".MmBErq");
+        if (emojiBtn && isEncOn()) emojiBtn.style.display = "none";
         else if (emojiBtn) emojiBtn.style.display = "";
 
-        // Create shield button if not exists
         if (emojiBtn && !document.getElementById("bb-settings-btn")) {
-            const shieldBtn = document.createElement("div");
-            shieldBtn.id = "bb-settings-btn";
-            shieldBtn.className = emojiBtn.className;
-            shieldBtn.setAttribute("role", "button");
-            shieldBtn.setAttribute("tabindex", "0");
-            shieldBtn.setAttribute("aria-label", "Encryption settings");
-            Object.assign(shieldBtn.style, {
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: "pointer",
-                transition: "color .2s",
-            });
-
-            const iconWrap = document.createElement("div");
-            Object.assign(iconWrap.style, {
-                borderRadius: "50%",
-                lineHeight: "0",
-                position: "relative",
-            });
-            iconWrap.innerHTML = `<svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>`;
-            shieldBtn.appendChild(iconWrap);
-
-            shieldBtn.addEventListener("click", openSettingsModal);
-            shieldBtn.addEventListener("keydown", (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    openSettingsModal();
-                }
-            });
-
-            emojiBtn.parentElement.insertBefore(shieldBtn, emojiBtn);
+            const sb = document.createElement("div"); sb.id = "bb-settings-btn";
+            sb.className = emojiBtn.className; sb.setAttribute("role","button"); sb.setAttribute("tabindex","0");
+            sb.setAttribute("aria-label","Encryption settings");
+            Object.assign(sb.style, { display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"color .2s" });
+            const iw = document.createElement("div");
+            Object.assign(iw.style, { borderRadius:"50%",lineHeight:"0",position:"relative" });
+            iw.innerHTML = `<svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>`;
+            sb.appendChild(iw);
+            sb.onclick = openSettings;
+            sb.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSettings(); } };
+            emojiBtn.parentElement.insertBefore(sb, emojiBtn);
         }
 
-        // Create no-key notice if not exists
         if (!document.getElementById("bb-no-key-notice")) {
-            const notice = document.createElement("div");
-            notice.id = "bb-no-key-notice";
-
-            const iconDiv = document.createElement("div");
-            iconDiv.className = "bb-notice-icon";
-            iconDiv.textContent = "⚠️";
-
-            const bodyDiv = document.createElement("div");
-            bodyDiv.className = "bb-notice-body";
-
-            const strongEl = document.createElement("strong");
-            strongEl.textContent =
-                "Encryption key not set — sending is blocked.";
-            bodyDiv.appendChild(strongEl);
-            bodyDiv.appendChild(
-                document.createTextNode(
-                    " Tap the 🔒 lock button to establish a secure session."
-                )
-            );
-            bodyDiv.appendChild(document.createElement("br"));
-
-            const noticeBtn = document.createElement("button");
-            noticeBtn.className = "bb-notice-btn";
-            noticeBtn.textContent = "🛡 Set Encryption Key";
-            noticeBtn.addEventListener("click", openSettingsModal);
-            bodyDiv.appendChild(noticeBtn);
-
-            notice.appendChild(iconDiv);
-            notice.appendChild(bodyDiv);
-            wrapper.insertBefore(notice, realInput);
+            const n = document.createElement("div"); n.id = "bb-no-key-notice";
+            const ni = document.createElement("div"); ni.className = "bb-notice-icon"; ni.textContent = "⚠️";
+            const nb = document.createElement("div"); nb.className = "bb-notice-body";
+            const ns = document.createElement("strong"); ns.textContent = "Encryption key not set — sending blocked.";
+            nb.appendChild(ns); nb.appendChild(document.createTextNode(" Tap 🔒 to set up."));
+            nb.appendChild(document.createElement("br"));
+            const nbtn = document.createElement("button"); nbtn.className = "bb-notice-btn"; nbtn.textContent = "🛡 Set Key";
+            nbtn.onclick = openSettings; nb.appendChild(nbtn);
+            n.appendChild(ni); n.appendChild(nb);
+            wrapper.insertBefore(n, realInput);
         }
 
-        // If secure overlay already exists, just sync
-        const existingOverlay = document.getElementById("secure-input-overlay");
-        if (existingOverlay) {
-            window._bbSend = existingOverlay._triggerSend;
-            syncInputVisibility();
-            return;
-        }
+        const existing = document.getElementById("secure-input-overlay");
+        if (existing) { window._bbSend = existing._triggerSend; syncVis(); return; }
 
-        // Hijack real input to prevent plaintext entry
-        if (!realInput._hasStrictHijack) {
-            realInput._hasStrictHijack = true;
-            realInput.addEventListener("focus", () => {
-                if (!isSyncing && isEncryptionEnabled()) {
-                    realInput.blur();
-                    document.getElementById("secure-input-overlay")?.focus();
-                }
-            });
-            for (const evt of ["keydown", "keypress", "keyup", "paste", "drop"]) {
-                realInput.addEventListener(
-                    evt,
-                    (e) => {
-                        if (!isSyncing && isEncryptionEnabled()) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                        }
-                    },
-                    true
-                );
+        if (!realInput._bbHijacked) {
+            realInput._bbHijacked = true;
+            realInput.addEventListener("focus", () => { if (!isSyncing && isEncOn()) { realInput.blur(); document.getElementById("secure-input-overlay")?.focus(); } });
+            for (const evt of ["keydown","keypress","keyup","paste","drop"]) {
+                realInput.addEventListener(evt, e => { if (!isSyncing && isEncOn()) { e.preventDefault(); e.stopPropagation(); } }, true);
             }
         }
 
-        // Create secure input overlay
-        let secureInput;
-        if (mobile) {
-            secureInput = document.createElement("textarea");
-            secureInput.dir = "auto";
-            secureInput.placeholder = "🔒 پیام امن...";
-            secureInput.rows = 1;
-            secureInput.addEventListener("input", () => {
-                secureInput.style.height = "auto";
-                secureInput.style.height =
-                    Math.min(secureInput.scrollHeight, 150) + "px";
-            });
+        let si;
+        if (mob) {
+            si = document.createElement("textarea"); si.dir = "auto"; si.placeholder = "🔒 پیام امن..."; si.rows = 1;
+            si.addEventListener("input", () => { si.style.height = "auto"; si.style.height = Math.min(si.scrollHeight, 150) + "px"; });
         } else {
-            secureInput = document.createElement("div");
-            secureInput.contentEditable = "true";
-            secureInput.dir = "auto";
-            secureInput.dataset.placeholder = "🔒 پیام امن...";
-            wrapper.style.overflow = "visible";
+            si = document.createElement("div"); si.contentEditable = "true"; si.dir = "auto";
+            si.dataset.placeholder = "🔒 پیام امن..."; wrapper.style.overflow = "visible";
         }
-        secureInput.id = "secure-input-overlay";
-        secureInput.className = realInput.className;
-        wrapper.insertBefore(secureInput, realInput);
+        si.id = "secure-input-overlay"; si.className = realInput.className;
+        wrapper.insertBefore(si, realInput);
 
-        const getText = () =>
-            mobile ? secureInput.value.trim() : secureInput.innerText.trim();
-        const setText = (v) => {
-            if (mobile) secureInput.value = v;
-            else secureInput.innerText = v;
-        };
+        const getT = () => mob ? si.value.trim() : si.innerText.trim();
+        const setT = v => { if (mob) si.value = v; else si.innerText = v; };
 
-        const syncHasText = (hasText) => {
-            if (hasText === lastHasText) return;
-            lastHasText = hasText;
-            isSyncing = true;
-            if (mobile) {
-                _textareaSetter?.call(realInput, hasText ? " " : "");
-                realInput.dispatchEvent(new Event("input", { bubbles: true }));
-            } else {
-                const sel = window.getSelection();
-                let marker = null;
-                if (
-                    sel.rangeCount > 0 &&
-                    secureInput.contains(
-                        sel.getRangeAt(0).commonAncestorContainer
-                    )
-                ) {
-                    marker = document.createElement("span");
-                    marker.id = "bb-caret-marker";
+        const syncHas = has => {
+            if (has === lastHasText) return;
+            lastHasText = has; isSyncing = true;
+            if (mob) { _taSetter?.call(realInput, has ? " " : ""); realInput.dispatchEvent(new Event("input", { bubbles:true })); }
+            else {
+                const sel = window.getSelection(); let marker = null;
+                if (sel.rangeCount > 0 && si.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+                    marker = document.createElement("span"); marker.id = "bb-caret-marker";
                     sel.getRangeAt(0).insertNode(marker);
                 }
-
-                realInput.focus();
-                document.execCommand("selectAll", false, null);
-                if (hasText) {
-                    document.execCommand("insertText", false, " ");
-                } else {
-                    document.execCommand("delete", false, null);
-                }
-                realInput.dispatchEvent(
-                    new Event("input", { bubbles: true, cancelable: true })
-                );
-                secureInput.focus();
-
+                realInput.focus(); document.execCommand("selectAll", false, null);
+                if (has) document.execCommand("insertText", false, " "); else document.execCommand("delete", false, null);
+                realInput.dispatchEvent(new Event("input", { bubbles:true, cancelable:true }));
+                si.focus();
                 if (marker && marker.parentNode) {
-                    const newRange = document.createRange();
-                    newRange.setStartBefore(marker);
-                    newRange.collapse(true);
-                    sel.removeAllRanges();
-                    sel.addRange(newRange);
-                    marker.remove();
-                    secureInput.normalize();
+                    const nr = document.createRange(); nr.setStartBefore(marker); nr.collapse(true);
+                    sel.removeAllRanges(); sel.addRange(nr); marker.remove(); si.normalize();
                 } else {
-                    const newRange = document.createRange();
-                    newRange.selectNodeContents(secureInput);
-                    newRange.collapse(false);
-                    sel.removeAllRanges();
-                    sel.addRange(newRange);
+                    const nr = document.createRange(); nr.selectNodeContents(si); nr.collapse(false);
+                    sel.removeAllRanges(); sel.addRange(nr);
                 }
             }
             isSyncing = false;
         };
+        si.addEventListener("input", e => { if (!e.isComposing) syncHas(getT().length > 0); });
+        si.addEventListener("compositionend", () => syncHas(getT().length > 0));
 
-        secureInput.addEventListener("input", (e) => {
-            if (e.isComposing) return;
-            syncHasText(getText().length > 0);
-        });
-        secureInput.addEventListener("compositionend", () => {
-            syncHasText(getText().length > 0);
-        });
-
-        const triggerSend = async (doEncrypt = true) => {
+        const triggerSend = async (doEnc = true) => {
             if (isSending) return;
-            const text = getText();
-            if (!text) return;
-
-            if (doEncrypt) {
-                if (!getActiveKey()) {
-                    openSettingsModal();
-                    return;
-                }
-                isSending = true;
-                setText("🔒 Encrypting...");
+            const text = getT(); if (!text) return;
+            if (doEnc) {
+                if (!getActiveKey()) { openSettings(); return; }
+                isSending = true; setT("🔒 Encrypting...");
                 try {
                     const chunks = await encryptChunked(text);
-                    if (!chunks) {
-                        setText(text);
-                        openSettingsModal();
-                        return;
-                    }
-                    for (const chunk of chunks) await _sendRaw(chunk);
-                    setText("");
-                    lastHasText = false;
-                    secureInput.focus();
-                } catch (e) {
-                    console.error("[BB] Send failed:", e);
-                    setText(text);
-                    _showToast("Send failed! Check console for details.", 3000);
-                } finally {
-                    isSending = false;
-                }
+                    if (!chunks) { setT(text); openSettings(); return; }
+                    for (const c of chunks) await _sendRaw(c);
+                    setT(""); lastHasText = false; si.focus();
+                } catch (e) { console.error("[BB]", e); setT(text); toast("Send failed!", 3000); }
+                finally { isSending = false; }
                 return;
             }
-
-            // Unencrypted send
-            if (
-                !confirm(
-                    "⚠️ You are about to send this message WITHOUT encryption.\n\nAre you sure?"
-                )
-            ) {
-                return;
-            }
-            isSending = true;
-            setText("🌐 Sending...");
-            try {
-                await _sendRaw(text);
-                setText("");
-                lastHasText = false;
-                secureInput.focus();
-            } catch (e) {
-                console.error("[BB] Unencrypted send failed:", e);
-                setText(text);
-                _showToast("Send failed!", 3000);
-            } finally {
-                isSending = false;
-            }
+            if (!confirm("⚠️ Send WITHOUT encryption?")) return;
+            isSending = true; setT("🌐 Sending...");
+            try { await _sendRaw(text); setT(""); lastHasText = false; si.focus(); }
+            catch (e) { setT(text); toast("Send failed!", 3000); }
+            finally { isSending = false; }
         };
-
-        secureInput._triggerSend = triggerSend;
-        window._bbSend = triggerSend;
-
-        secureInput.addEventListener("keydown", (e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                e.stopPropagation();
-                triggerSend(true);
-            }
-        });
-
-        syncInputVisibility();
+        si._triggerSend = triggerSend; window._bbSend = triggerSend;
+        si.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.stopPropagation(); triggerSend(true); } });
+        syncVis();
     }
 
-    // ─── 8b. Secure Edit / Caption Input ─────────────────────────────────────
+    // ─── 9b. Edit/Caption Input ───────────────────────────────────────────────
     function ensureEditInput() {
-        const real = document.querySelector(
-            'textarea[aria-label="File Description"]'
-        );
-        if (!real || real._bbEditHooked) return;
-        real._bbEditHooked = true;
+        const real = document.querySelector('textarea[aria-label="File Description"]');
+        if (!real || real._bbEdit) return;
+        real._bbEdit = true;
 
-        const secureEdit = document.createElement("textarea");
-        secureEdit.id = "secure-edit-overlay";
-        secureEdit.className = real.className;
-        secureEdit.placeholder = "🔒 " + (real.placeholder || "ویرایش امن...");
-        secureEdit.dir = real.dir || "auto";
-        secureEdit.style.cssText = real.style.cssText;
-        secureEdit.addEventListener("input", () => {
-            secureEdit.style.height = "auto";
-            secureEdit.style.height =
-                Math.min(secureEdit.scrollHeight, 150) + "px";
-        });
+        const se = document.createElement("textarea"); se.id = "secure-edit-overlay";
+        se.className = real.className; se.placeholder = "🔒 " + (real.placeholder || "ویرایش امن...");
+        se.dir = real.dir || "auto"; se.style.cssText = real.style.cssText;
+        se.addEventListener("input", () => { se.style.height = "auto"; se.style.height = Math.min(se.scrollHeight, 150) + "px"; });
 
-        real.parentElement.insertBefore(secureEdit, real);
-        lockInput(real);
-        secureEdit.focus();
+        real.parentElement.insertBefore(se, real); lockInput(real); se.focus();
 
-        const existing = real.value.trim();
-        _textareaSetter?.call(real, "");
-        real.dispatchEvent(new Event("input", { bubbles: true }));
-        if (existing.startsWith(CONFIG.ENCRYPTED_PREFIX)) {
-            decrypt(existing)
-                .then((p) => {
-                    if (p !== existing) secureEdit.value = p;
-                })
-                .catch(() => {});
-        } else {
-            secureEdit.value = existing;
-        }
+        const ex = real.value.trim();
+        _taSetter?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles:true }));
+        if (ex.startsWith(CFG.PFX_ENC)) decrypt(ex).then(p => { if (p !== ex) se.value = p; }).catch(()=>{});
+        else se.value = ex;
 
-        const encryptAndForward = async (btn) => {
-            if (secureEdit._isSending) return;
-            const text = secureEdit.value.trim();
-            if (!text) return;
-            if (!getActiveKey()) {
-                openSettingsModal();
-                return;
-            }
-            secureEdit._isSending = true;
-            const prev = secureEdit.value;
-            secureEdit.value = "🔒 Encrypting...";
+        const encFwd = async (btn) => {
+            if (se._busy) return;
+            const text = se.value.trim(); if (!text) return;
+            if (!getActiveKey()) { openSettings(); return; }
+            se._busy = true; const prev = se.value; se.value = "🔒 Encrypting...";
             try {
                 const out = await encrypt(text);
-                if (!out) {
-                    secureEdit.value = prev;
-                    openSettingsModal();
-                    return;
-                }
-                secureEdit.value = "";
-                unlockInput(real);
-                _textareaSetter?.call(real, out);
-                real.dispatchEvent(new Event("input", { bubbles: true }));
-                real.dispatchEvent(new Event("change", { bubbles: true }));
-                await new Promise((r) => setTimeout(r, CONFIG.SEND_DELAY_MS));
-
-                // Click the confirm button
-                const btnPropsKey = Object.keys(btn).find((k) =>
-                    k.startsWith("__reactProps$")
-                );
-                if (btnPropsKey && typeof btn[btnPropsKey]?.onClick === "function") {
-                    btn[btnPropsKey].onClick({
-                        preventDefault: () => {},
-                        stopPropagation: () => {},
-                    });
-                } else {
-                    for (const type of [
-                        "mousedown",
-                        "pointerdown",
-                        "mouseup",
-                        "pointerup",
-                        "click",
-                    ]) {
-                        btn.dispatchEvent(
-                            new MouseEvent(type, {
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                            })
-                        );
-                    }
-                }
-            } catch (e) {
-                console.error("[BB] Edit encryption failed:", e);
-                secureEdit.value = prev;
-                _showToast("Encryption failed!", 3000);
-            } finally {
-                secureEdit._isSending = false;
-            }
+                if (!out) { se.value = prev; openSettings(); return; }
+                se.value = ""; unlockInput(real);
+                _taSetter?.call(real, out); real.dispatchEvent(new Event("input", { bubbles:true })); real.dispatchEvent(new Event("change", { bubbles:true }));
+                await new Promise(r => setTimeout(r, CFG.SEND_DLY));
+                const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
+                if (rk && typeof btn[rk]?.onClick === 'function') btn[rk].onClick({ preventDefault(){}, stopPropagation(){} });
+                else for (const t of ["mousedown","pointerdown","mouseup","pointerup","click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles:true, cancelable:true, view:window }));
+            } catch(e) { console.error("[BB]", e); se.value = prev; toast("Encryption failed!", 3000); }
+            finally { se._busy = false; }
         };
 
-        const isConfirmBtn = (t) =>
-            t.closest('[data-testid="confirm-button"]') ||
-            (t.closest('button[aria-label="Send"]') &&
-                !t.closest("#chat_footer"));
-
-        const editClickHandler = (e) => {
+        const isConfBtn = t => t.closest('[data-testid="confirm-button"]') || (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
+        const editHandler = e => {
             if (!e.isTrusted) return;
-            const btn = isConfirmBtn(e.target);
-            if (!btn || !secureEdit.value.trim()) return;
-            if (secureEdit._isSending) {
-                e.preventDefault();
-                e.stopPropagation();
-                return;
-            }
-            e.preventDefault();
-            e.stopPropagation();
-            encryptAndForward(btn);
+            const btn = isConfBtn(e.target); if (!btn || !se.value.trim()) return;
+            if (se._busy) { e.preventDefault(); e.stopPropagation(); return; }
+            e.preventDefault(); e.stopPropagation(); encFwd(btn);
         };
+        document.addEventListener("click", editHandler, true);
+        document.addEventListener("mousedown", editHandler, true);
 
-        document.addEventListener("click", editClickHandler, true);
-        document.addEventListener("mousedown", editClickHandler, true);
-
-        // Cleanup observer: remove handlers when edit overlay is removed from DOM
-        const editObserver = new MutationObserver(() => {
-            if (!document.contains(secureEdit)) {
-                document.removeEventListener("click", editClickHandler, true);
-                document.removeEventListener("mousedown", editClickHandler, true);
-                editObserver.disconnect();
-            }
+        const eObs = new MutationObserver(() => {
+            if (!document.contains(se)) { document.removeEventListener("click", editHandler, true); document.removeEventListener("mousedown", editHandler, true); eObs.disconnect(); }
         });
-        editObserver.observe(document.body, { childList: true, subtree: true });
+        eObs.observe(document.body, { childList:true, subtree:true });
 
-        secureEdit.addEventListener("keydown", (e) => {
+        se.addEventListener("keydown", e => {
             if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                e.stopPropagation();
-                const btn =
-                    document.querySelector('[data-testid="confirm-button"]') ||
-                    document.querySelector(
-                        'button[aria-label="Send"]:not(#chat_footer button)'
-                    );
-                if (btn) encryptAndForward(btn);
+                e.preventDefault(); e.stopPropagation();
+                const btn = document.querySelector('[data-testid="confirm-button"]') || document.querySelector('button[aria-label="Send"]:not(#chat_footer button)');
+                if (btn) encFwd(btn);
             }
         });
     }
 
-    // ─── 9. Send Button Event Interception ────────────────────────────────────
-    const getSecureText = () => {
-        const si = document.getElementById("secure-input-overlay");
-        return si
-            ? si.tagName === "TEXTAREA"
-                ? si.value.trim()
-                : si.innerText.trim()
-            : "";
-    };
+    // ─── 10. Send Button Interception ─────────────────────────────────────────
+    const getSecTxt = () => { const s = document.getElementById("secure-input-overlay"); return s ? (s.tagName==="TEXTAREA" ? s.value.trim() : s.innerText.trim()) : ""; };
+    const isSendBtn = t => !!(t.closest('[aria-label="send-button"]') || t.closest('.RaTWwR'));
 
-    const isSendBtn = (t) =>
-        !!(
-            t.closest('[aria-label="send-button"]') ||
-            t.closest(".RaTWwR")
-        );
+    let touchTmr = null, isLong = false;
 
-    let touchTimer = null;
-    let isLongTouch = false;
-
-    // Desktop Events
-    for (const evt of ["mousedown", "mouseup", "click", "pointerdown", "pointerup"]) {
-        document.addEventListener(
-            evt,
-            (e) => {
-                if (!e.isTrusted) return; // Allow programmatic events
-                if (isSending && isSendBtn(e.target)) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    return;
-                }
-                if (
-                    !isSendBtn(e.target) ||
-                    !isEncryptionEnabled() ||
-                    !getSecureText()
-                ) {
-                    return;
-                }
-
-                e.preventDefault();
-                e.stopPropagation();
-
-                if (evt === "click" && e.button === 0) {
-                    window._bbSend?.(true);
-                }
-            },
-            true
-        );
+    for (const evt of ["mousedown","mouseup","click","pointerdown","pointerup"]) {
+        document.addEventListener(evt, e => {
+            if (!e.isTrusted) return;
+            if (!isSendBtn(e.target)) return;
+            if (!isEncOn() || !getSecTxt()) return;
+            if (isSending) { e.preventDefault(); e.stopPropagation(); return; }
+            e.preventDefault(); e.stopPropagation();
+            if (evt === "click" && e.button === 0) window._bbSend?.(true);
+        }, true);
     }
 
-    // Mobile Touch Events
-    document.addEventListener(
-        "touchstart",
-        (e) => {
-            if (!e.isTrusted) return;
-            if (isSending && isSendBtn(e.target)) {
-                e.preventDefault();
-                e.stopPropagation();
-                return;
-            }
-            if (
-                !isSendBtn(e.target) ||
-                !isEncryptionEnabled() ||
-                !getSecureText()
-            ) {
-                return;
-            }
+    document.addEventListener("touchstart", e => {
+        if (!e.isTrusted || !isSendBtn(e.target) || !isEncOn() || !getSecTxt()) return;
+        if (isSending) { e.preventDefault(); e.stopPropagation(); return; }
+        e.preventDefault(); e.stopPropagation();
+        isLong = false; if (touchTmr !== null) clearTimeout(touchTmr);
+        touchTmr = setTimeout(() => { isLong = true; if (e.touches?.length) showMenu(e.touches[0].clientX, e.touches[0].clientY); }, CFG.LONG_PRESS);
+    }, { passive:false, capture:true });
 
-            e.preventDefault();
-            e.stopPropagation();
+    document.addEventListener("touchend", e => {
+        if (!e.isTrusted || !isSendBtn(e.target) || !isEncOn() || !getSecTxt()) return;
+        if (isSending) { e.preventDefault(); e.stopPropagation(); return; }
+        e.preventDefault(); e.stopPropagation();
+        if (touchTmr !== null) { clearTimeout(touchTmr); touchTmr = null; }
+        if (!isLong) window._bbSend?.(true);
+    }, { passive:false, capture:true });
 
-            isLongTouch = false;
-            if (touchTimer !== null) clearTimeout(touchTimer);
+    document.addEventListener("touchmove", e => {
+        if (!e.isTrusted || !isSendBtn(e.target)) return;
+        if (touchTmr !== null) { clearTimeout(touchTmr); touchTmr = null; }
+        isLong = true;
+    }, { passive:false, capture:true });
 
-            touchTimer = setTimeout(() => {
-                isLongTouch = true;
-                if (e.touches && e.touches.length > 0) {
-                    showMenu(e.touches[0].clientX, e.touches[0].clientY);
-                }
-            }, CONFIG.LONG_PRESS_MS);
-        },
-        { passive: false, capture: true }
-    );
+    document.addEventListener("contextmenu", e => {
+        if (isSending || !isSendBtn(e.target) || !isEncOn() || !getSecTxt()) return;
+        e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY);
+    }, true);
 
-    document.addEventListener(
-        "touchend",
-        (e) => {
-            if (!e.isTrusted) return;
-            if (isSending && isSendBtn(e.target)) {
-                e.preventDefault();
-                e.stopPropagation();
-                return;
-            }
-            if (
-                !isSendBtn(e.target) ||
-                !isEncryptionEnabled() ||
-                !getSecureText()
-            ) {
-                return;
-            }
-
-            e.preventDefault();
-            e.stopPropagation();
-
-            if (touchTimer !== null) {
-                clearTimeout(touchTimer);
-                touchTimer = null;
-            }
-            if (!isLongTouch) {
-                window._bbSend?.(true);
-            }
-        },
-        { passive: false, capture: true }
-    );
-
-    document.addEventListener(
-        "touchmove",
-        (e) => {
-            if (!e.isTrusted || !isSendBtn(e.target)) return;
-            if (touchTimer !== null) {
-                clearTimeout(touchTimer);
-                touchTimer = null;
-            }
-            isLongTouch = true;
-        },
-        { passive: false, capture: true }
-    );
-
-    // Desktop Right Click Menu
-    document.addEventListener(
-        "contextmenu",
-        (e) => {
-            if (
-                isSending ||
-                !isSendBtn(e.target) ||
-                !isEncryptionEnabled() ||
-                !getSecureText()
-            ) {
-                return;
-            }
-            e.preventDefault();
-            e.stopPropagation();
-            showMenu(e.clientX, e.clientY);
-        },
-        true
-    );
-
-    // ─── 10. MutationObserver & SPA URL Tracker ───────────────────────────────
-    let scanTO = null;
-    let lastUrl = location.href;
-
-    const observer = new MutationObserver(() => {
+    // ─── 11. Observer ─────────────────────────────────────────────────────────
+    let scanTO = null, lastUrl = location.href;
+    new MutationObserver(() => {
         if (scanTO !== null) clearTimeout(scanTO);
         scanTO = setTimeout(() => {
             scanTO = null;
             try {
-                scanTree(document.body);
-                ensureSecureInput();
-                ensureEditInput();
-                if (location.href !== lastUrl) {
-                    lastUrl = location.href;
-                    _settingsCache = null;
-                    _settingsCacheId = null;
-                    syncInputVisibility();
-                }
-            } catch (e) {
-                console.error("[BB] Scan error:", e);
-            }
-        }, CONFIG.SCAN_DEBOUNCE_MS);
-    });
+                scanTree(document.body); ensureSecureInput(); ensureEditInput();
+                if (location.href !== lastUrl) { lastUrl = location.href; _sc = null; _scId = null; syncVis(); }
+            } catch(e) { console.error("[BB]", e); }
+        }, CFG.SCAN_MS);
+    }).observe(document.body, { childList:true, subtree:true, characterData:true });
 
-    observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-    });
-
-    // Initial scan
-    try {
-        scanTree(document.body);
-        ensureSecureInput();
-        ensureEditInput();
-    } catch (e) {
-        console.error("[BB] Initial scan error:", e);
-    }
+    try { scanTree(document.body); ensureSecureInput(); ensureEditInput(); } catch(e) { console.error("[BB] init", e); }
 })();
