@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      15.3
+// @version      15.4
 // @description  Fast dark UI, ECDH Bridge, Invisible Char Immunity, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -20,9 +20,6 @@
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
         HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_E2: "@@+", PFX_H: "!!",
-        // Use URL-safe base64 alphabet to avoid Bale mangling + and /
-        B64_STD: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
-        B64_SAFE: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.",
     });
 
     const P = Object.freeze({
@@ -68,41 +65,77 @@
     const encOn = () => getS().enabled;
     const fp = () => { const k = activeKey(); return k ? k.substring(0, 5).toUpperCase() : "NONE"; };
 
-    // ── URL-safe Base64 encode/decode ─────────────────────────────────────────
-    // Bale's rich text rendering can mangle standard base64 characters (+ / =)
-    // by inserting invisible Unicode or converting them. URL-safe base64 avoids this.
+    // ── Robust Base64 (no padding, URL-safe) ──────────────────────────────────
+    // Standard base64 chars +/= get mangled by Bale's rich-text renderer.
+    // Padding chars (= or any substitute) get stripped at end of messages.
+    // Solution: use URL-safe alphabet AND strip ALL padding on encode,
+    // then re-add padding on decode based on length % 4.
 
-    function toUrlSafeB64(buf) {
+    function toB64(buf) {
         let binary = '';
         const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
         for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
         return btoa(binary)
             .replace(/\+/g, '-')
             .replace(/\//g, '_')
-            .replace(/=/g, '.');
+            .replace(/=+$/, '');  // Strip ALL padding — we recalculate on decode
     }
 
-    function fromUrlSafeB64(s) {
-        // Strip ANY non-URL-safe-base64 characters (invisible chars, zero-width, etc.)
-        const cleaned = s.replace(/[^A-Za-z0-9\-_.]/g, '');
-        // Convert back to standard base64 for atob
-        const std = cleaned
-            .replace(/-/g, '+')
-            .replace(/_/g, '/')
-            .replace(/\./g, '=');
-        const bin = atob(std);
+    function fromB64(s) {
+        // Strip any invisible / non-base64 characters
+        let cleaned = s.replace(/[^A-Za-z0-9\-_]/g, '');
+        // Convert URL-safe back to standard
+        cleaned = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+        // Re-add padding
+        const pad = (4 - (cleaned.length % 4)) % 4;
+        cleaned += '='.repeat(pad);
+        const bin = atob(cleaned);
         const arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         return arr;
     }
 
-    // Legacy standard base64 decode (for backward compat with old messages)
+    // Legacy decoders for backward compatibility
     function fromStdB64(s) {
         const cleaned = s.replace(/[^A-Za-z0-9+/=]/g, '');
         const bin = atob(cleaned);
         const arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         return arr;
+    }
+
+    function fromLegacyB64(s) {
+        // Handle old format that used . for padding
+        let cleaned = s.replace(/[^A-Za-z0-9\-_.+/=]/g, '');
+        cleaned = cleaned.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
+        // Also re-pad if dots were stripped
+        const noPad = cleaned.replace(/=+$/, '');
+        const pad = (4 - (noPad.length % 4)) % 4;
+        cleaned = noPad + '='.repeat(pad);
+        const bin = atob(cleaned);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+    }
+
+    // Smart decoder: tries all formats
+    function decodeB64Smart(s) {
+        // 1) Try no-padding URL-safe (current format)
+        try {
+            const r = fromB64(s);
+            if (r.length > 0) return r;
+        } catch (_) {}
+        // 2) Try legacy dot-padding URL-safe
+        try {
+            const r = fromLegacyB64(s);
+            if (r.length > 0) return r;
+        } catch (_) {}
+        // 3) Try standard base64
+        try {
+            const r = fromStdB64(s);
+            if (r.length > 0) return r;
+        } catch (_) {}
+        return null;
     }
 
     // ── Crypto & Encodings ────────────────────────────────────────────────────
@@ -154,7 +187,7 @@
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(k), await cmp(t)));
         const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
-        return CFG.PFX_E2 + toUrlSafeB64(p);
+        return CFG.PFX_E2 + toB64(p);
     }
 
     async function dec(t) {
@@ -163,17 +196,12 @@
         try {
             let b;
             if (t.startsWith(CFG.PFX_E2)) {
-                const payload = t.slice(3);
-                // Try URL-safe first (new format), fall back to standard (old format)
-                try {
-                    b = fromUrlSafeB64(payload);
-                } catch (_) {
-                    b = fromStdB64(payload);
-                }
+                b = decodeB64Smart(t.slice(3));
             } else {
-                b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, '')); // Legacy B85 support
+                // Legacy B85 support
+                b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, ''));
             }
-            if (b.length < 13) return t;
+            if (!b || b.length < 13) return t;
             return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12))));
         } catch (_) { return t; }
     }
@@ -325,13 +353,12 @@
         return hsLock(async () => {
             try {
                 const cid = getChatId(), pair = await hsPair(), pub = await hsPubRaw(pair.publicKey);
-                // Store the full key pair's private key as JWK
                 const privJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
                 _hsState.set(cid, privJwk);
 
                 const pay = new Uint8Array(1 + 4 + pub.length);
                 pay[0] = CFG.HS_REQ; pay.set(tsB(), 1); pay.set(pub, 5);
-                const encoded = toUrlSafeB64(pay);
+                const encoded = toB64(pay);
                 mHash(cid, cH(encoded));
 
                 await sendRaw(CFG.PFX_H + encoded);
@@ -365,7 +392,7 @@
                     setS({ enabled: true, customKey: key }); syncVis();
 
                     const rp = new Uint8Array(1 + 4 + myPub.length); rp[0] = CFG.HS_RES; rp.set(tsB(), 1); rp.set(myPub, 5);
-                    const rb = toUrlSafeB64(rp);
+                    const rb = toB64(rp);
                     mHash(cid, mh); mHash(cid, cH(rb));
 
                     await sendRaw(CFG.PFX_H + rb);
@@ -382,27 +409,41 @@
         return hsLock(async () => {
             if (isH(cid, mh)) { vizHs(el, "🤝 Processed"); return; }
             try {
-                // Try URL-safe decode first, fall back to standard base64
-                let raw;
-                try {
-                    raw = fromUrlSafeB64(b64raw);
-                } catch (_) {
-                    raw = fromStdB64(b64raw);
+                const raw = decodeB64Smart(b64raw);
+                if (!raw) {
+                    console.error("[BB] HS decode returned null for:", b64raw);
+                    mHash(cid, mh); vizHs(el, "❌ Decode Error"); return;
                 }
 
-                if (raw.length < 70) { mHash(cid, mh); vizHs(el, "❌ Malformed"); return; }
+                console.debug("[BB] HS decoded bytes:", raw.length, "hex:", Array.from(raw.slice(0, 10)).map(x => x.toString(16).padStart(2, '0')).join(' '));
+
+                // type(1) + timestamp(4) + pubkey(min 33 compressed, 65 uncompressed)
+                // Minimum valid = 1 + 4 + 33 = 38 bytes
+                if (raw.length < 38) {
+                    console.error("[BB] HS too short:", raw.length, "bytes");
+                    mHash(cid, mh); vizHs(el, "❌ Malformed (" + raw.length + "b)"); return;
+                }
+
                 const type = raw[0], ts = rdTs(raw.subarray(1, 5)), them = raw.subarray(5);
                 const now = (Date.now() / 1000) | 0;
                 const age = now - ts;
 
-                // Debug: log timestamp info for troubleshooting
-                console.debug("[BB] Handshake ts:", ts, "now:", now, "age:", age, "type:", type);
+                console.debug("[BB] HS type:", type, "ts:", ts, "now:", now, "age:", age, "s, pubkey:", them.length, "bytes");
 
-                // Generous time window: allow ±10 minutes + clock skew
+                // Validate type field
+                if (type !== CFG.HS_REQ && type !== CFG.HS_RES) {
+                    mHash(cid, mh); vizHs(el, "❌ Unknown type"); return;
+                }
+
+                // Validate timestamp — generous ±10 min window
                 if (Math.abs(age) > CFG.HS_EXP) {
-                    mHash(cid, mh);
-                    vizHs(el, "⌛ Expired (" + age + "s)");
-                    return;
+                    mHash(cid, mh); vizHs(el, "⌛ Expired (" + age + "s ago)"); return;
+                }
+
+                // Validate public key length (P-256: 65 uncompressed or 33 compressed)
+                if (them.length !== 65 && them.length !== 33) {
+                    console.error("[BB] HS invalid pubkey length:", them.length);
+                    mHash(cid, mh); vizHs(el, "❌ Bad key (" + them.length + "b)"); return;
                 }
 
                 if (type === CFG.HS_REQ) {
@@ -412,7 +453,6 @@
                     const ps = _hsState.get(cid);
                     if (!ps) { mHash(cid, mh); vizHs(el, "❌ Orphaned"); return; }
 
-                    // Re-import with correct usages for ECDH deriveBits
                     const pk = await crypto.subtle.importKey("jwk", ps,
                         { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
                     const key = await hsDerive(pk, them);
@@ -423,8 +463,11 @@
                     setTimeout(async () => {
                         try { const f = fp(), ch = await encChunk(`✅ Bridge Established!\n🛡️ Both must see:\n# ${f}\nDifferent = intercepted.`); if (ch) for (const c of ch) await sendRaw(c); } catch (_) {}
                     }, 800);
-                } else { mHash(cid, mh); vizHs(el, "❌ Unknown"); }
-            } catch (e) { console.error("[BB] Handshake Error:", e); vizHs(el, "❌ Failed"); }
+                }
+            } catch (e) {
+                console.error("[BB] Handshake Error:", e, "input:", b64raw);
+                vizHs(el, "❌ Failed");
+            }
         });
     }
 
@@ -481,7 +524,6 @@
     const _infly = new WeakSet();
 
     function stripInvisibles(s) {
-        // Remove zero-width and invisible Unicode characters that Bale injects
         return s.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFFF9-\uFFFB]/g, '');
     }
 
@@ -493,7 +535,6 @@
             let tc = el.textContent;
             if (!tc || tc.length <= 20) continue;
 
-            // Pre-strip invisible characters for detection
             const cleanTc = stripInvisibles(tc);
 
             if (cleanTc.includes("!!") || cleanTc.includes("@@")) {
@@ -509,10 +550,9 @@
                 // Handle Handshakes
                 const hsIdx = cleanTc.indexOf("!!");
                 if (hsIdx !== -1) {
-                    // Extract payload, strip ALL non-URL-safe-base64 AND non-standard-base64 chars
                     const afterPrefix = cleanTc.slice(hsIdx + 2);
-                    // Allow both URL-safe (-_.) and standard (+/=) base64 chars
-                    const cleanPayload = afterPrefix.replace(/[^A-Za-z0-9+/=\-_.]/g, '');
+                    // Keep only URL-safe base64 chars (A-Z a-z 0-9 - _ ) and legacy (+ / = .)
+                    const cleanPayload = afterPrefix.replace(/[^A-Za-z0-9\-_+/.=]/g, '');
                     if (cleanPayload.length >= 40) {
                         el._isDecrypted = true;
                         handleHs(cleanPayload, el).catch(console.error);
@@ -523,7 +563,6 @@
                 // Handle Messages
                 const encIdx = cleanTc.indexOf("@@");
                 if (encIdx !== -1) {
-                    // Use cleaned text for decryption to avoid invisible char corruption
                     const raw = cleanTc.slice(encIdx);
                     _infly.add(el);
                     dec(raw).then(plain => {
