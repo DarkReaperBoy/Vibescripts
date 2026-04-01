@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
+// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS) - Optimized
 // @namespace    http://tampermonkey.net/
-// @version      13.1
-// @description  Fast dark UI, ECDH Bridge, Anti-XSS, no glow.
+// @version      15.0
+// @description  Fast dark UI, ECDH Bridge, B64 Immunity, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -15,11 +15,11 @@
 
     const CFG = Object.freeze({
         KEY_LEN: 32, MAX_ENC: 4000, HS_EXP: 300, TOAST_MS: 4500,
-        LONG_PRESS: 400, SEND_DLY: 30, POST_DLY: 100, MAX_HASHES: 50,
+        LONG_PRESS: 400, SEND_DLY: 60, POST_DLY: 100, MAX_HASHES: 50,
         MAX_DEPTH: 10, KCACHE: 16,
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
-        HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_H: "!!",
+        HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_E2: "@@+", PFX_H: "!!",
     });
 
     // Palette — muted slate-blue accent, no glow
@@ -65,12 +65,11 @@
     const encOn = () => getS().enabled;
     const fp = () => { const k = activeKey(); return k ? k.substring(0, 5).toUpperCase() : "NONE"; };
 
-    // ── Crypto ────────────────────────────────────────────────────────────────
+    // ── Crypto & Encodings ────────────────────────────────────────────────────
     const _kc = new Map();
     async function getKey(k) {
         let c = _kc.get(k); if (c) return c;
         const e = new TextEncoder().encode(k);
-        if (e.length !== CFG.KEY_LEN) throw new RangeError("Bad key");
         c = await crypto.subtle.importKey("raw", e, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
         if (_kc.size >= CFG.KCACHE) _kc.delete(_kc.keys().next().value);
         _kc.set(k, c); return c;
@@ -81,27 +80,15 @@
         return r.join("");
     }
 
-    // Base85
+    // Base85 Decoder (Legacy format fallback)
     const B85 = CFG.B85, B85D = new Uint8Array(128).fill(255);
     for (let i = 0; i < 85; i++) B85D[B85.charCodeAt(i)] = i;
-    function b85e(buf) {
-        const l = buf.length, o = []; let p = 0;
-        for (let i = 0; i < l; i += 4) {
-            const r = l - i < 4 ? l - i : 4; let a = 0;
-            for (let j = 0; j < 4; j++) a = (a << 8) | (i + j < l ? buf[i + j] : 0);
-            a >>>= 0; const n = r < 4 ? r + 1 : 5, t = [0,0,0,0,0];
-            for (let j = 4; j >= 0; j--) { t[j] = B85[a % 85]; a = (a / 85) | 0; }
-            for (let j = 0; j < n; j++) o[p++] = t[j];
-        }
-        return o.join("");
-    }
     function b85d(s) {
         const sl = s.length; if (!sl) return new Uint8Array(0);
-        if (sl % 5 === 1) throw new RangeError("Bad b85");
         const fl = (sl / 5) | 0, rm = sl % 5, est = fl * 4 + (rm ? rm - 1 : 0), o = new Uint8Array(est); let w = 0;
         for (let i = 0; i < sl; i += 5) {
             const e = i + 5 < sl ? i + 5 : sl, pd = 5 - (e - i); let a = 0;
-            for (let j = 0; j < 5; j++) { const c = i + j < sl ? s.charCodeAt(i + j) : 126; if (c > 127 || B85D[c] === 255) throw new RangeError("Bad b85 @" + (i + j)); a = a * 85 + B85D[c]; }
+            for (let j = 0; j < 5; j++) { const c = i + j < sl ? s.charCodeAt(i + j) : 126; if (c > 127 || B85D[c] === 255) continue; a = a * 85 + B85D[c]; }
             const b = 4 - pd;
             if (b >= 1) o[w++] = (a >>> 24) & 255; if (b >= 2) o[w++] = (a >>> 16) & 255;
             if (b >= 3) o[w++] = (a >>> 8) & 255; if (b >= 4) o[w++] = a & 255;
@@ -109,7 +96,6 @@
         return o.subarray(0, w);
     }
 
-    // Compression
     async function cmp(t) {
         if (typeof CompressionStream === "undefined") return new TextEncoder().encode(t);
         const c = new CompressionStream("deflate"), w = c.writable.getWriter();
@@ -122,19 +108,38 @@
         catch (_) { return new TextDecoder().decode(b); }
     }
 
+    // Strip Invisible Bidi Marks and Zero-Widths added by Bale/Browser
+    const cleanText = (str) => str.replace(/[\u200B-\u200D\uFEFF\u200E\u200F\s]/g, '').trim();
+
     async function enc(t) {
         const k = activeKey(); if (!k) return null;
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(k), await cmp(t)));
         const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
-        return CFG.PFX_E + b85e(p);
+        
+        // Encode in Base64 (Immune to Bale Markdown Mangling)
+        let binary = '';
+        for (let i = 0; i < p.byteLength; i++) binary += String.fromCharCode(p[i]);
+        return CFG.PFX_E2 + btoa(binary);
     }
+
     async function dec(t) {
         if (!t.startsWith(CFG.PFX_E)) return t;
         const k = activeKey(); if (!k) return t;
-        try { const b = b85d(t.slice(2)); if (b.length < 13) return t; return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12)))); }
-        catch (_) { return t; }
+        try { 
+            let b;
+            if (t.startsWith(CFG.PFX_E2)) {
+                const b64 = atob(cleanText(t.slice(3)));
+                b = new Uint8Array(b64.length);
+                for (let i = 0; i < b64.length; i++) b[i] = b64.charCodeAt(i);
+            } else {
+                b = b85d(cleanText(t.slice(2))); // Fallback for old B85 messages
+            }
+            if (b.length < 13) return t; 
+            return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12)))); 
+        } catch (_) { return t; }
     }
+    
     async function encChunk(t, d = 0) {
         if (d > CFG.MAX_DEPTH) return null;
         const r = await enc(t); if (!r) return null;
@@ -190,7 +195,6 @@
         el.appendChild(b); el.style.display = "block"; el.style.textAlign = "center"; el._isDecrypted = true;
     }
 
-    // Hash tracking
     function mHash(cid, h) {
         const k = "bb_phs_" + cid;
         try { const a = JSON.parse(localStorage.getItem(k) || "[]"); if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; } if (!a.includes(h)) { a.push(h); while (a.length > CFG.MAX_HASHES) a.shift(); localStorage.setItem(k, JSON.stringify(a)); } }
@@ -201,7 +205,7 @@
     function tsB() { const t = (Date.now() / 1000) | 0; return new Uint8Array([(t >>> 24) & 255, (t >>> 16) & 255, (t >>> 8) & 255, t & 255]); }
     function rdTs(b) { return ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0; }
 
-    // ── Send ──────────────────────────────────────────────────────────────────
+    // ── Send Logic & React Intercept ──────────────────────────────────────────
     const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
     const getReal = () => document.getElementById("editable-message-text") || document.getElementById("main-message-input");
     const isMob = el => el?.tagName === "TEXTAREA";
@@ -210,20 +214,60 @@
         const real = getReal(); if (!real) return;
         const mob = isMob(real), ws = isSyncing; isSyncing = true;
         unlockI(real);
-        if (mob) { _taSet?.call(real, text); real.dispatchEvent(new Event("input", { bubbles: true })); }
-        else { real.focus(); document.execCommand("selectAll", false, null); document.execCommand("insertText", false, text); real.dispatchEvent(new Event("input", { bubbles: true })); }
-        await new Promise(r => setTimeout(r, CFG.SEND_DLY));
-        let btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR'), sent = false;
-        if (btn) {
-            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
-            if (rk && typeof btn[rk]?.onClick === 'function') { try { btn[rk].onClick({ preventDefault() {}, stopPropagation() {} }); sent = true; } catch (_) {} }
-            if (!sent) { for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); sent = true; }
+        
+        real.focus();
+        if (mob) { 
+            _taSet?.call(real, text); 
+            real.dispatchEvent(new Event("input", { bubbles: true })); 
+        } else { 
+            document.execCommand("selectAll", false, null); 
+            document.execCommand("insertText", false, text); 
+            real.dispatchEvent(new Event("input", { bubbles: true })); 
         }
-        if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+        
+        await new Promise(r => setTimeout(r, CFG.SEND_DLY));
+        
+        const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
+        let sent = false;
+        
+        if (btn) {
+            // Find react props in Fiber tree
+            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+            try {
+                let node = btn[rk];
+                while(node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
+                if (typeof clickFn === 'function') {
+                    clickFn({ preventDefault() {}, stopPropagation() {} });
+                    sent = true;
+                }
+            } catch (_) {}
+            
+            // Fallback Native click mapping
+            if (!sent) { 
+                for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) {
+                    btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); 
+                }
+                sent = true; 
+            }
+        }
+        
+        if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13 }));
+        
         await new Promise(r => setTimeout(r, CFG.POST_DLY));
-        if (mob) { if (real.value !== "") { _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true })); } }
-        else { if (real.innerText.trim()) { real.focus(); document.execCommand("selectAll", false, null); document.execCommand("delete", false, null); real.dispatchEvent(new Event("input", { bubbles: true })); } }
-        if (encOn()) lockI(real); isSyncing = ws;
+        
+        if (mob) { 
+            _taSet?.call(real, ""); 
+            real.dispatchEvent(new Event("input", { bubbles: true })); 
+        } else { 
+            real.focus(); 
+            document.execCommand("selectAll", false, null); 
+            document.execCommand("delete", false, null); 
+            real.dispatchEvent(new Event("input", { bubbles: true })); 
+        }
+        
+        if (encOn()) lockI(real); 
+        isSyncing = ws;
     }
 
     // ── Handshake ─────────────────────────────────────────────────────────────
@@ -246,10 +290,9 @@
             border: `1px solid ${P.ac}`, padding: "14px 18px", borderRadius: "12px",
             background: P.card, display: "inline-block", fontFamily: "inherit", margin: "4px 0", maxWidth: "320px",
         });
-        const t = document.createElement("strong"); t.textContent = "🛡️ Secure Bridge Request";
-        Object.assign(t.style, { color: P.ac, display: "block", marginBottom: "6px", fontSize: "14px" });
-        const d = document.createElement("span"); d.textContent = "Your friend wants End-to-End Encryption.";
-        Object.assign(d.style, { fontSize: "12px", color: P.txD, display: "block", marginBottom: "10px", lineHeight: "1.4" });
+        box.innerHTML = `<strong style="color:${P.ac};display:block;margin-bottom:6px;font-size:14px">🛡️ Secure Bridge Request</strong>
+                         <span style="font-size:12px;color:${P.txD};display:block;margin-bottom:10px;line-height:1.4">Your friend wants End-to-End Encryption.</span>`;
+        
         const b = document.createElement("button"); b.textContent = "Accept & Connect";
         Object.assign(b.style, {
             background: P.ac, color: P.bg, border: "none", padding: "8px 16px", borderRadius: "8px",
@@ -271,7 +314,7 @@
                 });
             } catch (err) { console.error("[BB]", err); b.disabled = false; b.textContent = "Retry"; b.style.opacity = "1"; }
         };
-        box.appendChild(t); box.appendChild(d); box.appendChild(b); el.appendChild(box); el.style.display = "block";
+        box.appendChild(b); el.appendChild(box); el.style.display = "block";
     }
 
     async function handleHs(b64, el) {
@@ -290,8 +333,7 @@
                 else if (type === CFG.HS_RES) {
                     const ps = sessionStorage.getItem("bb_hs_" + cid);
                     if (!ps) { mHash(cid, mh); vizHs(el, "❌ Orphaned"); return; }
-                    let pj; try { pj = JSON.parse(ps); } catch (_) { mHash(cid, mh); vizHs(el, "❌ Corrupt"); return; }
-                    const pk = await crypto.subtle.importKey("jwk", pj, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+                    const pk = await crypto.subtle.importKey("jwk", JSON.parse(ps), { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
                     const key = await hsDerive(pk, them); sessionStorage.removeItem("bb_hs_" + cid);
                     setS({ enabled: true, customKey: key }); syncVis(); mHash(cid, mh);
                     vizHs(el, "✅ Bridge Complete"); toast("🛡️ Code: " + fp(), 6000);
@@ -352,42 +394,54 @@
     // ── Spoiler ───────────────────────────────────────────────────────────────
     document.addEventListener("click", e => { const s = e.target.closest(".bb-spoiler"); if (s) { s.style.color = "inherit"; s.style.background = P.bdr; } }, true);
 
-    // ── Scan ──────────────────────────────────────────────────────────────────
+    // ── Scan & Auto-Decrypt ───────────────────────────────────────────────────
     const SKIP = new Set(["secure-input-overlay", "secure-edit-overlay", "editable-message-text", "main-message-input", "bb-no-key-notice", "bale-bridge-menu", "bb-modal-overlay"]);
     const _infly = new WeakSet();
-    const _hsRx = /^!!([A-Za-z0-9+/=]{40,})/;
 
     function scan(root) {
-        const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-            acceptNode(node) {
-                if (node._isDecrypted || _infly.has(node) || SKIP.has(node.id)) return NodeFilter.FILTER_REJECT;
-                return NodeFilter.FILTER_ACCEPT;
-            }
-        });
-        let el;
-        while ((el = tw.nextNode())) {
-            const tc = el.textContent; if (tc.length <= 20) continue;
-            const trim = tc.trim();
+        // Find potential blocks in DOM
+        const els = root.querySelectorAll('span, div, p');
+        for (const el of els) {
+            if (el._isDecrypted || _infly.has(el) || SKIP.has(el.id)) continue;
+            
+            let tc = el.textContent;
+            if (!tc || tc.length <= 20) continue;
+            tc = cleanText(tc); // Removes invisible RTL/LTR markers affecting decoding 
 
-            const mh = trim.match(_hsRx);
-            if (mh) {
-                let skip = false; for (const c of el.children) if (c.textContent.includes("!!")) { skip = true; break; }
-                if (skip) continue;
-                el._isDecrypted = true; handleHs(mh[1], el).catch(e => console.error("[BB]", e)); continue;
-            }
-            if (trim.charCodeAt(0) === 64 && trim.charCodeAt(1) === 64 && trim.length > 20) {
-                let skip = false; for (const c of el.children) if (c.textContent.trim() === trim) { skip = true; break; }
-                if (skip) continue;
-                _infly.add(el);
-                dec(trim).then(plain => {
-                    if (plain !== trim) {
-                        if (!el._bbO) { Object.assign(el.style, { overflow: "hidden", overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%" }); el.classList.add("bb-msg-container"); el._bbO = true; }
-                        el.innerHTML = renderDec(plain) + `<span class="bb-enc-badge">🔒 encrypted <span class="bb-copy-btn" title="Copy">📋</span></span>`;
-                        el.style.color = "inherit"; el._isDecrypted = true;
-                        const cb = el.querySelector(".bb-copy-btn");
-                        if (cb) cb.onclick = ev => { ev.preventDefault(); ev.stopPropagation(); navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1200); }).catch(() => {}); };
+            if (tc.startsWith("@@") || tc.startsWith("!!")) {
+                // Ensure we process only the deepest element holding this exact string
+                let hasMatchingChild = false;
+                for (const c of el.children) {
+                    const ctc = c.textContent ? cleanText(c.textContent) : "";
+                    if (ctc === tc) { hasMatchingChild = true; break; }
+                }
+                if (hasMatchingChild) continue;
+
+                if (tc.startsWith("!!")) {
+                    const mh = tc.match(/^!!([A-Za-z0-9+/=]{40,})/);
+                    if (mh) {
+                        el._isDecrypted = true;
+                        handleHs(mh[1], el).catch(console.error);
                     }
-                }).catch(() => {}).finally(() => _infly.delete(el));
+                } else if (tc.startsWith("@@")) {
+                    _infly.add(el);
+                    dec(tc).then(plain => {
+                        if (plain !== tc) {
+                            if (!el._bbO) { 
+                                Object.assign(el.style, { overflow: "hidden", overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%" }); 
+                                el.classList.add("bb-msg-container"); el._bbO = true; 
+                            }
+                            el.innerHTML = renderDec(plain) + `<span class="bb-enc-badge">🔒 encrypted <span class="bb-copy-btn" title="Copy">📋</span></span>`;
+                            el.style.color = "inherit"; el._isDecrypted = true;
+                            
+                            const cb = el.querySelector(".bb-copy-btn");
+                            if (cb) cb.onclick = ev => { 
+                                ev.preventDefault(); ev.stopPropagation(); 
+                                navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1200); }).catch(() => {}); 
+                            };
+                        }
+                    }).catch(()=>{}).finally(() => _infly.delete(el));
+                }
             }
         }
     }
@@ -548,6 +602,8 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
     function ensureInput() {
         const ri = getReal(); if (!ri) return;
         const mob = isMob(ri), wrap = ri.parentElement; if (!wrap) return;
+        
+        // Find Native Attachment / Emoji Buttons reliably
         const emoji = document.querySelector('[aria-label="emoji-icon"]') || document.querySelector(".MmBErq");
         if (emoji && encOn()) emoji.style.display = "none"; else if (emoji) emoji.style.display = "";
 
@@ -645,7 +701,10 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         se.placeholder = "🔒 " + (real.placeholder || "ویرایش امن..."); se.dir = real.dir || "auto"; se.style.cssText = real.style.cssText;
         se.addEventListener("input", () => { se.style.height = "auto"; se.style.height = Math.min(se.scrollHeight, 150) + "px"; });
         real.parentElement.insertBefore(se, real); lockI(real); se.focus();
-        const ex = real.value.trim(); _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true }));
+        
+        const ex = real.value ? cleanText(real.value) : "";
+        _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true }));
+        
         if (ex.startsWith(CFG.PFX_E)) dec(ex).then(p => { if (p !== ex) se.value = p; }).catch(() => {}); else se.value = ex;
 
         const encFwd = async btn => {
@@ -657,9 +716,17 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 se.value = ""; unlockI(real); _taSet?.call(real, out);
                 real.dispatchEvent(new Event("input", { bubbles: true })); real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, CFG.SEND_DLY));
-                const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
-                if (rk && typeof btn[rk]?.onClick === 'function') btn[rk].onClick({ preventDefault() {}, stopPropagation() {} });
-                else for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+                const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                let dispatched = false;
+                try {
+                    let node = btn[rk];
+                    while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                    let fn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
+                    if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
+                } catch (_) {}
+                if (!dispatched) {
+                    for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+                }
             } catch (e) { console.error("[BB]", e); se.value = prev; toast("Failed!"); }
             finally { se._busy = false; }
         };
