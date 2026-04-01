@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bale Bridge Encryptor/Decryptor (Ultimate Privacy)
+// @name         Bale Bridge Encryptor (Stable ECDH)
 // @namespace    http://tampermonkey.net/
-// @version      11.2
-// @description  Per-chat keys, Shield button, Material UI, Auto-decrypt, Draft blocker. Desktop & Mobile.
+// @version      11.3
+// @description  Per-chat keys, Auto-Bridge, Material UI, Draft blocker. Fixed loops & history bugs.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -16,8 +16,12 @@
     const _origWsSend = WebSocket.prototype.send;
     WebSocket.prototype.send = function(data) {
         try {
-            const t = typeof data === "string" ? data : new TextDecoder().decode(data);
-            if (t.includes("EditParameter") && t.includes("drafts_")) return;
+            let t = "";
+            if (typeof data === "string") t = data;
+            else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+                t = new TextDecoder().decode(data);
+            }
+            if (t && t.includes("EditParameter") && t.includes("drafts_")) return;
         } catch (_) {}
         return _origWsSend.apply(this, arguments);
     };
@@ -52,7 +56,7 @@
     };
     const isEncryptionEnabled = () => getChatSettings().enabled;
 
-    // ─── 2. Crypto Engine (AES + Auto Bridge) ─────────────────────────────────
+    // ─── 2. Crypto Engine (AES) ───────────────────────────────────────────────
     const keyCache = new Map();
     async function getCryptoKey(k) {
         if (keyCache.has(k)) return keyCache.get(k);
@@ -178,20 +182,13 @@
         return [...a, ...b];
     }
 
-    // ─── 2b. Auto Bridge Exchange Engine ──────────────────────────────────────
-    const _pendingHS = new Map();
-    const _sentHS = new Set();
+    // ─── 3. ECDH Stable Auto Bridge ───────────────────────────────────────────
     let _hsBusy = false;
 
-    async function _hsNewPair() {
-        return crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
-    }
-    async function _hsPubRaw(pubKey) {
-        return new Uint8Array(await crypto.subtle.exportKey("raw", pubKey));
-    }
-    async function _hsPubImport(bytes) {
-        return crypto.subtle.importKey("raw", bytes, { name: "ECDH", namedCurve: "P-256" }, false, []);
-    }
+    async function _hsNewPair() { return crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]); }
+    async function _hsPubRaw(pubKey) { return new Uint8Array(await crypto.subtle.exportKey("raw", pubKey)); }
+    async function _hsPubImport(bytes) { return crypto.subtle.importKey("raw", bytes, { name: "ECDH", namedCurve: "P-256" }, false, []); }
+    
     async function _hsDeriveKeyStr(myPriv, theirPubBytes) {
         const theirPub = await _hsPubImport(theirPubBytes);
         const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: theirPub }, myPriv, 256);
@@ -211,47 +208,35 @@
         setTimeout(() => { el.style.opacity = "0"; el.style.transform = "translateX(-50%) translateY(10px)"; setTimeout(() => el.remove(), 300); }, dur);
     }
 
-    function _hideHsEl(el) {
-        el.innerHTML = '<span style="display:none;"></span>';
+    function _visualizeHs(el, text) {
+        el.innerHTML = `<span style="display:inline-block; margin:2px 0; padding:3px 8px; font-size:11px; font-weight:600; font-family:monospace; color:var(--color-primary-p-50,#00ab80); background:var(--color-neutrals-n-20,#f4f5f7); border-radius:12px; border:1px solid var(--color-primary-p-50,#00ab80); opacity: 0.85; user-select:none;">${text}</span>`;
+        el.style.display = "block";
+        el.style.textAlign = "center";
         el._isDecrypted = true;
     }
 
-    // Advanced React Fiber Bypass to solve Chromium's `isTrusted` firewall
-    function _forceReactSend(realInput, sendBtn) {
-        let sent = false;
-
-        // 1. Try Direct React Send Button execution
-        if (sendBtn) {
-            const btnProps = Object.keys(sendBtn).find(k => k.startsWith('__reactProps$'));
-            if (btnProps && sendBtn[btnProps] && sendBtn[btnProps].onClick) {
-                try {
-                    sendBtn[btnProps].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
-                    sent = true;
-                } catch(e) {}
-            }
-        }
-
-        // 2. Try Direct React Input Field 'Enter' execution
-        if (!sent && realInput) {
-            const inProps = Object.keys(realInput).find(k => k.startsWith('__reactProps$'));
-            if (inProps && realInput[inProps] && realInput[inProps].onKeyDown) {
-                try {
-                    realInput[inProps].onKeyDown({
-                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, shiftKey: false,
-                        preventDefault: () => {}, stopPropagation: () => {}
-                    });
-                    sent = true;
-                } catch(e) {}
-            }
-        }
-
-        // 3. Fallback to Native Events
-        if (!sent) {
-            if (sendBtn) sendBtn.click();
-            if (realInput) realInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+    function markHashProcessed(chatId, hash) {
+        const pKey = "bb_phs_" + chatId;
+        const processed = JSON.parse(localStorage.getItem(pKey) || "[]");
+        if (!processed.includes(hash)) {
+            processed.push(hash);
+            if(processed.length > 50) processed.shift();
+            localStorage.setItem(pKey, JSON.stringify(processed));
         }
     }
 
+    function isHashProcessed(chatId, hash) {
+        return JSON.parse(localStorage.getItem("bb_phs_" + chatId) || "[]").includes(hash);
+    }
+
+    function getTimestampBytes() {
+        const ts = Math.floor(Date.now() / 1000);
+        return new Uint8Array([(ts >>> 24) & 0xFF, (ts >>> 16) & 0xFF, (ts >>> 8) & 0xFF, ts & 0xFF]);
+    }
+
+    function readTimestamp(buf) { return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]; }
+
+    // Safe Send override bypassing messy react loops
     async function _sendRaw(text) {
         const real = getRealInput();
         if (!real) return;
@@ -271,15 +256,24 @@
             real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
         }
 
-        let sendBtn = null;
-        for(let i=0; i<15; i++){
-            await new Promise(r => setTimeout(r, 20));
-            const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
-            if (btn && getComputedStyle(btn).display !== 'none') { sendBtn = btn; break; }
-        }
+        await new Promise(r => setTimeout(r, 60));
 
-        _forceReactSend(real, sendBtn);
-        await new Promise(r => setTimeout(r, 150));
+        let sendBtn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
+        let sent = false;
+
+        if (sendBtn) {
+            const btnProps = Object.keys(sendBtn).find(k => k.startsWith('__reactProps$'));
+            if (btnProps && sendBtn[btnProps]?.onClick) {
+                try {
+                    sendBtn[btnProps].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
+                    sent = true;
+                } catch(e) {}
+            }
+        }
+        if (!sent && sendBtn) sendBtn.click();
+        if (!sent && real) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13 }));
+
+        await new Promise(r => setTimeout(r, 120));
 
         if (mobile) {
             _textareaSetter?.call(real, "");
@@ -302,101 +296,119 @@
             const chatId = getChatId();
             const pair = await _hsNewPair();
             const pub = await _hsPubRaw(pair.publicKey);
-            _pendingHS.set(chatId, pair.privateKey);
+            
+            // Session storage securely survives page reloads while waiting for answer
+            const exportedPriv = await crypto.subtle.exportKey("jwk", pair.privateKey);
+            sessionStorage.setItem("bb_pending_hs_" + chatId, JSON.stringify(exportedPriv));
 
-            const payload = new Uint8Array(1 + pub.length);
-            payload[0] = 0x01;
-            payload.set(pub, 1);
+            const payload = new Uint8Array(1 + 4 + pub.length);
+            payload[0] = 0x01; // Request
+            payload.set(getTimestampBytes(), 1);
+            payload.set(pub, 5);
 
             const b64 = btoa(String.fromCharCode.apply(null, payload));
             const msg = "!!" + b64;
 
             let msgHash = 0;
-            for (let i=0; i<msg.length; i++) msgHash = Math.imul(31, msgHash) + msg.charCodeAt(i) | 0;
-            const pKey = "bb_phs_" + chatId;
-            const processed = JSON.parse(localStorage.getItem(pKey) || "[]");
-            processed.push(msgHash);
-            if(processed.length > 30) processed.shift();
-            localStorage.setItem(pKey, JSON.stringify(processed));
+            for (let i=0; i<b64.length; i++) msgHash = Math.imul(31, msgHash) + b64.charCodeAt(i) | 0;
+            markHashProcessed(chatId, msgHash); // Don't trigger on our own sent message
 
-            _sentHS.add(msg);
             await _sendRaw(msg);
             _showToast("⏳ Establishing secure bridge...");
         } catch (e) { console.error("[BB] Bridge setup failed"); }
         finally { _hsBusy = false; }
     }
 
-    async function _handleHS(text, el) {
+    async function _handleHS(b64, el) {
         if (_hsBusy) return;
+        
+        const chatId = getChatId();
+        let msgHash = 0;
+        for (let i=0; i<b64.length; i++) msgHash = Math.imul(31, msgHash) + b64.charCodeAt(i) | 0;
+
+        if (isHashProcessed(chatId, msgHash)) {
+            _visualizeHs(el, "🤝 Bridge Signal Processed");
+            return;
+        }
+
         _hsBusy = true;
         try {
-            const chatId = getChatId();
-            let msgHash = 0;
-            for (let i=0; i<text.length; i++) msgHash = Math.imul(31, msgHash) + text.charCodeAt(i) | 0;
-            const pKey = "bb_phs_" + chatId;
-            const processed = JSON.parse(localStorage.getItem(pKey) || "[]");
-
-            if (processed.includes(msgHash)) {
-                _hideHsEl(el);
-                _hsBusy = false;
-                return;
-            }
-
-            const b64 = text.slice(2);
             const binary = atob(b64);
             const raw = new Uint8Array(binary.length);
             for(let i=0; i<binary.length; i++) raw[i] = binary.charCodeAt(i);
 
             const type = raw[0];
-            const theirPub = raw.subarray(1);
+            const ts = readTimestamp(raw.subarray(1, 5));
+            const theirPub = raw.subarray(5);
 
-            if (type === 0x01) {
+            // History Loop Bugfix: Ignore if > 5 minutes old
+            if (Math.floor(Date.now() / 1000) - ts > 300) {
+                markHashProcessed(chatId, msgHash);
+                _visualizeHs(el, "⌛ Expired Bridge Request");
+                _hsBusy = false;
+                return;
+            }
+
+            if (type === 0x01) { // They requested a bridge
                 const pair = await _hsNewPair();
                 const myPub = await _hsPubRaw(pair.publicKey);
                 const key = await _hsDeriveKeyStr(pair.privateKey, theirPub);
+                
                 saveChatSettings({ enabled: true, customKey: key });
                 syncInputVisibility();
 
-                const rPay = new Uint8Array(1 + myPub.length);
-                rPay[0] = 0x02;
-                rPay.set(myPub, 1);
-                const rMsg = "!!" + btoa(String.fromCharCode.apply(null, rPay));
+                const rPay = new Uint8Array(1 + 4 + myPub.length);
+                rPay[0] = 0x02; // Accept
+                rPay.set(getTimestampBytes(), 1);
+                rPay.set(myPub, 5);
 
-                processed.push(msgHash);
+                const rB64 = btoa(String.fromCharCode.apply(null, rPay));
+                const rMsg = "!!" + rB64;
+                
                 let rMsgHash = 0;
-                for (let i=0; i<rMsg.length; i++) rMsgHash = Math.imul(31, rMsgHash) + rMsg.charCodeAt(i) | 0;
-                processed.push(rMsgHash);
+                for (let i=0; i<rB64.length; i++) rMsgHash = Math.imul(31, rMsgHash) + rB64.charCodeAt(i) | 0;
+                
+                markHashProcessed(chatId, msgHash);
+                markHashProcessed(chatId, rMsgHash);
 
-                if(processed.length > 30) processed.splice(0, processed.length - 30);
-                localStorage.setItem(pKey, JSON.stringify(processed));
-
-                _sentHS.add(rMsg);
                 await _sendRaw(rMsg);
+                _visualizeHs(el, "🤝 Bridge Auto-Accepted");
+                _showToast("🛡️ Bridge secured! Key ID: " + key.substring(0, 6).toUpperCase(), 5000);
 
-                _showToast("🛡️ Bridge secured. Key ID: " + key.substring(0, 6).toUpperCase(), 7000);
-            } else if (type === 0x02) {
-                const priv = _pendingHS.get(chatId);
-                if (!priv) {
+                // Send success message to complete the loop visibly
+                setTimeout(async () => {
+                    const successEnc = await encryptChunked("✅ **Secure Bridge Auto-Established.** Communications are now encrypted.");
+                    if(successEnc) {
+                        for(const chunk of successEnc) await _sendRaw(chunk);
+                    }
+                }, 1000);
+
+            } else if (type === 0x02) { // They accepted our bridge
+                const privJwkStr = sessionStorage.getItem("bb_pending_hs_" + chatId);
+                if (!privJwkStr) {
+                    markHashProcessed(chatId, msgHash);
+                    _visualizeHs(el, "❌ Orphaned Bridge Accept");
                     _hsBusy = false;
                     return;
                 }
-                const key = await _hsDeriveKeyStr(priv, theirPub);
-                _pendingHS.delete(chatId);
+                const privJwk = JSON.parse(privJwkStr);
+                const privKey = await crypto.subtle.importKey("jwk", privJwk, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+                
+                const key = await _hsDeriveKeyStr(privKey, theirPub);
+                sessionStorage.removeItem("bb_pending_hs_" + chatId);
+                
                 saveChatSettings({ enabled: true, customKey: key });
                 syncInputVisibility();
 
-                processed.push(msgHash);
-                if(processed.length > 30) processed.shift();
-                localStorage.setItem(pKey, JSON.stringify(processed));
-
-                _showToast("🛡️ Bridge secured. Key ID: " + key.substring(0, 6).toUpperCase(), 7000);
+                markHashProcessed(chatId, msgHash);
+                _visualizeHs(el, "✅ Bridge Completed");
+                _showToast("🛡️ Bridge secured! Key ID: " + key.substring(0, 6).toUpperCase(), 5000);
             }
-            _hideHsEl(el);
-        } catch (e) { console.error("[BB] Core error"); }
+        } catch (e) { console.error("[BB] Core error", e); } 
         finally { _hsBusy = false; }
     }
 
-    // ─── 3. DOM Scanner & UI Rendering ────────────────────────────────────────
+    // ─── 4. DOM Scanner & UI Rendering ────────────────────────────────────────
     const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
     const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
     const escapeHtml = (s) => s.replace(/[&<>"]/g, c => _ESC_MAP[c]);
@@ -485,19 +497,21 @@
 
             const text = el.textContent;
             if (text.length <= 20) continue;
-            const trimmed = text.trim();
-
-            if (trimmed.startsWith("!!") && trimmed.length > 20) {
+            
+            // Handshake Bridge Scanner (Strict extraction avoids DOM trailing spaces bug)
+            const matchHs = text.trim().match(/!!([A-Za-z0-9+/=]{40,})/);
+            if (matchHs) {
                 let skip = false;
-                for (const c of el.children) { if (c.textContent.trim() === trimmed) { skip = true; break; } }
+                for (const c of el.children) { if (c.textContent.includes("!!")) { skip = true; break; } }
                 if (skip) continue;
 
                 el._isDecrypted = true;
-                if (_sentHS.has(trimmed)) _hideHsEl(el);
-                else _handleHS(trimmed, el);
+                _handleHS(matchHs[1], el);
                 continue;
             }
 
+            // Message Decryption Scanner
+            const trimmed = text.trim();
             if (trimmed.startsWith("@@") && trimmed.length > 20) {
                 let skip = false;
                 for (const c of el.children) { if (c.textContent.trim() === trimmed) { skip = true; break; } }
@@ -537,12 +551,11 @@
         }
     }
 
-    // ─── 4. Input Helpers ─────────────────────────────────────────────────────
+    // ─── 5. Input Helpers & UI Styles ─────────────────────────────────────────
     const getRealInput = () => document.getElementById("editable-message-text") || document.getElementById("main-message-input");
     const isMobileInput = (el) => el?.tagName === "TEXTAREA";
     const _textareaSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
 
-    // ─── 5. UI & Styles (v11.1 Port) ──────────────────────────────────────────
     document.addEventListener("click", (e) => {
         const sp = e.target.closest(".bb-spoiler");
         if (!sp) return;
@@ -650,16 +663,12 @@
         .bb-hr { display: block; border-top: 1px solid var(--color-neutrals-n-100,#ccc); margin: 6px 0; }
         .bb-spacer { display: block; height: 0.4em; }
 
-        /* Smart Compact mode */
         .BAsWs0 .bb-block, .MRlMpm .bb-block, .dialog-item-content .bb-block, .aqFHpt .bb-block,
         .BAsWs0 .bb-quote, .MRlMpm .bb-quote, .dialog-item-content .bb-quote, .aqFHpt .bb-quote,
         .BAsWs0 .bb-ul, .MRlMpm .bb-ul, .dialog-item-content .bb-ul, .aqFHpt .bb-ul,
         .BAsWs0 .bb-ol, .MRlMpm .bb-ol, .dialog-item-content .bb-ol, .aqFHpt .bb-ol,
         .BAsWs0 .bb-li, .MRlMpm .bb-li, .dialog-item-content .bb-li, .aqFHpt .bb-li {
-            display: inline !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            border: none !important;
+            display: inline !important; margin: 0 !important; padding: 0 !important; border: none !important;
         }
         .BAsWs0 .bb-spacer, .MRlMpm .bb-spacer, .dialog-item-content .bb-spacer, .aqFHpt .bb-spacer,
         .BAsWs0 .bb-hr, .MRlMpm .bb-hr, .dialog-item-content .bb-hr, .aqFHpt .bb-hr,
@@ -671,10 +680,7 @@
             content: " \\00a0•\\00a0 ";
         }
         .BAsWs0 .bb-msg-container, .MRlMpm .bb-msg-container, .dialog-item-content .bb-msg-container, .aqFHpt .bb-msg-container {
-            display: -webkit-box !important;
-            -webkit-line-clamp: 2 !important;
-            -webkit-box-orient: vertical !important;
-            white-space: normal !important;
+            display: -webkit-box !important; -webkit-line-clamp: 2 !important; -webkit-box-orient: vertical !important; white-space: normal !important;
         }
     </style>`);
 
@@ -692,7 +698,7 @@
     document.getElementById("bale-menu-enc").onclick = () => { popupMenu.style.display = "none"; window._bbSend?.(true); };
     document.getElementById("bale-menu-plain").onclick = () => { popupMenu.style.display = "none"; window._bbSend?.(false); };
 
-    // ─── 7. Settings Modal (v11.1 style + AutoBridge) ─────────────────────────
+    // ─── 7. Settings Modal ────────────────────────────────────────────────────
     function openSettingsModal() {
         document.getElementById("bb-modal-overlay")?.remove();
         const s = getChatSettings();
@@ -956,72 +962,7 @@
         });
 
         const sendOneChunk = async (out) => {
-            unlockInput(realInput);
-            isSyncing = true;
-
-            if (mobile) {
-                _textareaSetter?.call(realInput, out);
-                realInput.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-            } else {
-                realInput.focus();
-                document.execCommand("selectAll", false, null);
-                document.execCommand("insertText", false, out);
-                realInput.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-            }
-
-            let sendBtn = null;
-            for(let i=0; i<15; i++){
-                await new Promise(r => setTimeout(r, 20));
-                const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
-                if (btn && getComputedStyle(btn).display !== 'none') {
-                    sendBtn = btn;
-                    break;
-                }
-            }
-
-            // Advanced React Fiber Execution (Bypasses Chrome `isTrusted` firewall completely)
-            let sent = false;
-            if (sendBtn) {
-                const btnProps = Object.keys(sendBtn).find(k => k.startsWith('__reactProps$'));
-                if (btnProps && sendBtn[btnProps] && sendBtn[btnProps].onClick) {
-                    try {
-                        sendBtn[btnProps].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
-                        sent = true;
-                    } catch(e) {}
-                }
-            }
-            if (!sent && realInput) {
-                const inProps = Object.keys(realInput).find(k => k.startsWith('__reactProps$'));
-                if (inProps && realInput[inProps] && realInput[inProps].onKeyDown) {
-                    try {
-                        realInput[inProps].onKeyDown({
-                            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, shiftKey: false,
-                            preventDefault: () => {}, stopPropagation: () => {}
-                        });
-                        sent = true;
-                    } catch(e) {}
-                }
-            }
-            if (!sent) {
-                if (sendBtn) sendBtn.click();
-                realInput.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
-            }
-
-            await new Promise(r => setTimeout(r, 150));
-
-            // Clean real DOM
-            if (mobile) {
-                _textareaSetter?.call(realInput, "");
-                realInput.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-            } else {
-                realInput.focus();
-                document.execCommand("selectAll", false, null);
-                document.execCommand("delete", false, null);
-                realInput.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-            }
-
-            isSyncing = false;
-            if (isEncryptionEnabled()) lockInput(realInput);
+            await _sendRaw(out);
         };
 
         const triggerSend = async (doEncrypt = true) => {
@@ -1155,8 +1096,6 @@
         if (!isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
 
         e.preventDefault(); e.stopPropagation();
-
-        // Execute only on the primary touch/mouse event to prevent duplicate sends
         if (e.type === 'mousedown' || e.type === 'touchstart') {
             window._bbSend?.(true);
         }
