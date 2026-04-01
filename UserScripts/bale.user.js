@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      15.1
-// @description  Fast dark UI, ECDH Bridge, B64 Immunity, Anti-XSS.
+// @version      15.2
+// @description  Fast dark UI, ECDH Bridge, Invisible Char Immunity, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -81,23 +81,16 @@
         return r.join("");
     }
 
-    // Safe Base64 Encoder (Avoids call-stack limits on Mobile)
     function buf2b64(buf) {
         let binary = '';
         for (let i = 0; i < buf.byteLength; i++) binary += String.fromCharCode(buf[i]);
         return btoa(binary);
     }
 
-    // Base85 Decoder (Legacy format fallback)
     const B85 = CFG.B85, B85D = new Uint8Array(128).fill(255);
     for (let i = 0; i < 85; i++) B85D[B85.charCodeAt(i)] = i;
     
-    function b85d(raw) {
-        let s = ""; // Strip invisible/malformed bytes first
-        for(let i = 0; i < raw.length; i++) {
-            const c = raw.charCodeAt(i);
-            if(c < 128 && B85D[c] !== 255) s += raw[i];
-        }
+    function b85d(s) {
         const sl = s.length; if (!sl) return new Uint8Array(0);
         const fl = (sl / 5) | 0, rm = sl % 5, est = fl * 4 + (rm ? rm - 1 : 0), o = new Uint8Array(est); let w = 0;
         for (let i = 0; i < sl; i += 5) {
@@ -122,8 +115,6 @@
         catch (_) { return new TextDecoder().decode(b); }
     }
 
-    const cleanText = (str) => str.replace(/[\u200B-\u200D\uFEFF\u200E\u200F\s]/g, '').trim();
-
     async function enc(t) {
         const k = activeKey(); if (!k) return null;
         const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -138,11 +129,11 @@
         try { 
             let b;
             if (t.startsWith(CFG.PFX_E2)) {
-                const b64 = atob(cleanText(t.slice(3)));
+                const b64 = atob(t.slice(3).replace(/[^A-Za-z0-9+/=]/g, '')); // Strip injected invisibles
                 b = new Uint8Array(b64.length);
                 for (let i = 0; i < b64.length; i++) b[i] = b64.charCodeAt(i);
             } else {
-                b = b85d(cleanText(t.slice(2))); // Legacy B85 support
+                b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, '')); // Legacy B85 support
             }
             if (b.length < 13) return t; 
             return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12)))); 
@@ -159,7 +150,7 @@
     }
 
     // ── ECDH (Bridge State) ───────────────────────────────────────────────────
-    const _hsState = new Map(); // Immune to strict-mode security exceptions!
+    const _hsState = new Map(); // Store state in memory to avoid SecurityErrors
     let _hsLock = Promise.resolve();
     function hsLock(fn) { let u; const p = _hsLock; _hsLock = new Promise(r => u = r); return p.then(() => fn()).finally(() => u()); }
     
@@ -208,8 +199,14 @@
 
     function mHash(cid, h) {
         const k = "bb_phs_" + cid;
-        try { const a = JSON.parse(localStorage.getItem(k) || "[]"); if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; } if (!a.includes(h)) { a.push(h); while (a.length > CFG.MAX_HASHES) a.shift(); localStorage.setItem(k, JSON.stringify(a)); } }
-        catch (_) { localStorage.setItem(k, JSON.stringify([h])); }
+        try { 
+            const a = JSON.parse(localStorage.getItem(k) || "[]"); 
+            if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; } 
+            if (!a.includes(h)) { 
+                a.push(h); while (a.length > CFG.MAX_HASHES) a.shift(); 
+                localStorage.setItem(k, JSON.stringify(a)); 
+            } 
+        } catch (_) {} // Graceful fail if incognito
     }
     function isH(cid, h) { try { const a = JSON.parse(localStorage.getItem("bb_phs_" + cid) || "[]"); return Array.isArray(a) && a.includes(h); } catch (_) { return false; } }
     function cH(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
@@ -220,7 +217,7 @@
     const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
     const isMob = el => el?.tagName === "TEXTAREA";
     
-    // Crucial fix: Bale loads both desktop & mobile inputs to the DOM. Filter strictly by visibility.
+    // Bale renders both divs sometimes, verify which is visible
     const getReal = () => {
         const e1 = document.getElementById("editable-message-text");
         const e2 = document.getElementById("main-message-input");
@@ -240,39 +237,30 @@
                 _taSet?.call(real, text); 
                 real.dispatchEvent(new Event("input", { bubbles: true })); 
             } else { 
-                document.execCommand("selectAll", false, null); 
-                document.execCommand("insertText", false, text); 
+                real.innerHTML = text; 
                 real.dispatchEvent(new Event("input", { bubbles: true })); 
             }
         } catch (e) {
-            console.warn("[BB] Native insertion fallback", e);
-            if(!mob) {
-                real.innerText = text;
-                real.dispatchEvent(new Event("input", { bubbles: true }));
-            }
+            if(!mob) { real.innerText = text; real.dispatchEvent(new Event("input", { bubbles: true })); }
         }
         
         await new Promise(r => setTimeout(r, CFG.SEND_DLY));
         
         const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
+        
         if (btn) {
             const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
             try {
                 let node = btn[rk];
-                while(node && !node.onClick && !node.memoizedProps?.onClick) node = node.return;
+                while(node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
                 let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
                 if (typeof clickFn === 'function') {
                     clickFn({ preventDefault() {}, stopPropagation() {} });
                     sent = true;
                 }
             } catch (_) {}
-            if (!sent) { 
-                for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) {
-                    btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); 
-                }
-                sent = true; 
-            }
+            if (!sent) { btn.click(); sent = true; }
         }
         
         if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13 }));
@@ -283,11 +271,7 @@
             _taSet?.call(real, ""); 
             real.dispatchEvent(new Event("input", { bubbles: true })); 
         } else { 
-            real.focus(); 
-            try {
-                document.execCommand("selectAll", false, null); 
-                document.execCommand("delete", false, null); 
-            } catch (_) { real.innerText = ""; }
+            real.innerHTML = ""; 
             real.dispatchEvent(new Event("input", { bubbles: true })); 
         }
         
@@ -295,7 +279,7 @@
         isSyncing = ws;
     }
 
-    // ── Handshake (No SessionStorage!) ────────────────────────────────────────
+    // ── Handshake ─────────────────────────────────────────────────────────────
     async function startHs() {
         return hsLock(async () => {
             try {
@@ -308,10 +292,7 @@
                 
                 await sendRaw(CFG.PFX_H + b64); 
                 toast("⏳ Waiting for friend to accept…");
-            } catch (e) { 
-                console.error("[BB] StartHs Error:", e); 
-                toast("❌ Bridge failed to start"); 
-            }
+            } catch (e) { console.error("[BB] StartHs Error:", e); toast("❌ Bridge failed to start"); }
         });
     }
 
@@ -373,7 +354,7 @@
                     
                     const pk = await crypto.subtle.importKey("jwk", ps, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
                     const key = await hsDerive(pk, them); 
-                    _hsState.delete(cid); // Cleanup Memory
+                    _hsState.delete(cid); // Cleanup
                     
                     setS({ enabled: true, customKey: key }); syncVis(); mHash(cid, mh);
                     vizHs(el, "✅ Bridge Complete"); toast("🛡️ Code: " + fp(), 6000);
@@ -381,7 +362,7 @@
                         try { const f = fp(), ch = await encChunk(`✅ Bridge Established!\n🛡️ Both must see:\n# ${f}\nDifferent = intercepted.`); if (ch) for (const c of ch) await sendRaw(c); } catch (_) {}
                     }, 800);
                 } else { mHash(cid, mh); vizHs(el, "❌ Unknown"); }
-            } catch (e) { console.error("[BB] Handshake Handle Error:", e); vizHs(el, "❌ Failed"); }
+            } catch (e) { console.error("[BB] Handshake Error:", e); vizHs(el, "❌ Failed"); }
         });
     }
 
@@ -444,26 +425,35 @@
             
             let tc = el.textContent;
             if (!tc || tc.length <= 20) continue;
-            tc = cleanText(tc);
 
-            if (tc.startsWith("@@") || tc.startsWith("!!")) {
+            if (tc.includes("!!") || tc.includes("@@")) {
                 let hasMatchingChild = false;
                 for (const c of el.children) {
-                    const ctc = c.textContent ? cleanText(c.textContent) : "";
-                    if (ctc === tc) { hasMatchingChild = true; break; }
+                    if (c.textContent && (c.textContent.includes("!!") || c.textContent.includes("@@"))) { 
+                        hasMatchingChild = true; break; 
+                    }
                 }
                 if (hasMatchingChild) continue;
 
-                if (tc.startsWith("!!")) {
-                    const mh = tc.match(/^!!([A-Za-z0-9+/=]{40,})/);
-                    if (mh) {
+                // Handle Handshakes
+                const hsIdx = tc.indexOf("!!");
+                if (hsIdx !== -1) {
+                    // Extract ONLY base64 valid characters, stripping invisible Bale formats
+                    const cleanB64 = tc.slice(hsIdx + 2).replace(/[^A-Za-z0-9+/=]/g, '');
+                    if (cleanB64.length >= 40) {
                         el._isDecrypted = true;
-                        handleHs(mh[1], el).catch(console.error);
+                        handleHs(cleanB64, el).catch(console.error);
                     }
-                } else if (tc.startsWith("@@")) {
+                    continue;
+                }
+
+                // Handle Messages
+                const encIdx = tc.indexOf("@@");
+                if (encIdx !== -1) {
+                    const raw = tc.slice(encIdx);
                     _infly.add(el);
-                    dec(tc).then(plain => {
-                        if (plain !== tc) {
+                    dec(raw).then(plain => {
+                        if (plain !== raw) {
                             if (!el._bbO) { 
                                 Object.assign(el.style, { overflow: "hidden", overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%" }); 
                                 el.classList.add("bb-msg-container"); el._bbO = true; 
@@ -691,23 +681,16 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
 
         const syncH = has => {
             if (has === lastHasText) return; lastHasText = has; isSyncing = true;
-            if (mob) { _taSet?.call(ri, has ? " " : ""); ri.dispatchEvent(new Event("input", { bubbles: true })); }
-            else {
-                const sel = window.getSelection(); let mk = null;
-                if (sel.rangeCount > 0 && si.contains(sel.getRangeAt(0).commonAncestorContainer)) {
-                    mk = document.createElement("span"); mk.id = "bb-caret-mk"; sel.getRangeAt(0).insertNode(mk);
-                }
-                ri.focus(); 
-                try {
-                    document.execCommand("selectAll", false, null);
-                    if (has) document.execCommand("insertText", false, " "); else document.execCommand("delete", false, null);
-                } catch(_) {}
-                ri.dispatchEvent(new Event("input", { bubbles: true })); si.focus();
-                if (mk?.parentNode) { const r = document.createRange(); r.setStartBefore(mk); r.collapse(true); sel.removeAllRanges(); sel.addRange(r); mk.remove(); si.normalize(); }
-                else { const r = document.createRange(); r.selectNodeContents(si); r.collapse(false); sel.removeAllRanges(); sel.addRange(r); }
+            if (mob) { 
+                _taSet?.call(ri, has ? " " : ""); 
+                ri.dispatchEvent(new Event("input", { bubbles: true })); 
+            } else {
+                ri.innerHTML = has ? " " : ""; 
+                ri.dispatchEvent(new Event("input", { bubbles: true })); 
             }
             isSyncing = false;
         };
+        
         si.addEventListener("input", e => { if (!e.isComposing) syncH(getT().length > 0); });
         si.addEventListener("compositionend", () => syncH(getT().length > 0));
 
@@ -740,7 +723,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         se.addEventListener("input", () => { se.style.height = "auto"; se.style.height = Math.min(se.scrollHeight, 150) + "px"; });
         real.parentElement.insertBefore(se, real); lockI(real); se.focus();
         
-        const ex = real.value ? cleanText(real.value) : "";
+        const ex = real.value ? real.value.trim() : "";
         _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true }));
         if (ex.startsWith(CFG.PFX_E)) dec(ex).then(p => { if (p !== ex) se.value = p; }).catch(() => {}); else se.value = ex;
 
