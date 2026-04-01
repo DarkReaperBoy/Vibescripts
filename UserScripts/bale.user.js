@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS) - Optimized
+// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      15.0
+// @version      15.1
 // @description  Fast dark UI, ECDH Bridge, B64 Immunity, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -22,7 +22,6 @@
         HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_E2: "@@+", PFX_H: "!!",
     });
 
-    // Palette — muted slate-blue accent, no glow
     const P = Object.freeze({
         ac: "#7c8af6", acDim: "#636fcc", acSoft: "rgba(124,138,246,.10)",
         bg: "#0d1117", card: "#161b22", srf: "#1c2128",
@@ -50,6 +49,7 @@
         const r = p.get("uid") || p.get("groupId") || p.get("channelId") || location.pathname.split("/").pop() || "global";
         return _safeId.test(r) ? r : "global";
     };
+    
     let _scId = null, _sc = null;
     const getS = () => {
         const id = getChatId();
@@ -74,21 +74,35 @@
         if (_kc.size >= CFG.KCACHE) _kc.delete(_kc.keys().next().value);
         _kc.set(k, c); return c;
     }
+    
     function genKey() {
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = []; let f = 0;
         while (f < CFG.KEY_LEN) { const b = crypto.getRandomValues(new Uint8Array(64)); for (let i = 0; i < 64 && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl]; }
         return r.join("");
     }
 
+    // Safe Base64 Encoder (Avoids call-stack limits on Mobile)
+    function buf2b64(buf) {
+        let binary = '';
+        for (let i = 0; i < buf.byteLength; i++) binary += String.fromCharCode(buf[i]);
+        return btoa(binary);
+    }
+
     // Base85 Decoder (Legacy format fallback)
     const B85 = CFG.B85, B85D = new Uint8Array(128).fill(255);
     for (let i = 0; i < 85; i++) B85D[B85.charCodeAt(i)] = i;
-    function b85d(s) {
+    
+    function b85d(raw) {
+        let s = ""; // Strip invisible/malformed bytes first
+        for(let i = 0; i < raw.length; i++) {
+            const c = raw.charCodeAt(i);
+            if(c < 128 && B85D[c] !== 255) s += raw[i];
+        }
         const sl = s.length; if (!sl) return new Uint8Array(0);
         const fl = (sl / 5) | 0, rm = sl % 5, est = fl * 4 + (rm ? rm - 1 : 0), o = new Uint8Array(est); let w = 0;
         for (let i = 0; i < sl; i += 5) {
             const e = i + 5 < sl ? i + 5 : sl, pd = 5 - (e - i); let a = 0;
-            for (let j = 0; j < 5; j++) { const c = i + j < sl ? s.charCodeAt(i + j) : 126; if (c > 127 || B85D[c] === 255) continue; a = a * 85 + B85D[c]; }
+            for (let j = 0; j < 5; j++) { const c = i + j < sl ? s.charCodeAt(i + j) : 126; a = a * 85 + B85D[c]; }
             const b = 4 - pd;
             if (b >= 1) o[w++] = (a >>> 24) & 255; if (b >= 2) o[w++] = (a >>> 16) & 255;
             if (b >= 3) o[w++] = (a >>> 8) & 255; if (b >= 4) o[w++] = a & 255;
@@ -108,7 +122,6 @@
         catch (_) { return new TextDecoder().decode(b); }
     }
 
-    // Strip Invisible Bidi Marks and Zero-Widths added by Bale/Browser
     const cleanText = (str) => str.replace(/[\u200B-\u200D\uFEFF\u200E\u200F\s]/g, '').trim();
 
     async function enc(t) {
@@ -116,11 +129,7 @@
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(k), await cmp(t)));
         const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
-        
-        // Encode in Base64 (Immune to Bale Markdown Mangling)
-        let binary = '';
-        for (let i = 0; i < p.byteLength; i++) binary += String.fromCharCode(p[i]);
-        return CFG.PFX_E2 + btoa(binary);
+        return CFG.PFX_E2 + buf2b64(p); // B64 Immune to formatting
     }
 
     async function dec(t) {
@@ -133,7 +142,7 @@
                 b = new Uint8Array(b64.length);
                 for (let i = 0; i < b64.length; i++) b[i] = b64.charCodeAt(i);
             } else {
-                b = b85d(cleanText(t.slice(2))); // Fallback for old B85 messages
+                b = b85d(cleanText(t.slice(2))); // Legacy B85 support
             }
             if (b.length < 13) return t; 
             return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12)))); 
@@ -149,10 +158,12 @@
         return a && b ? [...a, ...b] : null;
     }
 
-    // ── ECDH ──────────────────────────────────────────────────────────────────
+    // ── ECDH (Bridge State) ───────────────────────────────────────────────────
+    const _hsState = new Map(); // Immune to strict-mode security exceptions!
     let _hsLock = Promise.resolve();
     function hsLock(fn) { let u; const p = _hsLock; _hsLock = new Promise(r => u = r); return p.then(() => fn()).finally(() => u()); }
-    const hsPair = () => crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    
+    const hsPair = () => crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey", "deriveBits"]);
     const hsPubRaw = async k => new Uint8Array(await crypto.subtle.exportKey("raw", k));
     const hsPubImp = b => crypto.subtle.importKey("raw", b, { name: "ECDH", namedCurve: "P-256" }, false, []);
 
@@ -207,43 +218,55 @@
 
     // ── Send Logic & React Intercept ──────────────────────────────────────────
     const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-    const getReal = () => document.getElementById("editable-message-text") || document.getElementById("main-message-input");
     const isMob = el => el?.tagName === "TEXTAREA";
+    
+    // Crucial fix: Bale loads both desktop & mobile inputs to the DOM. Filter strictly by visibility.
+    const getReal = () => {
+        const e1 = document.getElementById("editable-message-text");
+        const e2 = document.getElementById("main-message-input");
+        if (e1 && e1.getBoundingClientRect().height > 0) return e1;
+        if (e2 && e2.getBoundingClientRect().height > 0) return e2;
+        return e1 || e2;
+    };
 
     async function sendRaw(text) {
         const real = getReal(); if (!real) return;
         const mob = isMob(real), ws = isSyncing; isSyncing = true;
         unlockI(real);
         
-        real.focus();
-        if (mob) { 
-            _taSet?.call(real, text); 
-            real.dispatchEvent(new Event("input", { bubbles: true })); 
-        } else { 
-            document.execCommand("selectAll", false, null); 
-            document.execCommand("insertText", false, text); 
-            real.dispatchEvent(new Event("input", { bubbles: true })); 
+        try {
+            real.focus();
+            if (mob) { 
+                _taSet?.call(real, text); 
+                real.dispatchEvent(new Event("input", { bubbles: true })); 
+            } else { 
+                document.execCommand("selectAll", false, null); 
+                document.execCommand("insertText", false, text); 
+                real.dispatchEvent(new Event("input", { bubbles: true })); 
+            }
+        } catch (e) {
+            console.warn("[BB] Native insertion fallback", e);
+            if(!mob) {
+                real.innerText = text;
+                real.dispatchEvent(new Event("input", { bubbles: true }));
+            }
         }
         
         await new Promise(r => setTimeout(r, CFG.SEND_DLY));
         
         const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
-        
         if (btn) {
-            // Find react props in Fiber tree
             const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
             try {
                 let node = btn[rk];
-                while(node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                while(node && !node.onClick && !node.memoizedProps?.onClick) node = node.return;
                 let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
                 if (typeof clickFn === 'function') {
                     clickFn({ preventDefault() {}, stopPropagation() {} });
                     sent = true;
                 }
             } catch (_) {}
-            
-            // Fallback Native click mapping
             if (!sent) { 
                 for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) {
                     btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); 
@@ -261,8 +284,10 @@
             real.dispatchEvent(new Event("input", { bubbles: true })); 
         } else { 
             real.focus(); 
-            document.execCommand("selectAll", false, null); 
-            document.execCommand("delete", false, null); 
+            try {
+                document.execCommand("selectAll", false, null); 
+                document.execCommand("delete", false, null); 
+            } catch (_) { real.innerText = ""; }
             real.dispatchEvent(new Event("input", { bubbles: true })); 
         }
         
@@ -270,16 +295,23 @@
         isSyncing = ws;
     }
 
-    // ── Handshake ─────────────────────────────────────────────────────────────
+    // ── Handshake (No SessionStorage!) ────────────────────────────────────────
     async function startHs() {
         return hsLock(async () => {
             try {
                 const cid = getChatId(), pair = await hsPair(), pub = await hsPubRaw(pair.publicKey);
-                sessionStorage.setItem("bb_hs_" + cid, JSON.stringify(await crypto.subtle.exportKey("jwk", pair.privateKey)));
-                const pay = new Uint8Array(1 + 4 + pub.length); pay[0] = CFG.HS_REQ; pay.set(tsB(), 1); pay.set(pub, 5);
-                const b64 = btoa(String.fromCharCode(...pay)); mHash(cid, cH(b64));
-                await sendRaw(CFG.PFX_H + b64); toast("⏳ Waiting for friend to accept…");
-            } catch (e) { console.error("[BB]", e); toast("❌ Bridge failed"); }
+                _hsState.set(cid, await crypto.subtle.exportKey("jwk", pair.privateKey));
+                
+                const pay = new Uint8Array(1 + 4 + pub.length); 
+                pay[0] = CFG.HS_REQ; pay.set(tsB(), 1); pay.set(pub, 5);
+                const b64 = buf2b64(pay); mHash(cid, cH(b64));
+                
+                await sendRaw(CFG.PFX_H + b64); 
+                toast("⏳ Waiting for friend to accept…");
+            } catch (e) { 
+                console.error("[BB] StartHs Error:", e); 
+                toast("❌ Bridge failed to start"); 
+            }
         });
     }
 
@@ -306,13 +338,15 @@
                     const pair = await hsPair(), myPub = await hsPubRaw(pair.publicKey);
                     const key = await hsDerive(pair.privateKey, them);
                     setS({ enabled: true, customKey: key }); syncVis();
+                    
                     const rp = new Uint8Array(1 + 4 + myPub.length); rp[0] = CFG.HS_RES; rp.set(tsB(), 1); rp.set(myPub, 5);
-                    const rb = btoa(String.fromCharCode(...rp));
+                    const rb = buf2b64(rp);
                     mHash(cid, mh); mHash(cid, cH(rb));
+                    
                     await sendRaw(CFG.PFX_H + rb);
                     vizHs(el, "✅ Bridge Accepted"); toast("🛡️ Fingerprint: " + fp(), 6000);
                 });
-            } catch (err) { console.error("[BB]", err); b.disabled = false; b.textContent = "Retry"; b.style.opacity = "1"; }
+            } catch (err) { console.error("[BB] Accept Error:", err); b.disabled = false; b.textContent = "Retry"; b.style.opacity = "1"; }
         };
         box.appendChild(b); el.appendChild(box); el.style.display = "block";
     }
@@ -329,19 +363,25 @@
                 const type = raw[0], ts = rdTs(raw.subarray(1, 5)), them = raw.subarray(5);
                 const age = ((Date.now() / 1000) | 0) - ts;
                 if (age > CFG.HS_EXP || age < -60) { mHash(cid, mh); vizHs(el, "⌛ Expired"); return; }
-                if (type === CFG.HS_REQ) { if (!el._hsBound) { renderAccept(el, them, mh, cid); el._hsBound = true; } }
+                
+                if (type === CFG.HS_REQ) { 
+                    if (!el._hsBound) { renderAccept(el, them, mh, cid); el._hsBound = true; } 
+                }
                 else if (type === CFG.HS_RES) {
-                    const ps = sessionStorage.getItem("bb_hs_" + cid);
+                    const ps = _hsState.get(cid);
                     if (!ps) { mHash(cid, mh); vizHs(el, "❌ Orphaned"); return; }
-                    const pk = await crypto.subtle.importKey("jwk", JSON.parse(ps), { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-                    const key = await hsDerive(pk, them); sessionStorage.removeItem("bb_hs_" + cid);
+                    
+                    const pk = await crypto.subtle.importKey("jwk", ps, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+                    const key = await hsDerive(pk, them); 
+                    _hsState.delete(cid); // Cleanup Memory
+                    
                     setS({ enabled: true, customKey: key }); syncVis(); mHash(cid, mh);
                     vizHs(el, "✅ Bridge Complete"); toast("🛡️ Code: " + fp(), 6000);
                     setTimeout(async () => {
                         try { const f = fp(), ch = await encChunk(`✅ Bridge Established!\n🛡️ Both must see:\n# ${f}\nDifferent = intercepted.`); if (ch) for (const c of ch) await sendRaw(c); } catch (_) {}
                     }, 800);
                 } else { mHash(cid, mh); vizHs(el, "❌ Unknown"); }
-            } catch (e) { console.error("[BB]", e); vizHs(el, "❌ Failed"); }
+            } catch (e) { console.error("[BB] Handshake Handle Error:", e); vizHs(el, "❌ Failed"); }
         });
     }
 
@@ -391,7 +431,6 @@
         return out.join("");
     }
 
-    // ── Spoiler ───────────────────────────────────────────────────────────────
     document.addEventListener("click", e => { const s = e.target.closest(".bb-spoiler"); if (s) { s.style.color = "inherit"; s.style.background = P.bdr; } }, true);
 
     // ── Scan & Auto-Decrypt ───────────────────────────────────────────────────
@@ -399,17 +438,15 @@
     const _infly = new WeakSet();
 
     function scan(root) {
-        // Find potential blocks in DOM
         const els = root.querySelectorAll('span, div, p');
         for (const el of els) {
             if (el._isDecrypted || _infly.has(el) || SKIP.has(el.id)) continue;
             
             let tc = el.textContent;
             if (!tc || tc.length <= 20) continue;
-            tc = cleanText(tc); // Removes invisible RTL/LTR markers affecting decoding 
+            tc = cleanText(tc);
 
             if (tc.startsWith("@@") || tc.startsWith("!!")) {
-                // Ensure we process only the deepest element holding this exact string
                 let hasMatchingChild = false;
                 for (const c of el.children) {
                     const ctc = c.textContent ? cleanText(c.textContent) : "";
@@ -602,8 +639,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
     function ensureInput() {
         const ri = getReal(); if (!ri) return;
         const mob = isMob(ri), wrap = ri.parentElement; if (!wrap) return;
-        
-        // Find Native Attachment / Emoji Buttons reliably
         const emoji = document.querySelector('[aria-label="emoji-icon"]') || document.querySelector(".MmBErq");
         if (emoji && encOn()) emoji.style.display = "none"; else if (emoji) emoji.style.display = "";
 
@@ -662,8 +697,11 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 if (sel.rangeCount > 0 && si.contains(sel.getRangeAt(0).commonAncestorContainer)) {
                     mk = document.createElement("span"); mk.id = "bb-caret-mk"; sel.getRangeAt(0).insertNode(mk);
                 }
-                ri.focus(); document.execCommand("selectAll", false, null);
-                if (has) document.execCommand("insertText", false, " "); else document.execCommand("delete", false, null);
+                ri.focus(); 
+                try {
+                    document.execCommand("selectAll", false, null);
+                    if (has) document.execCommand("insertText", false, " "); else document.execCommand("delete", false, null);
+                } catch(_) {}
                 ri.dispatchEvent(new Event("input", { bubbles: true })); si.focus();
                 if (mk?.parentNode) { const r = document.createRange(); r.setStartBefore(mk); r.collapse(true); sel.removeAllRanges(); sel.addRange(r); mk.remove(); si.normalize(); }
                 else { const r = document.createRange(); r.selectNodeContents(si); r.collapse(false); sel.removeAllRanges(); sel.addRange(r); }
@@ -704,7 +742,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         
         const ex = real.value ? cleanText(real.value) : "";
         _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true }));
-        
         if (ex.startsWith(CFG.PFX_E)) dec(ex).then(p => { if (p !== ex) se.value = p; }).catch(() => {}); else se.value = ex;
 
         const encFwd = async btn => {
@@ -716,6 +753,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 se.value = ""; unlockI(real); _taSet?.call(real, out);
                 real.dispatchEvent(new Event("input", { bubbles: true })); real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, CFG.SEND_DLY));
+                
                 const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
                 let dispatched = false;
                 try {
@@ -724,12 +762,14 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                     let fn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
                     if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
                 } catch (_) {}
+                
                 if (!dispatched) {
                     for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
                 }
             } catch (e) { console.error("[BB]", e); se.value = prev; toast("Failed!"); }
             finally { se._busy = false; }
         };
+        
         const isConf = t => t.closest('[data-testid="confirm-button"]') || (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
         const eh = e => { if (!e.isTrusted) return; const b = isConf(e.target); if (!b || !se.value.trim()) return; if (se._busy) { e.preventDefault(); e.stopPropagation(); return; } e.preventDefault(); e.stopPropagation(); encFwd(b); };
         document.addEventListener("click", eh, true); document.addEventListener("mousedown", eh, true);
