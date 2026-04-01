@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      11.4
-// @description  Manual Key Accept, MITM Security Fingerprints, Strict XSS blocking, Material UI.
+// @version      11.5
+// @description  Manual Key Accept, MITM Security Fingerprints, Strict XSS blocking, Material UI, Send Fix.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -59,7 +59,6 @@
     function getSecurityFingerprint() {
         const k = getActiveKey();
         if (!k || k.length !== 32) return "NONE";
-        // Generates a short 5-character verification code for MITM comparison
         return k.substring(0, 5).toUpperCase();
     }
 
@@ -262,7 +261,8 @@
             real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
         }
 
-        await new Promise(r => setTimeout(r, 60));
+        // Give React time to process the input and enable the send button
+        await new Promise(r => setTimeout(r, 80));
 
         let sendBtn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
@@ -275,20 +275,34 @@
                     sent = true;
                 } catch(e) {}
             }
+            if (!sent) {
+                // Native fallback programmatic click
+                ["mousedown", "pointerdown", "mouseup", "pointerup", "click"].forEach(type => {
+                    sendBtn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                });
+                sent = true;
+            }
         }
-        if (!sent && sendBtn) sendBtn.click();
-        if (!sent && real) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13 }));
+        
+        if (!sent && real) {
+            real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+        }
 
-        await new Promise(r => setTimeout(r, 120));
+        // Give the app ample time to process the send network request before we cleanup
+        await new Promise(r => setTimeout(r, 200));
 
         if (mobile) {
-            _textareaSetter?.call(real, "");
-            real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+            if (real.value !== "") {
+                _textareaSetter?.call(real, "");
+                real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+            }
         } else {
-            real.focus();
-            document.execCommand("selectAll", false, null);
-            document.execCommand("delete", false, null);
-            real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+            if (real.innerText.trim() !== "") {
+                real.focus();
+                document.execCommand("selectAll", false, null);
+                document.execCommand("delete", false, null);
+                real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+            }
         }
 
         if(isEncryptionEnabled()) lockInput(real);
@@ -402,7 +416,6 @@
             }
 
             if (type === 0x01) {
-                // Renders the manual accept button
                 if (!el._hsBound) {
                     renderAcceptButton(el, theirPub, msgHash, chatId);
                     el._hsBound = true;
@@ -428,7 +441,6 @@
                 _visualizeHs(el, "✅ Bridge Completed");
                 _showToast("🛡️ Bridge secured! Verify Code: " + getSecurityFingerprint(), 7000);
 
-                // Send auto-success message to confirm MITM security
                 setTimeout(async () => {
                     const fp = getSecurityFingerprint();
                     const msg = `✅ **Secure Bridge Established!**\n\n🛡️ **MITM Check**: Both of you should see the exact identical code below:\n\n# ${fp}\n\nIf your friend sees a different code, someone is intercepting this chat.`;
@@ -446,7 +458,6 @@
     const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     const escapeHtml = (s) => s.replace(/[&<>"']/g, c => _ESC_MAP[c]);
 
-    // XSS mitigation for any URLs parsed. Forces http/https.
     function sanitizeUrl(url) {
         try {
             const p = new URL(url).protocol;
@@ -464,7 +475,6 @@
                 .replace(/\*([^*\n]+)\*/g, (_, t) => `<em>${t}</em>`)
                 .replace(/(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?=[^a-zA-Z0-9_]|$)/g, (_, p, t) => `${p}<em>${t}</em>`)
                 .replace(/~~(.+?)~~/g, (_, t) => `<del>${t}</del>`)
-                // Regex guarantees http:// or https:// prefix, paired with sanitizeUrl
                 .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, url) => `<a href="${sanitizeUrl(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`);
     }
 
@@ -542,7 +552,6 @@
             const text = el.textContent;
             if (text.length <= 20) continue;
             
-            // Handshake Signal Scanner
             const matchHs = text.trim().match(/^!!([A-Za-z0-9+/=]{40,})/);
             if (matchHs) {
                 let skip = false;
@@ -554,7 +563,6 @@
                 continue;
             }
 
-            // Encrypted Message Scanner
             const trimmed = text.trim();
             if (trimmed.startsWith("@@") && trimmed.length > 20) {
                 let skip = false;
@@ -1097,7 +1105,9 @@
                 if (btnProps && btn[btnProps] && btn[btnProps].onClick) {
                     btn[btnProps].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
                 } else {
-                    btn.click();
+                    ["mousedown", "pointerdown", "mouseup", "pointerup", "click"].forEach(type => {
+                        btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                    });
                 }
             } catch (e) {
                 secureEdit.value = prev; alert("Encryption failed!");
@@ -1106,6 +1116,8 @@
 
         const isConfirmBtn = (t) => t.closest('[data-testid="confirm-button"]') || (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
         const editClickHandler = (e) => {
+            if (!e.isTrusted) return; // Ignore programmatic clicks to avoid self-blocking
+
             const btn = isConfirmBtn(e.target);
             if (!btn || !secureEdit.value.trim()) return;
             if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
@@ -1139,9 +1151,14 @@
 
     // Prevent Real Clicks & Trigger Secure Send
     const blockAndSend = (e) => {
+        // ALLOW PROGRAMMATIC CLICKS (Our simulated clicks after encrypting the message)
+        if (!e.isTrusted) return;
+
+        // Block all real user clicks if the script is currently dispatching a message
         if (isSending) {
             e.preventDefault(); e.stopPropagation(); return;
         }
+
         if (!isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
 
         e.preventDefault(); e.stopPropagation();
