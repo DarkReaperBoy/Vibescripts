@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      11.5
-// @description  Manual Key Accept, MITM Security Fingerprints, Strict XSS blocking, Material UI, Send Fix.
+// @version      11.6
+// @description  Mobile Long-Press Fix, Manual Key Accept, MITM Security Fingerprints.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -261,7 +261,6 @@
             real.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
         }
 
-        // Give React time to process the input and enable the send button
         await new Promise(r => setTimeout(r, 80));
 
         let sendBtn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
@@ -276,7 +275,6 @@
                 } catch(e) {}
             }
             if (!sent) {
-                // Native fallback programmatic click
                 ["mousedown", "pointerdown", "mouseup", "pointerup", "click"].forEach(type => {
                     sendBtn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
                 });
@@ -288,7 +286,6 @@
             real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
         }
 
-        // Give the app ample time to process the send network request before we cleanup
         await new Promise(r => setTimeout(r, 200));
 
         if (mobile) {
@@ -1116,8 +1113,7 @@
 
         const isConfirmBtn = (t) => t.closest('[data-testid="confirm-button"]') || (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
         const editClickHandler = (e) => {
-            if (!e.isTrusted) return; // Ignore programmatic clicks to avoid self-blocking
-
+            if (!e.isTrusted) return; // Allow programmatic clicks
             const btn = isConfirmBtn(e.target);
             if (!btn || !secureEdit.value.trim()) return;
             if (secureEdit._isSending) { e.preventDefault(); e.stopPropagation(); return; }
@@ -1149,42 +1145,72 @@
     };
     const isSendBtn = (t) => !!(t.closest('[aria-label="send-button"]') || t.closest('.RaTWwR'));
 
-    // Prevent Real Clicks & Trigger Secure Send
-    const blockAndSend = (e) => {
-        // ALLOW PROGRAMMATIC CLICKS (Our simulated clicks after encrypting the message)
-        if (!e.isTrusted) return;
+    let touchTimer;
+    let isLongTouch = false;
 
-        // Block all real user clicks if the script is currently dispatching a message
-        if (isSending) {
-            e.preventDefault(); e.stopPropagation(); return;
-        }
-
+    // 1. Desktop Events (Mouse / Pointer)
+    ['mousedown', 'mouseup', 'click', 'pointerdown', 'pointerup'].forEach(evt => document.addEventListener(evt, (e) => {
+        if (!e.isTrusted) return; // Pass programmatic simulated clicks unconditionally
+        if (isSending && isSendBtn(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
         if (!isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
-
-        e.preventDefault(); e.stopPropagation();
-        if (e.type === 'mousedown' || e.type === 'touchstart') {
+        
+        e.preventDefault(); 
+        e.stopPropagation();
+        
+        // Only trigger send on a clean left-click for desktops
+        if (evt === 'click' && e.button === 0) {
             window._bbSend?.(true);
         }
-    };
+    }, true));
 
-    ['mousedown', 'click', 'pointerdown', 'touchstart'].forEach(evt => document.addEventListener(evt, blockAndSend, true));
+    // 2. Mobile Events (Touch)
+    document.addEventListener("touchstart", (e) => {
+        if (!e.isTrusted) return;
+        if (isSending && isSendBtn(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
+        if (!isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
+        
+        e.preventDefault(); 
+        e.stopPropagation();
+        
+        isLongTouch = false;
+        clearTimeout(touchTimer);
+        
+        // Wait 400ms to determine if it's a long-press (menu) or a tap (send)
+        touchTimer = setTimeout(() => {
+            isLongTouch = true;
+            if (e.touches && e.touches.length > 0) {
+                showMenu(e.touches[0].clientX, e.touches[0].clientY);
+            }
+        }, 400); 
+    }, { passive: false, capture: true });
 
-    // Right Click
+    document.addEventListener("touchend", (e) => {
+        if (!e.isTrusted) return;
+        if (isSending && isSendBtn(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
+        if (!isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
+        
+        e.preventDefault(); 
+        e.stopPropagation();
+        
+        clearTimeout(touchTimer);
+        // If the finger was lifted before 400ms, consider it a Tap -> Send.
+        if (!isLongTouch) {
+            window._bbSend?.(true);
+        }
+    }, { passive: false, capture: true });
+
+    // Cancel tap if the user drags/swipes off the button
+    document.addEventListener("touchmove", (e) => {
+        if (!e.isTrusted || !isSendBtn(e.target)) return;
+        clearTimeout(touchTimer);
+        isLongTouch = true; 
+    }, { passive: false, capture: true });
+
+    // Desktop Right Click Menu
     document.addEventListener("contextmenu", (e) => {
         if (isSending || !isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
         e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY);
     }, true);
-
-    // Mobile Hold
-    let touchTimer;
-    document.addEventListener("touchstart", (e) => {
-        if (isSending || !isSendBtn(e.target) || !isEncryptionEnabled() || !getSecureText()) return;
-        touchTimer = setTimeout(() => {
-            e.preventDefault(); showMenu(e.touches[0].clientX, e.touches[0].clientY);
-        }, 500);
-    }, { passive: false, capture: true });
-    document.addEventListener("touchend", () => clearTimeout(touchTimer), true);
-    document.addEventListener("touchmove", () => clearTimeout(touchTimer), true);
 
     // ─── 10. MutationObserver & SPA URL Tracker ───────────────────────────────
     let scanTO, lastUrl = location.href;
