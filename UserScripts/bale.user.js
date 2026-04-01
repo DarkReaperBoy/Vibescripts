@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bale Bridge Encryptor (Stable ECDH)
+// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      11.3
-// @description  Per-chat keys, Auto-Bridge, Material UI, Draft blocker. Fixed loops & history bugs.
+// @version      11.4
+// @description  Manual Key Accept, MITM Security Fingerprints, Strict XSS blocking, Material UI.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -55,6 +55,13 @@
         return s.customKey && s.customKey.length === 32 ? s.customKey : null;
     };
     const isEncryptionEnabled = () => getChatSettings().enabled;
+
+    function getSecurityFingerprint() {
+        const k = getActiveKey();
+        if (!k || k.length !== 32) return "NONE";
+        // Generates a short 5-character verification code for MITM comparison
+        return k.substring(0, 5).toUpperCase();
+    }
 
     // ─── 2. Crypto Engine (AES) ───────────────────────────────────────────────
     const keyCache = new Map();
@@ -182,7 +189,7 @@
         return [...a, ...b];
     }
 
-    // ─── 3. ECDH Stable Auto Bridge ───────────────────────────────────────────
+    // ─── 3. ECDH Manual & Secure Bridge ───────────────────────────────────────
     let _hsBusy = false;
 
     async function _hsNewPair() { return crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]); }
@@ -236,7 +243,6 @@
 
     function readTimestamp(buf) { return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]; }
 
-    // Safe Send override bypassing messy react loops
     async function _sendRaw(text) {
         const real = getRealInput();
         if (!real) return;
@@ -297,7 +303,6 @@
             const pair = await _hsNewPair();
             const pub = await _hsPubRaw(pair.publicKey);
             
-            // Session storage securely survives page reloads while waiting for answer
             const exportedPriv = await crypto.subtle.exportKey("jwk", pair.privateKey);
             sessionStorage.setItem("bb_pending_hs_" + chatId, JSON.stringify(exportedPriv));
 
@@ -311,45 +316,31 @@
 
             let msgHash = 0;
             for (let i=0; i<b64.length; i++) msgHash = Math.imul(31, msgHash) + b64.charCodeAt(i) | 0;
-            markHashProcessed(chatId, msgHash); // Don't trigger on our own sent message
+            markHashProcessed(chatId, msgHash);
 
             await _sendRaw(msg);
-            _showToast("⏳ Establishing secure bridge...");
+            _showToast("⏳ Requesting secure bridge. Waiting for friend to accept...");
         } catch (e) { console.error("[BB] Bridge setup failed"); }
         finally { _hsBusy = false; }
     }
 
-    async function _handleHS(b64, el) {
-        if (_hsBusy) return;
+    function renderAcceptButton(el, theirPub, msgHash, chatId) {
+        el.innerHTML = `
+            <div style="border:2px solid var(--color-primary-p-50,#00ab80); padding:10px; border-radius:12px; background:var(--color-neutrals-surface,#fff); display:inline-block; font-family:inherit; margin: 4px 0;">
+                <strong style="color:var(--color-primary-p-50,#00ab80); display:block; margin-bottom:4px; font-size:14px;">🛡️ Secure Bridge Request</strong>
+                <span style="font-size:12px; color:var(--color-neutrals-n-500,#555); display:block; margin-bottom:8px;">Your friend wants to enable End-to-End Encryption.</span>
+                <button class="bb-accept-hs-btn" style="background:var(--color-primary-p-50,#00ab80); color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px; transition:background 0.2s;">Accept & Connect</button>
+            </div>
+        `;
+        el.style.display = "block";
+        el._isDecrypted = true;
         
-        const chatId = getChatId();
-        let msgHash = 0;
-        for (let i=0; i<b64.length; i++) msgHash = Math.imul(31, msgHash) + b64.charCodeAt(i) | 0;
-
-        if (isHashProcessed(chatId, msgHash)) {
-            _visualizeHs(el, "🤝 Bridge Signal Processed");
-            return;
-        }
-
-        _hsBusy = true;
-        try {
-            const binary = atob(b64);
-            const raw = new Uint8Array(binary.length);
-            for(let i=0; i<binary.length; i++) raw[i] = binary.charCodeAt(i);
-
-            const type = raw[0];
-            const ts = readTimestamp(raw.subarray(1, 5));
-            const theirPub = raw.subarray(5);
-
-            // History Loop Bugfix: Ignore if > 5 minutes old
-            if (Math.floor(Date.now() / 1000) - ts > 300) {
-                markHashProcessed(chatId, msgHash);
-                _visualizeHs(el, "⌛ Expired Bridge Request");
-                _hsBusy = false;
-                return;
-            }
-
-            if (type === 0x01) { // They requested a bridge
+        const btn = el.querySelector('.bb-accept-hs-btn');
+        btn.onclick = async (e) => {
+            e.preventDefault();
+            btn.disabled = true;
+            btn.textContent = "Connecting...";
+            try {
                 const pair = await _hsNewPair();
                 const myPub = await _hsPubRaw(pair.publicKey);
                 const key = await _hsDeriveKeyStr(pair.privateKey, theirPub);
@@ -358,7 +349,7 @@
                 syncInputVisibility();
 
                 const rPay = new Uint8Array(1 + 4 + myPub.length);
-                rPay[0] = 0x02; // Accept
+                rPay[0] = 0x02; 
                 rPay.set(getTimestampBytes(), 1);
                 rPay.set(myPub, 5);
 
@@ -372,18 +363,51 @@
                 markHashProcessed(chatId, rMsgHash);
 
                 await _sendRaw(rMsg);
-                _visualizeHs(el, "🤝 Bridge Auto-Accepted");
-                _showToast("🛡️ Bridge secured! Key ID: " + key.substring(0, 6).toUpperCase(), 5000);
+                _visualizeHs(el, "✅ Bridge Accepted");
+                _showToast("🛡️ Bridge secured! Fingerprint: " + getSecurityFingerprint(), 7000);
+            } catch (err) {
+                btn.disabled = false;
+                btn.textContent = "Error! Try Again";
+            }
+        };
+    }
 
-                // Send success message to complete the loop visibly
-                setTimeout(async () => {
-                    const successEnc = await encryptChunked("✅ **Secure Bridge Auto-Established.** Communications are now encrypted.");
-                    if(successEnc) {
-                        for(const chunk of successEnc) await _sendRaw(chunk);
-                    }
-                }, 1000);
+    async function _handleHS(b64, el) {
+        if (_hsBusy) return;
+        const chatId = getChatId();
+        
+        let msgHash = 0;
+        for (let i=0; i<b64.length; i++) msgHash = Math.imul(31, msgHash) + b64.charCodeAt(i) | 0;
 
-            } else if (type === 0x02) { // They accepted our bridge
+        if (isHashProcessed(chatId, msgHash)) {
+            _visualizeHs(el, "🤝 Bridge Request Processed");
+            return;
+        }
+
+        _hsBusy = true;
+        try {
+            const binary = atob(b64);
+            const raw = new Uint8Array(binary.length);
+            for(let i=0; i<binary.length; i++) raw[i] = binary.charCodeAt(i);
+
+            const type = raw[0];
+            const ts = readTimestamp(raw.subarray(1, 5));
+            const theirPub = raw.subarray(5);
+
+            if (Math.floor(Date.now() / 1000) - ts > 300) {
+                markHashProcessed(chatId, msgHash);
+                _visualizeHs(el, "⌛ Expired Bridge Request");
+                _hsBusy = false;
+                return;
+            }
+
+            if (type === 0x01) {
+                // Renders the manual accept button
+                if (!el._hsBound) {
+                    renderAcceptButton(el, theirPub, msgHash, chatId);
+                    el._hsBound = true;
+                }
+            } else if (type === 0x02) {
                 const privJwkStr = sessionStorage.getItem("bb_pending_hs_" + chatId);
                 if (!privJwkStr) {
                     markHashProcessed(chatId, msgHash);
@@ -402,16 +426,34 @@
 
                 markHashProcessed(chatId, msgHash);
                 _visualizeHs(el, "✅ Bridge Completed");
-                _showToast("🛡️ Bridge secured! Key ID: " + key.substring(0, 6).toUpperCase(), 5000);
+                _showToast("🛡️ Bridge secured! Verify Code: " + getSecurityFingerprint(), 7000);
+
+                // Send auto-success message to confirm MITM security
+                setTimeout(async () => {
+                    const fp = getSecurityFingerprint();
+                    const msg = `✅ **Secure Bridge Established!**\n\n🛡️ **MITM Check**: Both of you should see the exact identical code below:\n\n# ${fp}\n\nIf your friend sees a different code, someone is intercepting this chat.`;
+                    const successEnc = await encryptChunked(msg);
+                    if(successEnc) {
+                        for(const chunk of successEnc) await _sendRaw(chunk);
+                    }
+                }, 1000);
             }
         } catch (e) { console.error("[BB] Core error", e); } 
         finally { _hsBusy = false; }
     }
 
-    // ─── 4. DOM Scanner & UI Rendering ────────────────────────────────────────
-    const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
-    const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
-    const escapeHtml = (s) => s.replace(/[&<>"]/g, c => _ESC_MAP[c]);
+    // ─── 4. DOM Scanner, XSS Protection & UI Rendering ────────────────────────
+    const _ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    const escapeHtml = (s) => s.replace(/[&<>"']/g, c => _ESC_MAP[c]);
+
+    // XSS mitigation for any URLs parsed. Forces http/https.
+    function sanitizeUrl(url) {
+        try {
+            const p = new URL(url).protocol;
+            if (p === 'http:' || p === 'https:') return escapeHtml(url);
+        } catch(e) {}
+        return '#';
+    }
 
     function applyInlineMarkdown(s) {
         return s.replace(/``([^`]+)``|`([^`]+)`/g, (_, a, b) => `<code style="background:var(--color-neutrals-n-20,#f4f5f7);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.92em">${a ?? b}</code>`)
@@ -422,17 +464,19 @@
                 .replace(/\*([^*\n]+)\*/g, (_, t) => `<em>${t}</em>`)
                 .replace(/(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?=[^a-zA-Z0-9_]|$)/g, (_, p, t) => `${p}<em>${t}</em>`)
                 .replace(/~~(.+?)~~/g, (_, t) => `<del>${t}</del>`)
-                .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, url) => `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`);
+                // Regex guarantees http:// or https:// prefix, paired with sanitizeUrl
+                .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, url) => `<a href="${sanitizeUrl(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline">${label}</a>`);
     }
 
+    const _URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
     function processLine(line) {
         const parts = [];
         let last = 0, m;
         _URL_RE.lastIndex = 0;
         while ((m = _URL_RE.exec(line)) !== null) {
             parts.push(applyInlineMarkdown(escapeHtml(line.slice(last, m.index))));
-            const safe = escapeHtml(m[0]);
-            parts.push(`<a href="${safe}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline;word-break:break-all">${safe}</a>`);
+            const safeUrl = sanitizeUrl(m[0]);
+            parts.push(`<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color:var(--color-primary-p-50,#00ab80);text-decoration:underline;word-break:break-all">${safeUrl}</a>`);
             last = m.index + m[0].length;
         }
         parts.push(applyInlineMarkdown(escapeHtml(line.slice(last))));
@@ -498,8 +542,8 @@
             const text = el.textContent;
             if (text.length <= 20) continue;
             
-            // Handshake Bridge Scanner (Strict extraction avoids DOM trailing spaces bug)
-            const matchHs = text.trim().match(/!!([A-Za-z0-9+/=]{40,})/);
+            // Handshake Signal Scanner
+            const matchHs = text.trim().match(/^!!([A-Za-z0-9+/=]{40,})/);
             if (matchHs) {
                 let skip = false;
                 for (const c of el.children) { if (c.textContent.includes("!!")) { skip = true; break; } }
@@ -510,7 +554,7 @@
                 continue;
             }
 
-            // Message Decryption Scanner
+            // Encrypted Message Scanner
             const trimmed = text.trim();
             if (trimmed.startsWith("@@") && trimmed.length > 20) {
                 let skip = false;
@@ -702,6 +746,8 @@
     function openSettingsModal() {
         document.getElementById("bb-modal-overlay")?.remove();
         const s = getChatSettings();
+        const safeKey = escapeHtml(s.customKey || "");
+        const fp = s.enabled && s.customKey && s.customKey.length === 32 ? escapeHtml(s.customKey.substring(0, 5).toUpperCase()) : 'N/A';
 
         document.body.insertAdjacentHTML("beforeend", `
             <div id="bb-modal-overlay">
@@ -721,7 +767,7 @@
                             <input type="password" id="bb-custom-key" class="bb-input"
                                 placeholder="Enter exactly 32 characters…"
                                 maxlength="32"
-                                value="${s.customKey || ""}">
+                                value="${safeKey}">
                             <button class="bb-icon-btn" id="bb-toggle-vis" title="Show / hide key">👁</button>
                             <button class="bb-icon-btn" id="bb-copy-key" title="Copy key">📋</button>
                         </div>
@@ -729,9 +775,11 @@
                             <button class="bb-tool-btn" id="bb-gen-key">⚡ Random Key</button>
                             <button class="bb-tool-btn" id="bb-start-hs" style="border-color:var(--color-primary-p-50,#00ab80);color:var(--color-primary-p-50,#00ab80);">🤝 Auto Bridge</button>
                         </div>
-                        <div class="bb-key-meta">
-                            <span class="bb-key-error" id="bb-key-error"></span>
-                            <span class="bb-key-counter" id="bb-key-counter">0 / 32</span>
+                        <div class="bb-key-meta" style="margin-top:10px;">
+                            <span class="bb-key-error" id="bb-key-error" style="color:#d32f2f;font-weight:500;"></span>
+                            <span style="font-size:11px;color:var(--color-neutrals-n-500,#555);">
+                                Fingerprint: <strong id="bb-modal-fp" style="font-family:monospace;color:var(--color-primary-p-50,#00ab80);">${fp}</strong>
+                            </span>
                         </div>
                     </div>
                     <div class="bb-actions">
@@ -744,8 +792,8 @@
         const overlay = document.getElementById("bb-modal-overlay");
         const keyInput = document.getElementById("bb-custom-key");
         const keySection = document.getElementById("bb-key-section");
-        const counter = document.getElementById("bb-key-counter");
         const errorEl = document.getElementById("bb-key-error");
+        const fpEl = document.getElementById("bb-modal-fp");
         const saveBtn = document.getElementById("bb-btn-save");
         const enableCb = document.getElementById("bb-enable-enc");
         const copyBtn = document.getElementById("bb-copy-key");
@@ -754,11 +802,12 @@
         const hsBtn = document.getElementById("bb-start-hs");
 
         const validate = () => {
-            const len = keyInput.value.length;
+            const val = keyInput.value;
+            const len = val.length;
             const enabled = enableCb.checked;
-            counter.textContent = `${len} / 32`;
-            counter.className = "bb-key-counter" + (len === 32 ? " exact" : "");
+            
             keySection.style.display = enabled ? "" : "none";
+            fpEl.textContent = len === 32 ? val.substring(0, 5).toUpperCase() : 'N/A';
 
             if (!enabled) {
                 errorEl.textContent = ""; saveBtn.disabled = false; return;
@@ -766,7 +815,7 @@
             if (len === 0) {
                 errorEl.textContent = "Key required."; saveBtn.disabled = true;
             } else if (len !== 32) {
-                errorEl.textContent = `Must be exactly 32 chars (${len}).`; saveBtn.disabled = true;
+                errorEl.textContent = `Must be 32 chars (${len}).`; saveBtn.disabled = true;
             } else {
                 errorEl.textContent = ""; saveBtn.disabled = false;
             }
