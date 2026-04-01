@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      15.2
+// @version      15.3
 // @description  Fast dark UI, ECDH Bridge, Invisible Char Immunity, Anti-XSS.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -14,12 +14,15 @@
     "use strict";
 
     const CFG = Object.freeze({
-        KEY_LEN: 32, MAX_ENC: 4000, HS_EXP: 300, TOAST_MS: 4500,
+        KEY_LEN: 32, MAX_ENC: 4000, HS_EXP: 600, TOAST_MS: 4500,
         LONG_PRESS: 400, SEND_DLY: 60, POST_DLY: 100, MAX_HASHES: 50,
         MAX_DEPTH: 10, KCACHE: 16,
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
         HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_E2: "@@+", PFX_H: "!!",
+        // Use URL-safe base64 alphabet to avoid Bale mangling + and /
+        B64_STD: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
+        B64_SAFE: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.",
     });
 
     const P = Object.freeze({
@@ -49,7 +52,7 @@
         const r = p.get("uid") || p.get("groupId") || p.get("channelId") || location.pathname.split("/").pop() || "global";
         return _safeId.test(r) ? r : "global";
     };
-    
+
     let _scId = null, _sc = null;
     const getS = () => {
         const id = getChatId();
@@ -65,6 +68,43 @@
     const encOn = () => getS().enabled;
     const fp = () => { const k = activeKey(); return k ? k.substring(0, 5).toUpperCase() : "NONE"; };
 
+    // ── URL-safe Base64 encode/decode ─────────────────────────────────────────
+    // Bale's rich text rendering can mangle standard base64 characters (+ / =)
+    // by inserting invisible Unicode or converting them. URL-safe base64 avoids this.
+
+    function toUrlSafeB64(buf) {
+        let binary = '';
+        const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary)
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=/g, '.');
+    }
+
+    function fromUrlSafeB64(s) {
+        // Strip ANY non-URL-safe-base64 characters (invisible chars, zero-width, etc.)
+        const cleaned = s.replace(/[^A-Za-z0-9\-_.]/g, '');
+        // Convert back to standard base64 for atob
+        const std = cleaned
+            .replace(/-/g, '+')
+            .replace(/_/g, '/')
+            .replace(/\./g, '=');
+        const bin = atob(std);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+    }
+
+    // Legacy standard base64 decode (for backward compat with old messages)
+    function fromStdB64(s) {
+        const cleaned = s.replace(/[^A-Za-z0-9+/=]/g, '');
+        const bin = atob(cleaned);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+    }
+
     // ── Crypto & Encodings ────────────────────────────────────────────────────
     const _kc = new Map();
     async function getKey(k) {
@@ -74,22 +114,16 @@
         if (_kc.size >= CFG.KCACHE) _kc.delete(_kc.keys().next().value);
         _kc.set(k, c); return c;
     }
-    
+
     function genKey() {
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = []; let f = 0;
         while (f < CFG.KEY_LEN) { const b = crypto.getRandomValues(new Uint8Array(64)); for (let i = 0; i < 64 && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl]; }
         return r.join("");
     }
 
-    function buf2b64(buf) {
-        let binary = '';
-        for (let i = 0; i < buf.byteLength; i++) binary += String.fromCharCode(buf[i]);
-        return btoa(binary);
-    }
-
     const B85 = CFG.B85, B85D = new Uint8Array(128).fill(255);
     for (let i = 0; i < 85; i++) B85D[B85.charCodeAt(i)] = i;
-    
+
     function b85d(s) {
         const sl = s.length; if (!sl) return new Uint8Array(0);
         const fl = (sl / 5) | 0, rm = sl % 5, est = fl * 4 + (rm ? rm - 1 : 0), o = new Uint8Array(est); let w = 0;
@@ -120,26 +154,30 @@
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(k), await cmp(t)));
         const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
-        return CFG.PFX_E2 + buf2b64(p); // B64 Immune to formatting
+        return CFG.PFX_E2 + toUrlSafeB64(p);
     }
 
     async function dec(t) {
         if (!t.startsWith(CFG.PFX_E)) return t;
         const k = activeKey(); if (!k) return t;
-        try { 
+        try {
             let b;
             if (t.startsWith(CFG.PFX_E2)) {
-                const b64 = atob(t.slice(3).replace(/[^A-Za-z0-9+/=]/g, '')); // Strip injected invisibles
-                b = new Uint8Array(b64.length);
-                for (let i = 0; i < b64.length; i++) b[i] = b64.charCodeAt(i);
+                const payload = t.slice(3);
+                // Try URL-safe first (new format), fall back to standard (old format)
+                try {
+                    b = fromUrlSafeB64(payload);
+                } catch (_) {
+                    b = fromStdB64(payload);
+                }
             } else {
                 b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, '')); // Legacy B85 support
             }
-            if (b.length < 13) return t; 
-            return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12)))); 
+            if (b.length < 13) return t;
+            return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12))));
         } catch (_) { return t; }
     }
-    
+
     async function encChunk(t, d = 0) {
         if (d > CFG.MAX_DEPTH) return null;
         const r = await enc(t); if (!r) return null;
@@ -150,10 +188,10 @@
     }
 
     // ── ECDH (Bridge State) ───────────────────────────────────────────────────
-    const _hsState = new Map(); // Store state in memory to avoid SecurityErrors
+    const _hsState = new Map();
     let _hsLock = Promise.resolve();
     function hsLock(fn) { let u; const p = _hsLock; _hsLock = new Promise(r => u = r); return p.then(() => fn()).finally(() => u()); }
-    
+
     const hsPair = () => crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey", "deriveBits"]);
     const hsPubRaw = async k => new Uint8Array(await crypto.subtle.exportKey("raw", k));
     const hsPubImp = b => crypto.subtle.importKey("raw", b, { name: "ECDH", namedCurve: "P-256" }, false, []);
@@ -199,25 +237,28 @@
 
     function mHash(cid, h) {
         const k = "bb_phs_" + cid;
-        try { 
-            const a = JSON.parse(localStorage.getItem(k) || "[]"); 
-            if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; } 
-            if (!a.includes(h)) { 
-                a.push(h); while (a.length > CFG.MAX_HASHES) a.shift(); 
-                localStorage.setItem(k, JSON.stringify(a)); 
-            } 
-        } catch (_) {} // Graceful fail if incognito
+        try {
+            const a = JSON.parse(localStorage.getItem(k) || "[]");
+            if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; }
+            if (!a.includes(h)) {
+                a.push(h); while (a.length > CFG.MAX_HASHES) a.shift();
+                localStorage.setItem(k, JSON.stringify(a));
+            }
+        } catch (_) {}
     }
     function isH(cid, h) { try { const a = JSON.parse(localStorage.getItem("bb_phs_" + cid) || "[]"); return Array.isArray(a) && a.includes(h); } catch (_) { return false; } }
     function cH(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
-    function tsB() { const t = (Date.now() / 1000) | 0; return new Uint8Array([(t >>> 24) & 255, (t >>> 16) & 255, (t >>> 8) & 255, t & 255]); }
+
+    function tsB() {
+        const t = (Date.now() / 1000) | 0;
+        return new Uint8Array([(t >>> 24) & 255, (t >>> 16) & 255, (t >>> 8) & 255, t & 255]);
+    }
     function rdTs(b) { return ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0; }
 
     // ── Send Logic & React Intercept ──────────────────────────────────────────
     const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
     const isMob = el => el?.tagName === "TEXTAREA";
-    
-    // Bale renders both divs sometimes, verify which is visible
+
     const getReal = () => {
         const e1 = document.getElementById("editable-message-text");
         const e2 = document.getElementById("main-message-input");
@@ -230,25 +271,25 @@
         const real = getReal(); if (!real) return;
         const mob = isMob(real), ws = isSyncing; isSyncing = true;
         unlockI(real);
-        
+
         try {
             real.focus();
-            if (mob) { 
-                _taSet?.call(real, text); 
-                real.dispatchEvent(new Event("input", { bubbles: true })); 
-            } else { 
-                real.innerHTML = text; 
-                real.dispatchEvent(new Event("input", { bubbles: true })); 
+            if (mob) {
+                _taSet?.call(real, text);
+                real.dispatchEvent(new Event("input", { bubbles: true }));
+            } else {
+                real.innerHTML = text;
+                real.dispatchEvent(new Event("input", { bubbles: true }));
             }
         } catch (e) {
             if(!mob) { real.innerText = text; real.dispatchEvent(new Event("input", { bubbles: true })); }
         }
-        
+
         await new Promise(r => setTimeout(r, CFG.SEND_DLY));
-        
+
         const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
-        
+
         if (btn) {
             const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
             try {
@@ -262,20 +303,20 @@
             } catch (_) {}
             if (!sent) { btn.click(); sent = true; }
         }
-        
+
         if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13 }));
-        
+
         await new Promise(r => setTimeout(r, CFG.POST_DLY));
-        
-        if (mob) { 
-            _taSet?.call(real, ""); 
-            real.dispatchEvent(new Event("input", { bubbles: true })); 
-        } else { 
-            real.innerHTML = ""; 
-            real.dispatchEvent(new Event("input", { bubbles: true })); 
+
+        if (mob) {
+            _taSet?.call(real, "");
+            real.dispatchEvent(new Event("input", { bubbles: true }));
+        } else {
+            real.innerHTML = "";
+            real.dispatchEvent(new Event("input", { bubbles: true }));
         }
-        
-        if (encOn()) lockI(real); 
+
+        if (encOn()) lockI(real);
         isSyncing = ws;
     }
 
@@ -284,13 +325,16 @@
         return hsLock(async () => {
             try {
                 const cid = getChatId(), pair = await hsPair(), pub = await hsPubRaw(pair.publicKey);
-                _hsState.set(cid, await crypto.subtle.exportKey("jwk", pair.privateKey));
-                
-                const pay = new Uint8Array(1 + 4 + pub.length); 
+                // Store the full key pair's private key as JWK
+                const privJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+                _hsState.set(cid, privJwk);
+
+                const pay = new Uint8Array(1 + 4 + pub.length);
                 pay[0] = CFG.HS_REQ; pay.set(tsB(), 1); pay.set(pub, 5);
-                const b64 = buf2b64(pay); mHash(cid, cH(b64));
-                
-                await sendRaw(CFG.PFX_H + b64); 
+                const encoded = toUrlSafeB64(pay);
+                mHash(cid, cH(encoded));
+
+                await sendRaw(CFG.PFX_H + encoded);
                 toast("⏳ Waiting for friend to accept…");
             } catch (e) { console.error("[BB] StartHs Error:", e); toast("❌ Bridge failed to start"); }
         });
@@ -305,7 +349,7 @@
         });
         box.innerHTML = `<strong style="color:${P.ac};display:block;margin-bottom:6px;font-size:14px">🛡️ Secure Bridge Request</strong>
                          <span style="font-size:12px;color:${P.txD};display:block;margin-bottom:10px;line-height:1.4">Your friend wants End-to-End Encryption.</span>`;
-        
+
         const b = document.createElement("button"); b.textContent = "Accept & Connect";
         Object.assign(b.style, {
             background: P.ac, color: P.bg, border: "none", padding: "8px 16px", borderRadius: "8px",
@@ -319,11 +363,11 @@
                     const pair = await hsPair(), myPub = await hsPubRaw(pair.publicKey);
                     const key = await hsDerive(pair.privateKey, them);
                     setS({ enabled: true, customKey: key }); syncVis();
-                    
+
                     const rp = new Uint8Array(1 + 4 + myPub.length); rp[0] = CFG.HS_RES; rp.set(tsB(), 1); rp.set(myPub, 5);
-                    const rb = buf2b64(rp);
+                    const rb = toUrlSafeB64(rp);
                     mHash(cid, mh); mHash(cid, cH(rb));
-                    
+
                     await sendRaw(CFG.PFX_H + rb);
                     vizHs(el, "✅ Bridge Accepted"); toast("🛡️ Fingerprint: " + fp(), 6000);
                 });
@@ -332,30 +376,48 @@
         box.appendChild(b); el.appendChild(box); el.style.display = "block";
     }
 
-    async function handleHs(b64, el) {
-        const cid = getChatId(), mh = cH(b64);
+    async function handleHs(b64raw, el) {
+        const cid = getChatId(), mh = cH(b64raw);
         if (isH(cid, mh)) { vizHs(el, "🤝 Processed"); return; }
         return hsLock(async () => {
             if (isH(cid, mh)) { vizHs(el, "🤝 Processed"); return; }
             try {
-                const bin = atob(b64), raw = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+                // Try URL-safe decode first, fall back to standard base64
+                let raw;
+                try {
+                    raw = fromUrlSafeB64(b64raw);
+                } catch (_) {
+                    raw = fromStdB64(b64raw);
+                }
+
                 if (raw.length < 70) { mHash(cid, mh); vizHs(el, "❌ Malformed"); return; }
                 const type = raw[0], ts = rdTs(raw.subarray(1, 5)), them = raw.subarray(5);
-                const age = ((Date.now() / 1000) | 0) - ts;
-                if (age > CFG.HS_EXP || age < -60) { mHash(cid, mh); vizHs(el, "⌛ Expired"); return; }
-                
-                if (type === CFG.HS_REQ) { 
-                    if (!el._hsBound) { renderAccept(el, them, mh, cid); el._hsBound = true; } 
+                const now = (Date.now() / 1000) | 0;
+                const age = now - ts;
+
+                // Debug: log timestamp info for troubleshooting
+                console.debug("[BB] Handshake ts:", ts, "now:", now, "age:", age, "type:", type);
+
+                // Generous time window: allow ±10 minutes + clock skew
+                if (Math.abs(age) > CFG.HS_EXP) {
+                    mHash(cid, mh);
+                    vizHs(el, "⌛ Expired (" + age + "s)");
+                    return;
+                }
+
+                if (type === CFG.HS_REQ) {
+                    if (!el._hsBound) { renderAccept(el, them, mh, cid); el._hsBound = true; }
                 }
                 else if (type === CFG.HS_RES) {
                     const ps = _hsState.get(cid);
                     if (!ps) { mHash(cid, mh); vizHs(el, "❌ Orphaned"); return; }
-                    
-                    const pk = await crypto.subtle.importKey("jwk", ps, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-                    const key = await hsDerive(pk, them); 
-                    _hsState.delete(cid); // Cleanup
-                    
+
+                    // Re-import with correct usages for ECDH deriveBits
+                    const pk = await crypto.subtle.importKey("jwk", ps,
+                        { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+                    const key = await hsDerive(pk, them);
+                    _hsState.delete(cid);
+
                     setS({ enabled: true, customKey: key }); syncVis(); mHash(cid, mh);
                     vizHs(el, "✅ Bridge Complete"); toast("🛡️ Code: " + fp(), 6000);
                     setTimeout(async () => {
@@ -418,53 +480,65 @@
     const SKIP = new Set(["secure-input-overlay", "secure-edit-overlay", "editable-message-text", "main-message-input", "bb-no-key-notice", "bale-bridge-menu", "bb-modal-overlay"]);
     const _infly = new WeakSet();
 
+    function stripInvisibles(s) {
+        // Remove zero-width and invisible Unicode characters that Bale injects
+        return s.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFFF9-\uFFFB]/g, '');
+    }
+
     function scan(root) {
         const els = root.querySelectorAll('span, div, p');
         for (const el of els) {
             if (el._isDecrypted || _infly.has(el) || SKIP.has(el.id)) continue;
-            
+
             let tc = el.textContent;
             if (!tc || tc.length <= 20) continue;
 
-            if (tc.includes("!!") || tc.includes("@@")) {
+            // Pre-strip invisible characters for detection
+            const cleanTc = stripInvisibles(tc);
+
+            if (cleanTc.includes("!!") || cleanTc.includes("@@")) {
                 let hasMatchingChild = false;
                 for (const c of el.children) {
-                    if (c.textContent && (c.textContent.includes("!!") || c.textContent.includes("@@"))) { 
-                        hasMatchingChild = true; break; 
+                    const childClean = stripInvisibles(c.textContent || '');
+                    if (childClean.includes("!!") || childClean.includes("@@")) {
+                        hasMatchingChild = true; break;
                     }
                 }
                 if (hasMatchingChild) continue;
 
                 // Handle Handshakes
-                const hsIdx = tc.indexOf("!!");
+                const hsIdx = cleanTc.indexOf("!!");
                 if (hsIdx !== -1) {
-                    // Extract ONLY base64 valid characters, stripping invisible Bale formats
-                    const cleanB64 = tc.slice(hsIdx + 2).replace(/[^A-Za-z0-9+/=]/g, '');
-                    if (cleanB64.length >= 40) {
+                    // Extract payload, strip ALL non-URL-safe-base64 AND non-standard-base64 chars
+                    const afterPrefix = cleanTc.slice(hsIdx + 2);
+                    // Allow both URL-safe (-_.) and standard (+/=) base64 chars
+                    const cleanPayload = afterPrefix.replace(/[^A-Za-z0-9+/=\-_.]/g, '');
+                    if (cleanPayload.length >= 40) {
                         el._isDecrypted = true;
-                        handleHs(cleanB64, el).catch(console.error);
+                        handleHs(cleanPayload, el).catch(console.error);
                     }
                     continue;
                 }
 
                 // Handle Messages
-                const encIdx = tc.indexOf("@@");
+                const encIdx = cleanTc.indexOf("@@");
                 if (encIdx !== -1) {
-                    const raw = tc.slice(encIdx);
+                    // Use cleaned text for decryption to avoid invisible char corruption
+                    const raw = cleanTc.slice(encIdx);
                     _infly.add(el);
                     dec(raw).then(plain => {
                         if (plain !== raw) {
-                            if (!el._bbO) { 
-                                Object.assign(el.style, { overflow: "hidden", overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%" }); 
-                                el.classList.add("bb-msg-container"); el._bbO = true; 
+                            if (!el._bbO) {
+                                Object.assign(el.style, { overflow: "hidden", overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%" });
+                                el.classList.add("bb-msg-container"); el._bbO = true;
                             }
                             el.innerHTML = renderDec(plain) + `<span class="bb-enc-badge">🔒 encrypted <span class="bb-copy-btn" title="Copy">📋</span></span>`;
                             el.style.color = "inherit"; el._isDecrypted = true;
-                            
+
                             const cb = el.querySelector(".bb-copy-btn");
-                            if (cb) cb.onclick = ev => { 
-                                ev.preventDefault(); ev.stopPropagation(); 
-                                navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1200); }).catch(() => {}); 
+                            if (cb) cb.onclick = ev => {
+                                ev.preventDefault(); ev.stopPropagation();
+                                navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1200); }).catch(() => {});
                             };
                         }
                     }).catch(()=>{}).finally(() => _infly.delete(el));
@@ -681,16 +755,16 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
 
         const syncH = has => {
             if (has === lastHasText) return; lastHasText = has; isSyncing = true;
-            if (mob) { 
-                _taSet?.call(ri, has ? " " : ""); 
-                ri.dispatchEvent(new Event("input", { bubbles: true })); 
+            if (mob) {
+                _taSet?.call(ri, has ? " " : "");
+                ri.dispatchEvent(new Event("input", { bubbles: true }));
             } else {
-                ri.innerHTML = has ? " " : ""; 
-                ri.dispatchEvent(new Event("input", { bubbles: true })); 
+                ri.innerHTML = has ? " " : "";
+                ri.dispatchEvent(new Event("input", { bubbles: true }));
             }
             isSyncing = false;
         };
-        
+
         si.addEventListener("input", e => { if (!e.isComposing) syncH(getT().length > 0); });
         si.addEventListener("compositionend", () => syncH(getT().length > 0));
 
@@ -722,7 +796,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         se.placeholder = "🔒 " + (real.placeholder || "ویرایش امن..."); se.dir = real.dir || "auto"; se.style.cssText = real.style.cssText;
         se.addEventListener("input", () => { se.style.height = "auto"; se.style.height = Math.min(se.scrollHeight, 150) + "px"; });
         real.parentElement.insertBefore(se, real); lockI(real); se.focus();
-        
+
         const ex = real.value ? real.value.trim() : "";
         _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true }));
         if (ex.startsWith(CFG.PFX_E)) dec(ex).then(p => { if (p !== ex) se.value = p; }).catch(() => {}); else se.value = ex;
@@ -736,7 +810,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 se.value = ""; unlockI(real); _taSet?.call(real, out);
                 real.dispatchEvent(new Event("input", { bubbles: true })); real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, CFG.SEND_DLY));
-                
+
                 const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
                 let dispatched = false;
                 try {
@@ -745,14 +819,14 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                     let fn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
                     if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
                 } catch (_) {}
-                
+
                 if (!dispatched) {
                     for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
                 }
             } catch (e) { console.error("[BB]", e); se.value = prev; toast("Failed!"); }
             finally { se._busy = false; }
         };
-        
+
         const isConf = t => t.closest('[data-testid="confirm-button"]') || (t.closest('button[aria-label="Send"]') && !t.closest('#chat_footer'));
         const eh = e => { if (!e.isTrusted) return; const b = isConf(e.target); if (!b || !se.value.trim()) return; if (se._busy) { e.preventDefault(); e.stopPropagation(); return; } e.preventDefault(); e.stopPropagation(); encFwd(b); };
         document.addEventListener("click", eh, true); document.addEventListener("mousedown", eh, true);
