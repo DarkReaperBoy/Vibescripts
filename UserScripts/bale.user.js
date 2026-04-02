@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.2
-// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Buffer clone fix).
+// @version      16.3
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Firefox Xray Wrapper Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -20,7 +20,6 @@
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
         PFX_E: "@@", PFX_E2: "@@+",
-        // HS_EXP expanded to 24 hours, meaning timezone issues are completely bypassed.
         PFX_H: "!!", HS_EXP: 86400, HS_CLEANUP_INTERVAL: 86400000
     });
 
@@ -185,6 +184,15 @@
     const S = crypto.subtle;
     async function digest(data) { return new Uint8Array(await S.digest("SHA-256", data)); }
     function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
+    
+    // Hex to Binary array mapping (prevents memory cloning issues in IDB)
+    function fromHex(h) {
+        if (!h) return new Uint8Array(0);
+        const a = new Uint8Array(h.length / 2);
+        for (let i = 0; i < h.length; i += 2) a[i / 2] = parseInt(h.substring(i, i + 2), 16);
+        return a;
+    }
+
     function concatBytes(...arrays) {
         let t = arrays.reduce((a, b) => a + b.length, 0), r = new Uint8Array(t), o = 0;
         for (let a of arrays) { r.set(a, o); o += a.length; }
@@ -204,16 +212,7 @@
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
         const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
         const infoStr = new TextEncoder().encode("aes-session-key");
-        
-        // Ensure absolutely everything is a fresh Uint8Array to prevent buffer views issues
-        const info = concatBytes(
-            infoStr,
-            new Uint8Array(nonce),
-            new Uint8Array(initIdPub),
-            new Uint8Array(respIdPub),
-            new Uint8Array(initEphPub),
-            new Uint8Array(respEphPub)
-        );
+        const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
         
         const material = new Uint8Array(await S.deriveBits({
             name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
@@ -246,6 +245,7 @@
             req.onerror = e => { _useMem = true; rej(req.error); };
         });
     }
+
     async function dbOp(s, o, v) {
         try {
             const d = await getDB();
@@ -254,7 +254,15 @@
                 const tx = d.transaction(s, o === "get" || o === "getAll" ? "readonly" : "readwrite");
                 const st = tx.objectStore(s);
                 let rq;
-                if (o === "get") rq = st.get(v); else if (o === "put") rq = st.put(v); else if (o === "del") rq = st.delete(v); else if (o === "getAll") rq = st.getAll();
+                if (o === "get") { rq = st.get(v); }
+                else if (o === "put") {
+                    // Critical Firefox Bypass: Strips Xray wrappers via strictly parsed JSON serialization
+                    const safeObject = JSON.parse(JSON.stringify(v));
+                    rq = st.put(safeObject);
+                } 
+                else if (o === "del") { rq = st.delete(v); } 
+                else if (o === "getAll") { rq = st.getAll(); }
+
                 rq.onsuccess = () => res(rq.result);
                 rq.onerror = () => rej(rq.error);
             });
@@ -338,12 +346,21 @@
         const payload = concatBytes(new Uint8Array([1, 1]), nonce, tsBuf, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        // Explicitly ensuring cloned arrays to prevent IDB DataCloneError
+        
+        // Storing ONLY hex strings and POJO objects to avoid Firefox DataClone wrapper locks
         await dbOp("handshakes", "put", { 
-            nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", 
-            ephPrivJwk, ephPubRaw: Array.from(ephPubRaw), initIdPub: Array.from(id.pubRaw), 
-            theirIdentityKey: null, createdAt: Date.now(), payloadHash: Array.from(await digest(payload)) 
+            nonce: toHex(nonce), 
+            chatId: getChatId(), 
+            role: "initiator", 
+            stage: "invited", 
+            ephPrivJwk: ephPrivJwk, 
+            ephPubRawHex: toHex(ephPubRaw), 
+            initIdPubHex: toHex(id.pubRaw), 
+            theirIdentityKeyHex: null, 
+            createdAt: Date.now(), 
+            payloadHashHex: toHex(await digest(payload)) 
         });
+
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
         toast("Bridge invite sent!");
         syncVis();
@@ -354,41 +371,56 @@
         const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
         const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
+        
         const { sessionKey, hmacKeyBytes } = await deriveSymmetric(ephPrivJwk, data.theirEphPubRaw, data.nonce, data.theirIdPubRaw, id.pubRaw, data.theirEphPubRaw, ephPubRaw);
+        
         const ts = Math.floor(Date.now() / 1000);
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 2]), data.nonce, tsBuf, data.payloadHash, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        // Deep clone binaries with Array.from for safety with strict IndexedDB engines
+        
         await dbOp("handshakes", "put", { 
-            nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", 
-            derivedKey: sessionKey, hmacKeyBytes: Array.from(hmacKeyBytes), 
-            theirIdentityKey: Array.from(data.theirIdPubRaw), createdAt: Date.now() 
+            nonce: toHex(data.nonce), 
+            chatId: getChatId(), 
+            role: "responder", 
+            stage: "accepted", 
+            derivedKey: sessionKey, 
+            hmacKeyHex: toHex(hmacKeyBytes), 
+            theirIdentityKeyHex: toHex(data.theirIdPubRaw), 
+            createdAt: Date.now() 
         });
+
         renderHS(el, "🔄 Bridge accepted — waiting for confirmation", "wrn");
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
     }
 
     async function processAccept(data, hs, el) {
         const id = await getMyId();
-        const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-        // Extract safely from IDB
-        const hsInitIdPub = new Uint8Array(hs.initIdPub);
-        const hsEphPubRaw = new Uint8Array(hs.ephPubRaw);
+        const hsNonceBuf = fromHex(hs.nonce);
+        const hsInitIdPub = fromHex(hs.initIdPubHex);
+        const hsEphPubRaw = fromHex(hs.ephPubRawHex);
+        
         const { sessionKey, hmacKeyBytes } = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
-        const hmacKey = await S.importKey("raw", new Uint8Array(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        
+        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
         const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
+        
         const ts = Math.floor(Date.now() / 1000);
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 3]), hsNonceBuf, tsBuf, hmacVal);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
+        
         setS({ enabled: true, customKey: sessionKey });
-        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKey: Array.from(data.theirIdPubRaw), lastSeen: Date.now() });
+        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKeyHex: toHex(data.theirIdPubRaw), lastSeen: Date.now() });
+        
         delete hs.ephPrivJwk;
-        await dbOp("handshakes", "put", { ...hs, stage: "confirmed", derivedKey: sessionKey });
+        hs.derivedKey = sessionKey;
+        hs.stage = "confirmed";
+        await dbOp("handshakes", "put", hs);
+        
         syncVis();
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
         renderHS(el, "✅ Bridge established", "ac");
@@ -399,18 +431,25 @@
     }
 
     async function processConfirm(data, hs, el) {
-        const hmacKeyBytes = new Uint8Array(hs.hmacKeyBytes);
+        const hmacKeyBytes = fromHex(hs.hmacKeyHex);
         const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const hsNonceBuf = fromHex(hs.nonce);
         const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
+        
         if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC Verification Failed");
+        
         setS({ enabled: true, customKey: hs.derivedKey });
-        const hsIdentityRaw = new Uint8Array(hs.theirIdentityKey);
+        
+        const hsIdentityRaw = fromHex(hs.theirIdentityKeyHex);
         const fpInfo = await getTrustInfo(hsIdentityRaw, getChatId());
-        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKey: Array.from(hsIdentityRaw), lastSeen: Date.now() });
-        delete hs.hmacKeyBytes;
-        await dbOp("handshakes", "put", { ...hs, stage: "confirmed" });
+        
+        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKeyHex: toHex(hsIdentityRaw), lastSeen: Date.now() });
+        
+        delete hs.hmacKeyHex;
+        hs.stage = "confirmed";
+        await dbOp("handshakes", "put", hs);
+        
         syncVis();
         renderHS(el, "✅ Bridge established", "ac");
     }
@@ -424,10 +463,7 @@
             const ver = bytes[0], type = bytes[1];
             if (ver !== 1) throw new Error("Unknown Protocol Version");
             
-            // Critical fix: Using .slice() guarantees a brand new standalone ArrayBuffer, dodging IDB DataCloneErrors!
             const nonce = bytes.slice(2, 18), hexNonce = toHex(nonce);
-            
-            // Time Expiration Checks completely removed from packet verification.
             
             const myId = await getMyId();
             const hs = await dbOp("handshakes", "get", hexNonce);
@@ -436,13 +472,16 @@
                 if (bytes.length !== 216) throw new Error("Invalid Invite Payload Size");
                 const payload = bytes.slice(0, 152), sig = bytes.slice(152, 216);
                 const idPubRaw = bytes.slice(22, 87), ephPubRaw = bytes.slice(87, 152);
+                
                 if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Signature Verification Failed");
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge invite sent", "txM");
+                
                 if (hs) {
                     if (hs.stage === "accepted") return renderHS(el, "🔄 Waiting for confirmation", "wrn");
                     if (hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     return renderHS(el, "🤝 Processed", "txM");
                 }
+                
                 const trust = await getTrustInfo(idPubRaw, getChatId());
                 const hsList = await dbOp("handshakes", "getAll");
                 const activeOut = hsList.find(h => h.chatId === getChatId() && h.role === "initiator" && h.stage === "invited");
@@ -451,23 +490,27 @@
                     else if (myId.fp > trust.fp) await dbOp("handshakes", "del", activeOut.nonce);
                     else throw new Error("Identical Fingerprint Collision");
                 }
+                
                 let tStr = trust.state === "new" ? "🆕 New contact" : (trust.state === "known" ? "✅ Known contact" : `⚠️ IDENTITY CHANGED — old: ${trust.oldFp}, new: ${trust.fp}`);
                 renderHS(el, "🛡️ Secure Bridge Request", "ac", trust.fp, tStr, async () => {
                     try { await acceptBridge({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
                     catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to start accept"), "err"); console.error("[BB]", e); }
                 });
+                
             } else if (type === 2) {
                 if (bytes.length !== 248) throw new Error("Invalid Accept Payload Size");
                 const payload = bytes.slice(0, 184), sig = bytes.slice(184, 248);
                 const inviteHash = bytes.slice(22, 54), idPubRaw = bytes.slice(54, 119), ephPubRaw = bytes.slice(119, 184);
+                
                 if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Signature Verification Failed");
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge accept sent", "txM");
+                
                 if (!hs || hs.role !== "initiator" || hs.stage !== "invited") {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     return renderHS(el, "🤝 Processed", "txM");
                 }
-                // Verify against IDB cloned payloadHash
-                const hsPayloadHash = new Uint8Array(hs.payloadHash);
+                
+                const hsPayloadHash = fromHex(hs.payloadHashHex);
                 if (toHex(inviteHash) !== toHex(hsPayloadHash)) throw new Error("Invite Binding Hash Mismatch");
                 
                 const trust = await getTrustInfo(idPubRaw, getChatId());
@@ -475,18 +518,21 @@
                     try { await processAccept({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, fp: trust.fp, cid: trust.cid }, hs, el); }
                     catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process accept"), "err"); console.error("[BB]", e); }
                 };
+                
                 if (trust.state === "changed") {
                     renderHS(el, "⚠️ Identity Changed During Bridge!", "err", trust.fp, `Old: ${trust.oldFp}, New: ${trust.fp}`, doAccept, "Acknowledge & Connect");
                 } else {
                     renderHS(el, "✅ Bridge completing...", "ac");
                     await doAccept();
                 }
+                
             } else if (type === 3) {
                 if (bytes.length !== 118) throw new Error("Invalid Confirm Payload Size");
                 const payload = bytes.slice(0, 54), sig = bytes.slice(54, 118);
                 const hmac = bytes.slice(22, 54);
+                
                 if (hs && hs.role === "responder" && hs.stage === "accepted") {
-                    const hsIdentityRaw = new Uint8Array(hs.theirIdentityKey);
+                    const hsIdentityRaw = fromHex(hs.theirIdentityKeyHex);
                     if (!await ecVerify(hsIdentityRaw, sig, payload)) throw new Error("Signature Verification Failed");
                     try { await processConfirm({ hmac }, hs, el); }
                     catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process confirm"), "err"); console.error("[BB]", e); }
@@ -1022,7 +1068,11 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
     function cleanupHs() {
         dbOp("handshakes", "getAll").then(hs => {
             const now = Date.now();
-            hs.forEach(h => { if (h.stage !== "confirmed" && (now - h.createdAt) > CFG.HS_CLEANUP_INTERVAL) dbOp("handshakes", "del", h.nonce); });
+            hs.forEach(h => { 
+                if (h.stage !== "confirmed" && (now - h.createdAt) > CFG.HS_CLEANUP_INTERVAL) dbOp("handshakes", "del", h.nonce); 
+                // Database Versioning Fix: Instantly clear out any corrupt handshakes from older versions
+                if (h.stage === "invited" && !h.ephPubRawHex) dbOp("handshakes", "del", h.nonce);
+            });
         }).catch(() => {});
     }
 
