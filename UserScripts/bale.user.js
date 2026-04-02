@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.6
-// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Ultimate Firefox Sandbox Bypass).
+// @version      16.7
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Ultimate Xray Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -33,25 +33,28 @@
     });
 
     // =========================================================================================
-    // FIREFOX XRAY WRAPPER BYPASS: Safely moves arrays from Sandbox memory to Page memory
+    // ABSOLUTE FIREFOX XRAY WRAPPER BYPASS
+    // Reads byte-by-byte primitive numbers to avoid ANY cross-sandbox object restrictions
     // =========================================================================================
     const _W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const _U8 = _W.Uint8Array || Uint8Array;
-    function pb(b) {
+    function pb(buf) {
+        if (!buf) return buf;
         try {
-            if (!b) return b;
-            if (b.buffer) { // If it's an ArrayBufferView (Uint8Array from Sandbox)
-                const r = new _U8(b.length);
-                r.set(new Uint8Array(b.buffer, b.byteOffset, b.length));
-                return r;
+            let view = buf;
+            if (buf instanceof ArrayBuffer || (buf.byteLength !== undefined && buf.length === undefined)) {
+                view = new Uint8Array(buf);
             }
-            if (b.byteLength !== undefined) { // If it's a raw ArrayBuffer
-                const r = new _U8(b.byteLength);
-                r.set(new Uint8Array(b));
-                return r;
+            const len = view.length;
+            const res = new _U8(len); // Native Page Context Array
+            for (let i = 0; i < len; i++) {
+                res[i] = view[i]; // Primitive value copy (immune to wrappers)
             }
-        } catch (e) {}
-        return b;
+            return res;
+        } catch (e) {
+            console.error("[BB] pb() failed", e);
+            return buf; // Hard fallback
+        }
     }
 
     const _wsSend = WebSocket.prototype.send;
@@ -143,7 +146,7 @@
     function genKey() {
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = []; let f = 0;
         while (f < CFG.KEY_LEN) { 
-            const b = pb(new Uint8Array(64)); 
+            const b = new Uint8Array(64); 
             crypto.getRandomValues(b); 
             for (let i = 0; i < 64 && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl]; 
         }
@@ -180,10 +183,10 @@
 
     async function enc(t) {
         const k = activeKey(); if (!k) return null;
-        const iv = pb(new Uint8Array(12));
+        const iv = new Uint8Array(12);
         crypto.getRandomValues(iv);
         const data = pb(await cmp(t));
-        const ctBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, await getKey(k), data);
+        const ctBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: pb(iv) }, await getKey(k), data);
         const ct = new Uint8Array(ctBuf);
         const p = new Uint8Array(12 + ct.length); 
         p.set(iv); 
@@ -351,6 +354,13 @@
         return prev.then(() => fn()).finally(() => unlock());
     }
 
+    function formatError(e) {
+        if (!e) return "Unknown Error";
+        const msg = e.message || String(e);
+        const name = e.name ? e.name + ": " : "";
+        return name + msg;
+    }
+
     function renderHS(el, text, colorCode, fp = "", trustStr = "", onAction = null, btnText = "Accept & Connect") {
         const c = colorCode === "ac" ? P.ac : (colorCode === "wrn" ? P.wrn : (colorCode === "err" ? P.err : P.txM));
         const bg = colorCode === "ac" ? P.acSoft : (colorCode === "wrn" ? P.wrnBg : (colorCode === "err" ? "rgba(248,81,73,0.1)" : "rgba(255,255,255,0.05)"));
@@ -379,7 +389,7 @@
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
         const ephPrivPkcs8 = new Uint8Array(await S.exportKey("pkcs8", eph.privateKey));
         
-        const nonce = pb(new Uint8Array(16));
+        const nonce = new Uint8Array(16);
         crypto.getRandomValues(nonce);
         
         const ts = Math.floor(Date.now() / 1000);
@@ -534,7 +544,10 @@
                 let tStr = trust.state === "new" ? "🆕 New contact" : (trust.state === "known" ? "✅ Known contact" : `⚠️ IDENTITY CHANGED — old: ${trust.oldFp}, new: ${trust.fp}`);
                 renderHS(el, "🛡️ Secure Bridge Request", "ac", trust.fp, tStr, async () => {
                     try { await acceptBridge({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to start accept"), "err"); console.error("[BB]", e); }
+                    catch (e) { 
+                        console.error("[BB Error Detailed]", e);
+                        renderHS(el, "❌ Error: " + formatError(e), "err"); 
+                    }
                 });
                 
             } else if (type === 2) {
@@ -556,7 +569,10 @@
                 const trust = await getTrustInfo(idPubRaw, getChatId());
                 const doAccept = async () => {
                     try { await processAccept({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, fp: trust.fp, cid: trust.cid }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process accept"), "err"); console.error("[BB]", e); }
+                    catch (e) { 
+                        console.error("[BB Error Detailed]", e);
+                        renderHS(el, "❌ Error: " + formatError(e), "err"); 
+                    }
                 };
                 
                 if (trust.state === "changed") {
@@ -575,13 +591,19 @@
                     const hsIdentityRaw = fromHex(hs.theirIdentityKeyHex);
                     if (!await ecVerify(hsIdentityRaw, sig, payload)) throw new Error("Signature Verification Failed");
                     try { await processConfirm({ hmac }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process confirm"), "err"); console.error("[BB]", e); }
+                    catch (e) { 
+                        console.error("[BB Error Detailed]", e);
+                        renderHS(el, "❌ Error: " + formatError(e), "err"); 
+                    }
                 } else {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     renderHS(el, "🤝 Processed", "txM");
                 }
             }
-        } catch (e) { renderHS(el, "❌ Invalid: " + (e.message || "Bad Payload Format"), "err"); console.error("[BB]", e); }
+        } catch (e) { 
+            console.error("[BB Error Detailed]", e);
+            renderHS(el, "❌ Error: " + formatError(e), "err"); 
+        }
     }
 
     function toast(m, d = CFG.TOAST_MS) {
