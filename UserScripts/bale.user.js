@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.1
-// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (No-Expiry Fix).
+// @version      16.2
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Buffer clone fix).
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -20,7 +20,7 @@
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
         PFX_E: "@@", PFX_E2: "@@+",
-        // HS_EXP expanded to 24 hours for UI states, cleanup expanded to 24 hours
+        // HS_EXP expanded to 24 hours, meaning timezone issues are completely bypassed.
         PFX_H: "!!", HS_EXP: 86400, HS_CLEANUP_INTERVAL: 86400000
     });
 
@@ -204,19 +204,29 @@
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
         const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
         const infoStr = new TextEncoder().encode("aes-session-key");
-        const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
+        
+        // Ensure absolutely everything is a fresh Uint8Array to prevent buffer views issues
+        const info = concatBytes(
+            infoStr,
+            new Uint8Array(nonce),
+            new Uint8Array(initIdPub),
+            new Uint8Array(respIdPub),
+            new Uint8Array(initEphPub),
+            new Uint8Array(respEphPub)
+        );
+        
         const material = new Uint8Array(await S.deriveBits({
             name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
             info: info
         }, hkdfKey, 96 * 8));
-        const keyMat = material.subarray(0, 64);
-        const hmacMat = material.subarray(64, 96);
+        const keyMat = material.slice(0, 64);
+        const hmacMat = material.slice(64, 96);
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = [];
         let f = 0;
         for (let i = 0; i < keyMat.length && f < CFG.KEY_LEN; i++) {
             if (keyMat[i] < mx) r[f++] = c[keyMat[i] % cl];
         }
-        if (f < CFG.KEY_LEN) throw new Error();
+        if (f < CFG.KEY_LEN) throw new Error("Key Derivation Exhausted");
         return { sessionKey: r.join(''), hmacKeyBytes: hmacMat };
     }
 
@@ -239,7 +249,7 @@
     async function dbOp(s, o, v) {
         try {
             const d = await getDB();
-            if (!d) throw new Error();
+            if (!d) throw new Error("DB Initialization Failed");
             return new Promise((res, rej) => {
                 const tx = d.transaction(s, o === "get" || o === "getAll" ? "readonly" : "readwrite");
                 const st = tx.objectStore(s);
@@ -324,12 +334,16 @@
         const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
         const nonce = crypto.getRandomValues(new Uint8Array(16));
         const ts = Math.floor(Date.now() / 1000);
-        // Safely extract bytes ensuring no overflow issues down the line
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 1]), nonce, tsBuf, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        await dbOp("handshakes", "put", { nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", ephPrivJwk, ephPubRaw, initIdPub: id.pubRaw, theirIdentityKey: null, createdAt: Date.now(), payloadHash: await digest(payload) });
+        // Explicitly ensuring cloned arrays to prevent IDB DataCloneError
+        await dbOp("handshakes", "put", { 
+            nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", 
+            ephPrivJwk, ephPubRaw: Array.from(ephPubRaw), initIdPub: Array.from(id.pubRaw), 
+            theirIdentityKey: null, createdAt: Date.now(), payloadHash: Array.from(await digest(payload)) 
+        });
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
         toast("Bridge invite sent!");
         syncVis();
@@ -346,7 +360,12 @@
         const payload = concatBytes(new Uint8Array([1, 2]), data.nonce, tsBuf, data.payloadHash, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        await dbOp("handshakes", "put", { nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", derivedKey: sessionKey, hmacKeyBytes: Array.from(hmacKeyBytes), theirIdentityKey: data.theirIdPubRaw, createdAt: Date.now() });
+        // Deep clone binaries with Array.from for safety with strict IndexedDB engines
+        await dbOp("handshakes", "put", { 
+            nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", 
+            derivedKey: sessionKey, hmacKeyBytes: Array.from(hmacKeyBytes), 
+            theirIdentityKey: Array.from(data.theirIdPubRaw), createdAt: Date.now() 
+        });
         renderHS(el, "🔄 Bridge accepted — waiting for confirmation", "wrn");
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
     }
@@ -354,7 +373,10 @@
     async function processAccept(data, hs, el) {
         const id = await getMyId();
         const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw, hsNonceBuf, hs.initIdPub, data.theirIdPubRaw, hs.ephPubRaw, data.theirEphPubRaw);
+        // Extract safely from IDB
+        const hsInitIdPub = new Uint8Array(hs.initIdPub);
+        const hsEphPubRaw = new Uint8Array(hs.ephPubRaw);
+        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
         const hmacKey = await S.importKey("raw", new Uint8Array(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
         const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
@@ -364,7 +386,7 @@
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
         setS({ enabled: true, customKey: sessionKey });
-        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKey: data.theirIdPubRaw, lastSeen: Date.now() });
+        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKey: Array.from(data.theirIdPubRaw), lastSeen: Date.now() });
         delete hs.ephPrivJwk;
         await dbOp("handshakes", "put", { ...hs, stage: "confirmed", derivedKey: sessionKey });
         syncVis();
@@ -382,10 +404,11 @@
         const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
         const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
-        if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error();
+        if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC Verification Failed");
         setS({ enabled: true, customKey: hs.derivedKey });
-        const fpInfo = await getTrustInfo(hs.theirIdentityKey, getChatId());
-        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKey: hs.theirIdentityKey, lastSeen: Date.now() });
+        const hsIdentityRaw = new Uint8Array(hs.theirIdentityKey);
+        const fpInfo = await getTrustInfo(hsIdentityRaw, getChatId());
+        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKey: Array.from(hsIdentityRaw), lastSeen: Date.now() });
         delete hs.hmacKeyBytes;
         await dbOp("handshakes", "put", { ...hs, stage: "confirmed" });
         syncVis();
@@ -397,25 +420,23 @@
         el._isDecrypted = true;
         try {
             const bytes = decodeB64Smart(b64);
-            if (!bytes || bytes.length < 118) throw new Error();
+            if (!bytes || bytes.length < 118) throw new Error("Invalid Payload Length");
             const ver = bytes[0], type = bytes[1];
-            if (ver !== 1) throw new Error();
-
-            const nonce = bytes.subarray(2, 18), hexNonce = toHex(nonce);
-
-            // =========================================================================
-            // TIME EXPIRATION CHECK HAS BEEN COMPLETELY REMOVED HERE
-            // Replay protection/abuse prevention now relies solely on IDB Nonce tracking
-            // =========================================================================
-
+            if (ver !== 1) throw new Error("Unknown Protocol Version");
+            
+            // Critical fix: Using .slice() guarantees a brand new standalone ArrayBuffer, dodging IDB DataCloneErrors!
+            const nonce = bytes.slice(2, 18), hexNonce = toHex(nonce);
+            
+            // Time Expiration Checks completely removed from packet verification.
+            
             const myId = await getMyId();
             const hs = await dbOp("handshakes", "get", hexNonce);
 
             if (type === 1) {
-                if (bytes.length !== 216) throw new Error();
-                const payload = bytes.subarray(0, 152), sig = bytes.subarray(152, 216);
-                const idPubRaw = bytes.subarray(22, 87), ephPubRaw = bytes.subarray(87, 152);
-                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error();
+                if (bytes.length !== 216) throw new Error("Invalid Invite Payload Size");
+                const payload = bytes.slice(0, 152), sig = bytes.slice(152, 216);
+                const idPubRaw = bytes.slice(22, 87), ephPubRaw = bytes.slice(87, 152);
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Signature Verification Failed");
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge invite sent", "txM");
                 if (hs) {
                     if (hs.stage === "accepted") return renderHS(el, "🔄 Waiting for confirmation", "wrn");
@@ -428,28 +449,31 @@
                 if (activeOut) {
                     if (myId.fp < trust.fp) return renderHS(el, "🤝 Collision avoided (You are initiator)", "txM");
                     else if (myId.fp > trust.fp) await dbOp("handshakes", "del", activeOut.nonce);
-                    else throw new Error();
+                    else throw new Error("Identical Fingerprint Collision");
                 }
                 let tStr = trust.state === "new" ? "🆕 New contact" : (trust.state === "known" ? "✅ Known contact" : `⚠️ IDENTITY CHANGED — old: ${trust.oldFp}, new: ${trust.fp}`);
                 renderHS(el, "🛡️ Secure Bridge Request", "ac", trust.fp, tStr, async () => {
                     try { await acceptBridge({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
-                    catch (e) { renderHS(el, "❌ Error", "err"); }
+                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to start accept"), "err"); console.error("[BB]", e); }
                 });
             } else if (type === 2) {
-                if (bytes.length !== 248) throw new Error();
-                const payload = bytes.subarray(0, 184), sig = bytes.subarray(184, 248);
-                const inviteHash = bytes.subarray(22, 54), idPubRaw = bytes.subarray(54, 119), ephPubRaw = bytes.subarray(119, 184);
-                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error();
+                if (bytes.length !== 248) throw new Error("Invalid Accept Payload Size");
+                const payload = bytes.slice(0, 184), sig = bytes.slice(184, 248);
+                const inviteHash = bytes.slice(22, 54), idPubRaw = bytes.slice(54, 119), ephPubRaw = bytes.slice(119, 184);
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Signature Verification Failed");
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge accept sent", "txM");
                 if (!hs || hs.role !== "initiator" || hs.stage !== "invited") {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     return renderHS(el, "🤝 Processed", "txM");
                 }
-                if (toHex(inviteHash) !== toHex(hs.payloadHash)) throw new Error();
+                // Verify against IDB cloned payloadHash
+                const hsPayloadHash = new Uint8Array(hs.payloadHash);
+                if (toHex(inviteHash) !== toHex(hsPayloadHash)) throw new Error("Invite Binding Hash Mismatch");
+                
                 const trust = await getTrustInfo(idPubRaw, getChatId());
                 const doAccept = async () => {
                     try { await processAccept({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, fp: trust.fp, cid: trust.cid }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error", "err"); }
+                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process accept"), "err"); console.error("[BB]", e); }
                 };
                 if (trust.state === "changed") {
                     renderHS(el, "⚠️ Identity Changed During Bridge!", "err", trust.fp, `Old: ${trust.oldFp}, New: ${trust.fp}`, doAccept, "Acknowledge & Connect");
@@ -458,19 +482,20 @@
                     await doAccept();
                 }
             } else if (type === 3) {
-                if (bytes.length !== 118) throw new Error();
-                const payload = bytes.subarray(0, 54), sig = bytes.subarray(54, 118);
-                const hmac = bytes.subarray(22, 54);
+                if (bytes.length !== 118) throw new Error("Invalid Confirm Payload Size");
+                const payload = bytes.slice(0, 54), sig = bytes.slice(54, 118);
+                const hmac = bytes.slice(22, 54);
                 if (hs && hs.role === "responder" && hs.stage === "accepted") {
-                    if (!await ecVerify(hs.theirIdentityKey, sig, payload)) throw new Error();
+                    const hsIdentityRaw = new Uint8Array(hs.theirIdentityKey);
+                    if (!await ecVerify(hsIdentityRaw, sig, payload)) throw new Error("Signature Verification Failed");
                     try { await processConfirm({ hmac }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error", "err"); }
+                    catch (e) { renderHS(el, "❌ Error: " + (e.message || "Failed to process confirm"), "err"); console.error("[BB]", e); }
                 } else {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     renderHS(el, "🤝 Processed", "txM");
                 }
             }
-        } catch (e) { renderHS(el, "❌ Invalid Payload", "err"); }
+        } catch (e) { renderHS(el, "❌ Invalid: " + (e.message || "Bad Payload Format"), "err"); console.error("[BB]", e); }
     }
 
     function toast(m, d = CFG.TOAST_MS) {
