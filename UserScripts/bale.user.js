@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor
 // @namespace    http://tampermonkey.net/
-// @version      17.0
+// @version      17.1
 // @description  E2E encryption overlay for Bale Web with ECDH key exchange.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -91,8 +91,9 @@ async function deriveSymmetric(myPrivBuf,theirPubRaw,nonce,initIdPub,respIdPub,i
     const theirPub=await _S.importKey("raw",theirPubRaw,{name:"ECDH",namedCurve:"P-256"},true,[]);
     const shared=await _S.deriveBits({name:"ECDH",public:theirPub},myPriv,256);
     const hkdfKey=await _S.importKey("raw",shared,{name:"HKDF"},false,["deriveBits"]);
-    const info=concatBytes(new TextEncoder().encode("aes-session-key"),nonce,initIdPub,respIdPub,initEphPub,respEphPub);
-    const material=u8(await _S.deriveBits({name:"HKDF",hash:"SHA-256",salt:new TextEncoder().encode("bale-bridge-v16"),info},hkdfKey,96*8));
+    const info=concatBytes(initEphPub,respEphPub,nonce,initIdPub,respIdPub);
+    const salt=u8(await _S.digest("SHA-256",concatBytes(nonce,initIdPub,respIdPub)));
+    const material=u8(await _S.deriveBits({name:"HKDF",hash:"SHA-256",salt,info},hkdfKey,96*8));
     const keyMat=material.slice(0,64),hmacMat=material.slice(64,96);
     const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[]; let f=0;
     for(let i=0;i<keyMat.length&&f<CFG.KEY_LEN;i++) if(keyMat[i]<mx) r[f++]=c[keyMat[i]%cl];
@@ -182,7 +183,7 @@ async function processAccept(data,hs,el){
     const hsNonce=fromHex(hs.nonce),hsInitPub=fromHex(hs.initIdPubHex),hsEphPub=fromHex(hs.ephPubHex),myPriv=fromHex(hs.ephPrivHex);
     const {sessionKey,hmacKeyBytes}=await deriveSymmetric(myPriv,data.theirEphPubRaw,hsNonce,hsInitPub,data.theirIdPubRaw,hsEphPub,data.theirEphPubRaw);
     const hmacKey=await _S.importKey("raw",hmacKeyBytes,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const hmacVal=u8(await _S.sign("HMAC",hmacKey,concatBytes(new TextEncoder().encode("bale-bridge-confirm"),hsNonce)));
+    const hmacVal=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),hsNonce)));
     const useGroupKey=hs.chatType==="group"&&hs.groupKey;
     const activeSessionKey=useGroupKey?hs.groupKey:sessionKey;
     let payload,encBlob;
@@ -205,7 +206,7 @@ async function processAccept(data,hs,el){
 
 async function processConfirm(data,hs,el){
     const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new TextEncoder().encode("bale-bridge-confirm"),fromHex(hs.nonce))));
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
     if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
     setS({enabled:true,customKey:hs.derivedKey});
     const fpInfo=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
@@ -216,7 +217,7 @@ async function processConfirm(data,hs,el){
 
 async function processGroupConfirm(data,hs,el){
     const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new TextEncoder().encode("bale-bridge-confirm"),fromHex(hs.nonce))));
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
     if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
     const pairwiseAes=await _S.importKey("raw",new TextEncoder().encode(hs.derivedKey),{name:"AES-GCM"},false,["decrypt"]);
     const gkIv=data.encBlob.slice(0,12),gkCt=data.encBlob.slice(12);
