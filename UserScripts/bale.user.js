@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.5
-// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Firefox Xray Wrapper Bypass).
+// @version      16.6
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Ultimate Firefox Sandbox Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -32,11 +32,33 @@
         glass: "rgba(22,27,34,.88)", glassBdr: "rgba(240,246,252,.06)",
     });
 
+    // =========================================================================================
+    // FIREFOX XRAY WRAPPER BYPASS: Safely moves arrays from Sandbox memory to Page memory
+    // =========================================================================================
+    const _W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const _U8 = _W.Uint8Array || Uint8Array;
+    function pb(b) {
+        try {
+            if (!b) return b;
+            if (b.buffer) { // If it's an ArrayBufferView (Uint8Array from Sandbox)
+                const r = new _U8(b.length);
+                r.set(new Uint8Array(b.buffer, b.byteOffset, b.length));
+                return r;
+            }
+            if (b.byteLength !== undefined) { // If it's a raw ArrayBuffer
+                const r = new _U8(b.byteLength);
+                r.set(new Uint8Array(b));
+                return r;
+            }
+        } catch (e) {}
+        return b;
+    }
+
     const _wsSend = WebSocket.prototype.send;
     const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
     WebSocket.prototype.send = function (d) {
         try {
-            let t = typeof d === "string" ? d : (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) ? new TextDecoder().decode(d) : "";
+            let t = typeof d === "string" ? d : (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) ? new TextDecoder().decode(pb(d)) : "";
             if (t && _draftRx.test(t)) return;
         } catch (_) {}
         return _wsSend.apply(this, arguments);
@@ -112,7 +134,7 @@
     const _kc = new Map();
     async function getKey(k) {
         let c = _kc.get(k); if (c) return c;
-        const e = new TextEncoder().encode(k);
+        const e = pb(new TextEncoder().encode(k));
         c = await crypto.subtle.importKey("raw", e, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
         if (_kc.size >= CFG.KCACHE) _kc.delete(_kc.keys().next().value);
         _kc.set(k, c); return c;
@@ -120,7 +142,11 @@
 
     function genKey() {
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = []; let f = 0;
-        while (f < CFG.KEY_LEN) { const b = crypto.getRandomValues(new Uint8Array(64)); for (let i = 0; i < 64 && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl]; }
+        while (f < CFG.KEY_LEN) { 
+            const b = pb(new Uint8Array(64)); 
+            crypto.getRandomValues(b); 
+            for (let i = 0; i < 64 && f < CFG.KEY_LEN; i++) if (b[i] < mx) r[f++] = c[b[i] % cl]; 
+        }
         return r.join("");
     }
 
@@ -143,20 +169,25 @@
     async function cmp(t) {
         if (typeof CompressionStream === "undefined") return new TextEncoder().encode(t);
         const c = new CompressionStream("deflate"), w = c.writable.getWriter();
-        w.write(new TextEncoder().encode(t)); w.close();
+        w.write(pb(new TextEncoder().encode(t))); w.close();
         return new Uint8Array(await new Response(c.readable).arrayBuffer());
     }
     async function dcmp(b) {
         if (typeof DecompressionStream === "undefined") return new TextDecoder().decode(b);
-        try { const d = new DecompressionStream("deflate"), w = d.writable.getWriter(); w.write(b); w.close(); return new TextDecoder().decode(await new Response(d.readable).arrayBuffer()); }
-        catch (_) { return new TextDecoder().decode(b); }
+        try { const d = new DecompressionStream("deflate"), w = d.writable.getWriter(); w.write(pb(b)); w.close(); return new TextDecoder().decode(await new Response(d.readable).arrayBuffer()); }
+        catch (_) { return new TextDecoder().decode(pb(b)); }
     }
 
     async function enc(t) {
         const k = activeKey(); if (!k) return null;
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(k), await cmp(t)));
-        const p = new Uint8Array(12 + ct.length); p.set(iv); p.set(ct, 12);
+        const iv = pb(new Uint8Array(12));
+        crypto.getRandomValues(iv);
+        const data = pb(await cmp(t));
+        const ctBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, await getKey(k), data);
+        const ct = new Uint8Array(ctBuf);
+        const p = new Uint8Array(12 + ct.length); 
+        p.set(iv); 
+        p.set(ct, 12);
         return CFG.PFX_E2 + toB64(p);
     }
 
@@ -168,7 +199,9 @@
             if (t.startsWith(CFG.PFX_E2)) b = decodeB64Smart(t.slice(3));
             else b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, ''));
             if (!b || b.length < 13) return t;
-            return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12))));
+            const iv = pb(b.subarray(0, 12));
+            const data = pb(b.subarray(12));
+            return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, await getKey(k), data)));
         } catch (_) { return t; }
     }
 
@@ -182,9 +215,8 @@
     }
 
     const S = crypto.subtle;
-    async function digest(data) { return new Uint8Array(await S.digest("SHA-256", data)); }
+    async function digest(data) { return new Uint8Array(await S.digest("SHA-256", pb(data))); }
     
-    // Completely secure serialization to avoid Firefox Xray boundary crashes
     function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
     function fromHex(h) {
         if (!h) return new Uint8Array(0);
@@ -199,29 +231,28 @@
         return r;
     }
     
-    async function getFpStr(pubRaw) { return toHex(await digest(pubRaw)).slice(0, 8).toUpperCase(); }
-    async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, buf)); }
+    async function getFpStr(pubRaw) { return toHex(await digest(pb(pubRaw))).slice(0, 8).toUpperCase(); }
+    async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, pb(buf))); }
     async function ecVerify(pubRaw, sig, buf) {
         try {
-            const p = await S.importKey("raw", pubRaw, {name: "ECDSA", namedCurve: "P-256"}, false, ["verify"]);
-            return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, sig, buf);
+            const p = await S.importKey("raw", pb(pubRaw), {name: "ECDSA", namedCurve: "P-256"}, false, ["verify"]);
+            return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, pb(sig), pb(buf));
         } catch(e) { return false; }
     }
     
     async function deriveSymmetric(myEphPrivBuf, theirEphPubRaw, nonce, initIdPub, respIdPub, initEphPub, respEphPub) {
-        // We now pass pure flat ArrayBuffers to importKey (PKCS8 & RAW), completely bypassing Firefox JSON object Sandbox wrappers!
-        const myPriv = await S.importKey("pkcs8", myEphPrivBuf, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
-        const theirPub = await S.importKey("raw", theirEphPubRaw, {name: "ECDH", namedCurve: "P-256"}, true, []);
+        const myPriv = await S.importKey("pkcs8", pb(myEphPrivBuf), {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+        const theirPub = await S.importKey("raw", pb(theirEphPubRaw), {name: "ECDH", namedCurve: "P-256"}, true, []);
         
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
-        const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
-        const infoStr = new TextEncoder().encode("aes-session-key");
+        const hkdfKey = await S.importKey("raw", pb(shared), {name: "HKDF"}, false, ["deriveBits"]);
         
-        const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
+        const infoStr = new TextEncoder().encode("aes-session-key");
+        const info = pb(concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub));
+        const salt = pb(new TextEncoder().encode("bale-bridge-v16"));
         
         const material = new Uint8Array(await S.deriveBits({
-            name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
-            info: info
+            name: "HKDF", hash: "SHA-256", salt: salt, info: info
         }, hkdfKey, 96 * 8));
         
         const keyMat = material.slice(0, 64);
@@ -240,7 +271,6 @@
         if (_useMem) return null;
         if (_db) return _db;
         return new Promise((res, rej) => {
-            // Version 2 upgrade immediately purges the DB of any toxic v1 JSON objects 
             const req = indexedDB.open("bale_bridge_db", 2);
             req.onupgradeneeded = e => {
                 const d = e.target.result;
@@ -267,7 +297,7 @@
                 const st = tx.objectStore(s);
                 let rq;
                 if (o === "get") rq = st.get(v); 
-                else if (o === "put") rq = st.put(JSON.parse(JSON.stringify(v))); // Ultimate sandbox sanitization
+                else if (o === "put") rq = st.put(JSON.parse(JSON.stringify(v))); 
                 else if (o === "del") rq = st.delete(v); 
                 else if (o === "getAll") rq = st.getAll();
                 rq.onsuccess = () => res(rq.result);
@@ -286,14 +316,13 @@
         let rec = await dbOp("identity", "get", "self");
         if (rec && rec.pubHex && rec.privHex) {
             try {
-                const pubBuf = fromHex(rec.pubHex);
-                const privBuf = fromHex(rec.privHex);
+                const pubBuf = pb(fromHex(rec.pubHex));
+                const privBuf = pb(fromHex(rec.privHex));
                 const pub = await S.importKey("raw", pubBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
                 const priv = await S.importKey("pkcs8", privBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
                 return { pub, priv, pubRaw: pubBuf, fp: await getFpStr(pubBuf) };
             } catch (e) {}
         }
-        // Force purely binary representations moving forward
         const kp = await S.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
         const pubRaw = new Uint8Array(await S.exportKey("raw", kp.publicKey));
         const privPkcs8 = new Uint8Array(await S.exportKey("pkcs8", kp.privateKey));
@@ -349,7 +378,10 @@
         const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
         const ephPrivPkcs8 = new Uint8Array(await S.exportKey("pkcs8", eph.privateKey));
-        const nonce = crypto.getRandomValues(new Uint8Array(16));
+        
+        const nonce = pb(new Uint8Array(16));
+        crypto.getRandomValues(nonce);
+        
         const ts = Math.floor(Date.now() / 1000);
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 1]), nonce, tsBuf, id.pubRaw, ephPubRaw);
@@ -412,8 +444,8 @@
         
         const { sessionKey, hmacKeyBytes } = await deriveSymmetric(myPrivBuf, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
         
-        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
+        const hmacKey = await S.importKey("raw", pb(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacData = pb(concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf));
         const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
         
         const ts = Math.floor(Date.now() / 1000);
@@ -441,9 +473,9 @@
 
     async function processConfirm(data, hs, el) {
         const hmacKeyBytes = fromHex(hs.hmacKeyHex);
-        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacKey = await S.importKey("raw", pb(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
         const hsNonceBuf = fromHex(hs.nonce);
-        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
+        const hmacData = pb(concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf));
         const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
         
         if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC Verification Failed");
@@ -1078,7 +1110,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
             const now = Date.now();
             hs.forEach(h => { 
                 if (h.stage !== "confirmed" && (now - h.createdAt) > CFG.HS_CLEANUP_INTERVAL) dbOp("handshakes", "del", h.nonce); 
-                if (h.stage === "invited" && !h.ephPubHex) dbOp("handshakes", "del", h.nonce);
             });
         }).catch(() => {});
     }
