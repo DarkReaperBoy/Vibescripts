@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.7
+// @version      16.8
 // @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Ultimate Xray Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
@@ -33,36 +33,15 @@
     });
 
     // =========================================================================================
-    // ABSOLUTE FIREFOX XRAY WRAPPER BYPASS
-    // Reads byte-by-byte primitive numbers to avoid ANY cross-sandbox object restrictions
+    // FIREFOX XRAY WRAPPER BYPASS
+    // Prevents unprivileged page objects from polluting WebCrypto (fixes 'constructor' denied error)
     // =========================================================================================
     const _W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    const _U8 = _W.Uint8Array || Uint8Array;
-    function pb(buf) {
-        if (!buf) return buf;
-        try {
-            let view = buf;
-            if (buf instanceof ArrayBuffer || (buf.byteLength !== undefined && buf.length === undefined)) {
-                view = new Uint8Array(buf);
-            }
-            const len = view.length;
-            const res = new _U8(len); // Native Page Context Array
-            for (let i = 0; i < len; i++) {
-                res[i] = view[i]; // Primitive value copy (immune to wrappers)
-            }
-            return res;
-        } catch (e) {
-            console.error("[BB] pb() failed", e);
-            return buf; // Hard fallback
-        }
-    }
-
-    const _wsSend = WebSocket.prototype.send;
+    const _wsSend = _W.WebSocket.prototype.send;
     const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
-    WebSocket.prototype.send = function (d) {
+    _W.WebSocket.prototype.send = function (d) {
         try {
-            let t = typeof d === "string" ? d : (d instanceof ArrayBuffer || ArrayBuffer.isView(d)) ? new TextDecoder().decode(pb(d)) : "";
-            if (t && _draftRx.test(t)) return;
+            if (typeof d === "string" && _draftRx.test(d)) return;
         } catch (_) {}
         return _wsSend.apply(this, arguments);
     };
@@ -137,7 +116,7 @@
     const _kc = new Map();
     async function getKey(k) {
         let c = _kc.get(k); if (c) return c;
-        const e = pb(new TextEncoder().encode(k));
+        const e = new TextEncoder().encode(k);
         c = await crypto.subtle.importKey("raw", e, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
         if (_kc.size >= CFG.KCACHE) _kc.delete(_kc.keys().next().value);
         _kc.set(k, c); return c;
@@ -172,21 +151,21 @@
     async function cmp(t) {
         if (typeof CompressionStream === "undefined") return new TextEncoder().encode(t);
         const c = new CompressionStream("deflate"), w = c.writable.getWriter();
-        w.write(pb(new TextEncoder().encode(t))); w.close();
+        w.write(new TextEncoder().encode(t)); w.close();
         return new Uint8Array(await new Response(c.readable).arrayBuffer());
     }
     async function dcmp(b) {
         if (typeof DecompressionStream === "undefined") return new TextDecoder().decode(b);
-        try { const d = new DecompressionStream("deflate"), w = d.writable.getWriter(); w.write(pb(b)); w.close(); return new TextDecoder().decode(await new Response(d.readable).arrayBuffer()); }
-        catch (_) { return new TextDecoder().decode(pb(b)); }
+        try { const d = new DecompressionStream("deflate"), w = d.writable.getWriter(); w.write(b); w.close(); return new TextDecoder().decode(await new Response(d.readable).arrayBuffer()); }
+        catch (_) { return new TextDecoder().decode(b); }
     }
 
     async function enc(t) {
         const k = activeKey(); if (!k) return null;
         const iv = new Uint8Array(12);
         crypto.getRandomValues(iv);
-        const data = pb(await cmp(t));
-        const ctBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: pb(iv) }, await getKey(k), data);
+        const data = await cmp(t);
+        const ctBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, await getKey(k), data);
         const ct = new Uint8Array(ctBuf);
         const p = new Uint8Array(12 + ct.length); 
         p.set(iv); 
@@ -202,8 +181,8 @@
             if (t.startsWith(CFG.PFX_E2)) b = decodeB64Smart(t.slice(3));
             else b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, ''));
             if (!b || b.length < 13) return t;
-            const iv = pb(b.subarray(0, 12));
-            const data = pb(b.subarray(12));
+            const iv = b.subarray(0, 12);
+            const data = b.subarray(12);
             return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, await getKey(k), data)));
         } catch (_) { return t; }
     }
@@ -218,7 +197,7 @@
     }
 
     const S = crypto.subtle;
-    async function digest(data) { return new Uint8Array(await S.digest("SHA-256", pb(data))); }
+    async function digest(data) { return new Uint8Array(await S.digest("SHA-256", data)); }
     
     function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
     function fromHex(h) {
@@ -234,25 +213,25 @@
         return r;
     }
     
-    async function getFpStr(pubRaw) { return toHex(await digest(pb(pubRaw))).slice(0, 8).toUpperCase(); }
-    async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, pb(buf))); }
+    async function getFpStr(pubRaw) { return toHex(await digest(pubRaw)).slice(0, 8).toUpperCase(); }
+    async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, buf)); }
     async function ecVerify(pubRaw, sig, buf) {
         try {
-            const p = await S.importKey("raw", pb(pubRaw), {name: "ECDSA", namedCurve: "P-256"}, false, ["verify"]);
-            return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, pb(sig), pb(buf));
+            const p = await S.importKey("raw", pubRaw, {name: "ECDSA", namedCurve: "P-256"}, false, ["verify"]);
+            return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, sig, buf);
         } catch(e) { return false; }
     }
     
     async function deriveSymmetric(myEphPrivBuf, theirEphPubRaw, nonce, initIdPub, respIdPub, initEphPub, respEphPub) {
-        const myPriv = await S.importKey("pkcs8", pb(myEphPrivBuf), {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
-        const theirPub = await S.importKey("raw", pb(theirEphPubRaw), {name: "ECDH", namedCurve: "P-256"}, true, []);
+        const myPriv = await S.importKey("pkcs8", myEphPrivBuf, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+        const theirPub = await S.importKey("raw", theirEphPubRaw, {name: "ECDH", namedCurve: "P-256"}, true, []);
         
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
-        const hkdfKey = await S.importKey("raw", pb(shared), {name: "HKDF"}, false, ["deriveBits"]);
+        const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
         
         const infoStr = new TextEncoder().encode("aes-session-key");
-        const info = pb(concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub));
-        const salt = pb(new TextEncoder().encode("bale-bridge-v16"));
+        const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
+        const salt = new TextEncoder().encode("bale-bridge-v16");
         
         const material = new Uint8Array(await S.deriveBits({
             name: "HKDF", hash: "SHA-256", salt: salt, info: info
@@ -319,8 +298,8 @@
         let rec = await dbOp("identity", "get", "self");
         if (rec && rec.pubHex && rec.privHex) {
             try {
-                const pubBuf = pb(fromHex(rec.pubHex));
-                const privBuf = pb(fromHex(rec.privHex));
+                const pubBuf = fromHex(rec.pubHex);
+                const privBuf = fromHex(rec.privHex);
                 const pub = await S.importKey("raw", pubBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
                 const priv = await S.importKey("pkcs8", privBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
                 return { pub, priv, pubRaw: pubBuf, fp: await getFpStr(pubBuf) };
@@ -454,8 +433,8 @@
         
         const { sessionKey, hmacKeyBytes } = await deriveSymmetric(myPrivBuf, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
         
-        const hmacKey = await S.importKey("raw", pb(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const hmacData = pb(concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf));
+        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
         
         const ts = Math.floor(Date.now() / 1000);
@@ -483,9 +462,9 @@
 
     async function processConfirm(data, hs, el) {
         const hmacKeyBytes = fromHex(hs.hmacKeyHex);
-        const hmacKey = await S.importKey("raw", pb(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
         const hsNonceBuf = fromHex(hs.nonce);
-        const hmacData = pb(concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf));
+        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
         const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
         
         if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC Verification Failed");
@@ -691,11 +670,12 @@
         const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
         if (btn) {
-            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+            const uBtn = btn.wrappedJSObject || btn;
+            const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
             try {
-                let node = btn[rk];
+                let node = uBtn[rk];
                 while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
-                let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
+                let clickFn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
                 if (typeof clickFn === 'function') { clickFn({ preventDefault() {}, stopPropagation() {} }); sent = true; }
             } catch (_) {}
             if (!sent) { btn.click(); sent = true; }
@@ -1056,12 +1036,13 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 real.dispatchEvent(new Event("input", { bubbles: true })); real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, CFG.SEND_DLY));
 
-                const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                const uBtn = btn.wrappedJSObject || btn;
+                const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
                 let dispatched = false;
                 try {
-                    let node = btn[rk];
+                    let node = uBtn[rk];
                     while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
-                    let fn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
+                    let fn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
                     if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
                 } catch (_) {}
 
