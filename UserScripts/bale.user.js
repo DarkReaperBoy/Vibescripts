@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.8
+// @version      16.9
 // @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Ultimate Xray Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
@@ -33,8 +33,8 @@
     });
 
     // =========================================================================================
-    // FIREFOX XRAY WRAPPER BYPASS
-    // Prevents unprivileged page objects from polluting WebCrypto (fixes 'constructor' denied error)
+    // FIREFOX XRAY WRAPPER BYPASS (v16.9)
+    // Prevents unprivileged page objects from polluting WebCrypto or throwing 'constructor' errors
     // =========================================================================================
     const _W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const _wsSend = _W.WebSocket.prototype.send;
@@ -282,15 +282,21 @@
                 else if (o === "put") rq = st.put(JSON.parse(JSON.stringify(v))); 
                 else if (o === "del") rq = st.delete(v); 
                 else if (o === "getAll") rq = st.getAll();
-                rq.onsuccess = () => res(rq.result);
+                rq.onsuccess = () => {
+                    try {
+                        if (rq.result !== undefined && rq.result !== null && typeof rq.result === 'object') {
+                            res(JSON.parse(JSON.stringify(rq.result))); // Deep clone to detach from Firefox Xray page constraints
+                        } else { res(rq.result); }
+                    } catch (e) { res(rq.result); }
+                };
                 rq.onerror = () => rej(rq.error);
             });
         } catch (e) {
             _useMem = true;
-            if (o === "get") return _memDB[s][v];
-            if (o === "put") { _memDB[s][v.id || v.nonce] = v; return v; }
+            if (o === "get") return _memDB[s][v] ? JSON.parse(JSON.stringify(_memDB[s][v])) : undefined;
+            if (o === "put") { _memDB[s][v.id || v.nonce] = JSON.parse(JSON.stringify(v)); return v; }
             if (o === "del") { delete _memDB[s][v]; return; }
-            if (o === "getAll") return Object.values(_memDB[s]);
+            if (o === "getAll") return Object.values(_memDB[s]).map(x => JSON.parse(JSON.stringify(x)));
         }
     }
 
@@ -670,13 +676,15 @@
         const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
         let sent = false;
         if (btn) {
-            const uBtn = btn.wrappedJSObject || btn;
-            const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
             try {
-                let node = uBtn[rk];
-                while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
-                let clickFn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
-                if (typeof clickFn === 'function') { clickFn({ preventDefault() {}, stopPropagation() {} }); sent = true; }
+                const uBtn = btn.wrappedJSObject || btn; // Xray wrapper safe guard
+                const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                if (rk) {
+                    let node = uBtn[rk];
+                    while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                    let clickFn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
+                    if (typeof clickFn === 'function') { clickFn({ preventDefault() {}, stopPropagation() {} }); sent = true; }
+                }
             } catch (_) {}
             if (!sent) { btn.click(); sent = true; }
         }
@@ -1036,14 +1044,16 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 real.dispatchEvent(new Event("input", { bubbles: true })); real.dispatchEvent(new Event("change", { bubbles: true }));
                 await new Promise(r => setTimeout(r, CFG.SEND_DLY));
 
-                const uBtn = btn.wrappedJSObject || btn;
-                const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
                 let dispatched = false;
                 try {
-                    let node = uBtn[rk];
-                    while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
-                    let fn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
-                    if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
+                    const uBtn = btn.wrappedJSObject || btn;
+                    const rk = Object.keys(uBtn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                    if (rk) {
+                        let node = uBtn[rk];
+                        while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                        let fn = node?.memoizedProps?.onClick || node?.onClick || uBtn[rk]?.onClick;
+                        if (fn) { fn({ preventDefault() {}, stopPropagation() {} }); dispatched = true; }
+                    }
                 } catch (_) {}
 
                 if (!dispatched) {
