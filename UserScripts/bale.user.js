@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.3
+// @version      16.5
 // @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (Firefox Xray Wrapper Bypass).
 // @author       You
 // @match        *://web.bale.ai/*
@@ -183,9 +183,9 @@
 
     const S = crypto.subtle;
     async function digest(data) { return new Uint8Array(await S.digest("SHA-256", data)); }
-    function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
     
-    // Hex to Binary array mapping (prevents memory cloning issues in IDB)
+    // Completely secure serialization to avoid Firefox Xray boundary crashes
+    function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
     function fromHex(h) {
         if (!h) return new Uint8Array(0);
         const a = new Uint8Array(h.length / 2);
@@ -198,6 +198,7 @@
         for (let a of arrays) { r.set(a, o); o += a.length; }
         return r;
     }
+    
     async function getFpStr(pubRaw) { return toHex(await digest(pubRaw)).slice(0, 8).toUpperCase(); }
     async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, buf)); }
     async function ecVerify(pubRaw, sig, buf) {
@@ -206,18 +207,23 @@
             return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, sig, buf);
         } catch(e) { return false; }
     }
-    async function deriveSymmetric(myEphPrivJwk, theirEphPubRaw, nonce, initIdPub, respIdPub, initEphPub, respEphPub) {
-        const myPriv = await S.importKey("jwk", myEphPrivJwk, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+    
+    async function deriveSymmetric(myEphPrivBuf, theirEphPubRaw, nonce, initIdPub, respIdPub, initEphPub, respEphPub) {
+        // We now pass pure flat ArrayBuffers to importKey (PKCS8 & RAW), completely bypassing Firefox JSON object Sandbox wrappers!
+        const myPriv = await S.importKey("pkcs8", myEphPrivBuf, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
         const theirPub = await S.importKey("raw", theirEphPubRaw, {name: "ECDH", namedCurve: "P-256"}, true, []);
+        
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
         const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
         const infoStr = new TextEncoder().encode("aes-session-key");
+        
         const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
         
         const material = new Uint8Array(await S.deriveBits({
             name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
             info: info
         }, hkdfKey, 96 * 8));
+        
         const keyMat = material.slice(0, 64);
         const hmacMat = material.slice(64, 96);
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = [];
@@ -225,7 +231,7 @@
         for (let i = 0; i < keyMat.length && f < CFG.KEY_LEN; i++) {
             if (keyMat[i] < mx) r[f++] = c[keyMat[i] % cl];
         }
-        if (f < CFG.KEY_LEN) throw new Error("Key Derivation Exhausted");
+        if (f < CFG.KEY_LEN) throw new Error("Key Exhaustion");
         return { sessionKey: r.join(''), hmacKeyBytes: hmacMat };
     }
 
@@ -234,9 +240,15 @@
         if (_useMem) return null;
         if (_db) return _db;
         return new Promise((res, rej) => {
-            const req = indexedDB.open("bale_bridge_db", 1);
+            // Version 2 upgrade immediately purges the DB of any toxic v1 JSON objects 
+            const req = indexedDB.open("bale_bridge_db", 2);
             req.onupgradeneeded = e => {
                 const d = e.target.result;
+                if (e.oldVersion < 2) {
+                    if (d.objectStoreNames.contains("identity")) d.deleteObjectStore("identity");
+                    if (d.objectStoreNames.contains("contacts")) d.deleteObjectStore("contacts");
+                    if (d.objectStoreNames.contains("handshakes")) d.deleteObjectStore("handshakes");
+                }
                 if (!d.objectStoreNames.contains("identity")) d.createObjectStore("identity", { keyPath: "id" });
                 if (!d.objectStoreNames.contains("contacts")) d.createObjectStore("contacts", { keyPath: "id" });
                 if (!d.objectStoreNames.contains("handshakes")) d.createObjectStore("handshakes", { keyPath: "nonce" });
@@ -249,20 +261,15 @@
     async function dbOp(s, o, v) {
         try {
             const d = await getDB();
-            if (!d) throw new Error("DB Initialization Failed");
+            if (!d) throw new Error("DB Fail");
             return new Promise((res, rej) => {
                 const tx = d.transaction(s, o === "get" || o === "getAll" ? "readonly" : "readwrite");
                 const st = tx.objectStore(s);
                 let rq;
-                if (o === "get") { rq = st.get(v); }
-                else if (o === "put") {
-                    // Critical Firefox Bypass: Strips Xray wrappers via strictly parsed JSON serialization
-                    const safeObject = JSON.parse(JSON.stringify(v));
-                    rq = st.put(safeObject);
-                } 
-                else if (o === "del") { rq = st.delete(v); } 
-                else if (o === "getAll") { rq = st.getAll(); }
-
+                if (o === "get") rq = st.get(v); 
+                else if (o === "put") rq = st.put(JSON.parse(JSON.stringify(v))); // Ultimate sandbox sanitization
+                else if (o === "del") rq = st.delete(v); 
+                else if (o === "getAll") rq = st.getAll();
                 rq.onsuccess = () => res(rq.result);
                 rq.onerror = () => rej(rq.error);
             });
@@ -277,19 +284,21 @@
 
     async function getMyId() {
         let rec = await dbOp("identity", "get", "self");
-        if (rec) {
+        if (rec && rec.pubHex && rec.privHex) {
             try {
-                const pub = await S.importKey("jwk", rec.publicKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
-                const priv = await S.importKey("jwk", rec.privateKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
-                const pubRaw = new Uint8Array(await S.exportKey("raw", pub));
-                return { pub, priv, pubRaw, fp: await getFpStr(pubRaw) };
+                const pubBuf = fromHex(rec.pubHex);
+                const privBuf = fromHex(rec.privHex);
+                const pub = await S.importKey("raw", pubBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+                const priv = await S.importKey("pkcs8", privBuf, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+                return { pub, priv, pubRaw: pubBuf, fp: await getFpStr(pubBuf) };
             } catch (e) {}
         }
+        // Force purely binary representations moving forward
         const kp = await S.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
-        const pubJwk = await S.exportKey("jwk", kp.publicKey);
-        const privJwk = await S.exportKey("jwk", kp.privateKey);
-        await dbOp("identity", "put", { id: "self", publicKey: pubJwk, privateKey: privJwk, createdAt: Date.now() });
         const pubRaw = new Uint8Array(await S.exportKey("raw", kp.publicKey));
+        const privPkcs8 = new Uint8Array(await S.exportKey("pkcs8", kp.privateKey));
+        
+        await dbOp("identity", "put", { id: "self", pubHex: toHex(pubRaw), privHex: toHex(privPkcs8), createdAt: Date.now() });
         return { pub: kp.publicKey, priv: kp.privateKey, pubRaw, fp: await getFpStr(pubRaw) };
     }
 
@@ -339,7 +348,7 @@
         const id = await getMyId();
         const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
-        const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
+        const ephPrivPkcs8 = new Uint8Array(await S.exportKey("pkcs8", eph.privateKey));
         const nonce = crypto.getRandomValues(new Uint8Array(16));
         const ts = Math.floor(Date.now() / 1000);
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
@@ -347,14 +356,13 @@
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
         
-        // Storing ONLY hex strings and POJO objects to avoid Firefox DataClone wrapper locks
         await dbOp("handshakes", "put", { 
             nonce: toHex(nonce), 
             chatId: getChatId(), 
             role: "initiator", 
             stage: "invited", 
-            ephPrivJwk: ephPrivJwk, 
-            ephPubRawHex: toHex(ephPubRaw), 
+            ephPrivHex: toHex(ephPrivPkcs8), 
+            ephPubHex: toHex(ephPubRaw), 
             initIdPubHex: toHex(id.pubRaw), 
             theirIdentityKeyHex: null, 
             createdAt: Date.now(), 
@@ -370,9 +378,9 @@
         const id = await getMyId();
         const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
-        const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
+        const ephPrivPkcs8 = new Uint8Array(await S.exportKey("pkcs8", eph.privateKey));
         
-        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(ephPrivJwk, data.theirEphPubRaw, data.nonce, data.theirIdPubRaw, id.pubRaw, data.theirEphPubRaw, ephPubRaw);
+        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(ephPrivPkcs8, data.theirEphPubRaw, data.nonce, data.theirIdPubRaw, id.pubRaw, data.theirEphPubRaw, ephPubRaw);
         
         const ts = Math.floor(Date.now() / 1000);
         const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
@@ -399,9 +407,10 @@
         const id = await getMyId();
         const hsNonceBuf = fromHex(hs.nonce);
         const hsInitIdPub = fromHex(hs.initIdPubHex);
-        const hsEphPubRaw = fromHex(hs.ephPubRawHex);
+        const hsEphPubRaw = fromHex(hs.ephPubHex);
+        const myPrivBuf = fromHex(hs.ephPrivHex);
         
-        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
+        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(myPrivBuf, data.theirEphPubRaw, hsNonceBuf, hsInitIdPub, data.theirIdPubRaw, hsEphPubRaw, data.theirEphPubRaw);
         
         const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
         const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
@@ -414,9 +423,9 @@
         const finalMsg = concatBytes(payload, sig);
         
         setS({ enabled: true, customKey: sessionKey });
-        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKeyHex: toHex(data.theirIdPubRaw), lastSeen: Date.now() });
+        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), pubHex: toHex(data.theirIdPubRaw), lastSeen: Date.now() });
         
-        delete hs.ephPrivJwk;
+        delete hs.ephPrivHex;
         hs.derivedKey = sessionKey;
         hs.stage = "confirmed";
         await dbOp("handshakes", "put", hs);
@@ -444,7 +453,7 @@
         const hsIdentityRaw = fromHex(hs.theirIdentityKeyHex);
         const fpInfo = await getTrustInfo(hsIdentityRaw, getChatId());
         
-        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKeyHex: toHex(hsIdentityRaw), lastSeen: Date.now() });
+        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), pubHex: hs.theirIdentityKeyHex, lastSeen: Date.now() });
         
         delete hs.hmacKeyHex;
         hs.stage = "confirmed";
@@ -464,7 +473,6 @@
             if (ver !== 1) throw new Error("Unknown Protocol Version");
             
             const nonce = bytes.slice(2, 18), hexNonce = toHex(nonce);
-            
             const myId = await getMyId();
             const hs = await dbOp("handshakes", "get", hexNonce);
 
@@ -1070,8 +1078,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
             const now = Date.now();
             hs.forEach(h => { 
                 if (h.stage !== "confirmed" && (now - h.createdAt) > CFG.HS_CLEANUP_INTERVAL) dbOp("handshakes", "del", h.nonce); 
-                // Database Versioning Fix: Instantly clear out any corrupt handshakes from older versions
-                if (h.stage === "invited" && !h.ephPubRawHex) dbOp("handshakes", "del", h.nonce);
+                if (h.stage === "invited" && !h.ephPubHex) dbOp("handshakes", "del", h.nonce);
             });
         }).catch(() => {});
     }
