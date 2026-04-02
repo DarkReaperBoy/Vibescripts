@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bale Bridge Encryptor (Secure ECDH & Anti-XSS)
+// @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      15.4
-// @description  Fast dark UI, ECDH Bridge, Invisible Char Immunity, Anti-XSS.
+// @version      16.0
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge.
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -14,12 +14,13 @@
     "use strict";
 
     const CFG = Object.freeze({
-        KEY_LEN: 32, MAX_ENC: 4000, HS_EXP: 600, TOAST_MS: 4500,
-        LONG_PRESS: 400, SEND_DLY: 60, POST_DLY: 100, MAX_HASHES: 50,
+        KEY_LEN: 32, MAX_ENC: 4000, TOAST_MS: 4500,
+        LONG_PRESS: 400, SEND_DLY: 60, POST_DLY: 100,
         MAX_DEPTH: 10, KCACHE: 16,
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
-        HS_REQ: 1, HS_RES: 2, PFX_E: "@@", PFX_E2: "@@+", PFX_H: "!!",
+        PFX_E: "@@", PFX_E2: "@@+",
+        PFX_H: "!!", HS_EXP: 600, HS_CLEANUP_INTERVAL: 600000
     });
 
     const P = Object.freeze({
@@ -31,7 +32,6 @@
         glass: "rgba(22,27,34,.88)", glassBdr: "rgba(240,246,252,.06)",
     });
 
-    // ── WebSocket draft blocker ───────────────────────────────────────────────
     const _wsSend = WebSocket.prototype.send;
     const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
     WebSocket.prototype.send = function (d) {
@@ -42,7 +42,6 @@
         return _wsSend.apply(this, arguments);
     };
 
-    // ── Settings ──────────────────────────────────────────────────────────────
     const _safeId = /^[a-zA-Z0-9_\-]+$/;
     const getChatId = () => {
         const p = new URLSearchParams(location.search);
@@ -65,28 +64,16 @@
     const encOn = () => getS().enabled;
     const fp = () => { const k = activeKey(); return k ? k.substring(0, 5).toUpperCase() : "NONE"; };
 
-    // ── Robust Base64 (no padding, URL-safe) ──────────────────────────────────
-    // Standard base64 chars +/= get mangled by Bale's rich-text renderer.
-    // Padding chars (= or any substitute) get stripped at end of messages.
-    // Solution: use URL-safe alphabet AND strip ALL padding on encode,
-    // then re-add padding on decode based on length % 4.
-
     function toB64(buf) {
         let binary = '';
         const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
         for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-        return btoa(binary)
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=+$/, '');  // Strip ALL padding — we recalculate on decode
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
 
     function fromB64(s) {
-        // Strip any invisible / non-base64 characters
         let cleaned = s.replace(/[^A-Za-z0-9\-_]/g, '');
-        // Convert URL-safe back to standard
         cleaned = cleaned.replace(/-/g, '+').replace(/_/g, '/');
-        // Re-add padding
         const pad = (4 - (cleaned.length % 4)) % 4;
         cleaned += '='.repeat(pad);
         const bin = atob(cleaned);
@@ -95,7 +82,6 @@
         return arr;
     }
 
-    // Legacy decoders for backward compatibility
     function fromStdB64(s) {
         const cleaned = s.replace(/[^A-Za-z0-9+/=]/g, '');
         const bin = atob(cleaned);
@@ -105,10 +91,8 @@
     }
 
     function fromLegacyB64(s) {
-        // Handle old format that used . for padding
         let cleaned = s.replace(/[^A-Za-z0-9\-_.+/=]/g, '');
         cleaned = cleaned.replace(/-/g, '+').replace(/_/g, '/').replace(/\./g, '=');
-        // Also re-pad if dots were stripped
         const noPad = cleaned.replace(/=+$/, '');
         const pad = (4 - (noPad.length % 4)) % 4;
         cleaned = noPad + '='.repeat(pad);
@@ -118,27 +102,13 @@
         return arr;
     }
 
-    // Smart decoder: tries all formats
     function decodeB64Smart(s) {
-        // 1) Try no-padding URL-safe (current format)
-        try {
-            const r = fromB64(s);
-            if (r.length > 0) return r;
-        } catch (_) {}
-        // 2) Try legacy dot-padding URL-safe
-        try {
-            const r = fromLegacyB64(s);
-            if (r.length > 0) return r;
-        } catch (_) {}
-        // 3) Try standard base64
-        try {
-            const r = fromStdB64(s);
-            if (r.length > 0) return r;
-        } catch (_) {}
+        try { const r = fromB64(s); if (r.length > 0) return r; } catch (_) {}
+        try { const r = fromLegacyB64(s); if (r.length > 0) return r; } catch (_) {}
+        try { const r = fromStdB64(s); if (r.length > 0) return r; } catch (_) {}
         return null;
     }
 
-    // ── Crypto & Encodings ────────────────────────────────────────────────────
     const _kc = new Map();
     async function getKey(k) {
         let c = _kc.get(k); if (c) return c;
@@ -195,12 +165,8 @@
         const k = activeKey(); if (!k) return t;
         try {
             let b;
-            if (t.startsWith(CFG.PFX_E2)) {
-                b = decodeB64Smart(t.slice(3));
-            } else {
-                // Legacy B85 support
-                b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, ''));
-            }
+            if (t.startsWith(CFG.PFX_E2)) b = decodeB64Smart(t.slice(3));
+            else b = b85d(t.slice(2).replace(/[^\x21-\x7E]/g, ''));
             if (!b || b.length < 13) return t;
             return await dcmp(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, await getKey(k), b.subarray(12))));
         } catch (_) { return t; }
@@ -215,27 +181,268 @@
         return a && b ? [...a, ...b] : null;
     }
 
-    // ── ECDH (Bridge State) ───────────────────────────────────────────────────
-    const _hsState = new Map();
-    let _hsLock = Promise.resolve();
-    function hsLock(fn) { let u; const p = _hsLock; _hsLock = new Promise(r => u = r); return p.then(() => fn()).finally(() => u()); }
-
-    const hsPair = () => crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey", "deriveBits"]);
-    const hsPubRaw = async k => new Uint8Array(await crypto.subtle.exportKey("raw", k));
-    const hsPubImp = b => crypto.subtle.importKey("raw", b, { name: "ECDH", namedCurve: "P-256" }, false, []);
-
-    async function hsDerive(priv, theirBytes) {
-        const pub = await hsPubImp(theirBytes);
-        const shared = await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256);
-        let hash;
+    const S = crypto.subtle;
+    async function digest(data) { return new Uint8Array(await S.digest("SHA-256", data)); }
+    function toHex(buf) { return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(''); }
+    function concatBytes(...arrays) {
+        let t = arrays.reduce((a, b) => a + b.length, 0), r = new Uint8Array(t), o = 0;
+        for (let a of arrays) { r.set(a, o); o += a.length; }
+        return r;
+    }
+    async function getFpStr(pubRaw) { return toHex(await digest(pubRaw)).slice(0, 8).toUpperCase(); }
+    async function ecSign(priv, buf) { return new Uint8Array(await S.sign({name: "ECDSA", hash: "SHA-256"}, priv, buf)); }
+    async function ecVerify(pubRaw, sig, buf) {
         try {
-            const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
-            hash = new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v14"), info: new TextEncoder().encode("aes-key") }, ikm, 512));
-        } catch (_) { const h = new Uint8Array(await crypto.subtle.digest("SHA-256", shared)); hash = new Uint8Array(64); hash.set(h); }
-        const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0;
-        let key = "", i = 0;
-        while (key.length < CFG.KEY_LEN) { if (i >= hash.length) throw new Error("No entropy"); if (hash[i] < mx) key += c[hash[i] % cl]; i++; }
-        return key;
+            const p = await S.importKey("raw", pubRaw, {name: "ECDSA", namedCurve: "P-256"}, false, ["verify"]);
+            return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, sig, buf);
+        } catch(e) { return false; }
+    }
+    async function deriveSymmetric(ephPrivJwk, theirEphPubRaw) {
+        const myPriv = await S.importKey("jwk", ephPrivJwk, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+        const theirPub = await S.importKey("raw", theirEphPubRaw, {name: "ECDH", namedCurve: "P-256"}, true, []);
+        const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
+        const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
+        const material = new Uint8Array(await S.deriveBits({
+            name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
+            info: new TextEncoder().encode("aes-session-key")
+        }, hkdfKey, 256 * 8));
+        const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = [];
+        let f = 0;
+        for (let i = 0; i < material.length && f < CFG.KEY_LEN; i++) {
+            if (material[i] < mx) r[f++] = c[material[i] % cl];
+        }
+        if (f < CFG.KEY_LEN) throw new Error("Derivation exhaustion");
+        return r.join('');
+    }
+
+    let _db, _memDB = { identity: {}, contacts: {}, handshakes: {} }, _useMem = false;
+    async function getDB() {
+        if (_useMem) return null;
+        if (_db) return _db;
+        return new Promise((res, rej) => {
+            const req = indexedDB.open("bale_bridge_db", 1);
+            req.onupgradeneeded = e => {
+                const d = e.target.result;
+                if (!d.objectStoreNames.contains("identity")) d.createObjectStore("identity", { keyPath: "id" });
+                if (!d.objectStoreNames.contains("contacts")) d.createObjectStore("contacts", { keyPath: "id" });
+                if (!d.objectStoreNames.contains("handshakes")) d.createObjectStore("handshakes", { keyPath: "nonce" });
+            };
+            req.onsuccess = e => { _db = e.target.result; res(_db); };
+            req.onerror = e => { _useMem = true; rej(req.error); };
+        });
+    }
+    async function dbOp(s, o, v) {
+        try {
+            const d = await getDB();
+            if (!d) throw new Error("Mem");
+            return new Promise((res, rej) => {
+                const tx = d.transaction(s, o === "get" || o === "getAll" ? "readonly" : "readwrite");
+                const st = tx.objectStore(s);
+                let rq;
+                if (o === "get") rq = st.get(v); else if (o === "put") rq = st.put(v); else if (o === "del") rq = st.delete(v); else if (o === "getAll") rq = st.getAll();
+                rq.onsuccess = () => res(rq.result);
+                rq.onerror = () => rej(rq.error);
+            });
+        } catch (e) {
+            _useMem = true;
+            if (o === "get") return _memDB[s][v];
+            if (o === "put") { _memDB[s][v.id || v.nonce] = v; return v; }
+            if (o === "del") { delete _memDB[s][v]; return; }
+            if (o === "getAll") return Object.values(_memDB[s]);
+        }
+    }
+
+    async function getMyId() {
+        let rec = await dbOp("identity", "get", "self");
+        if (rec) {
+            try {
+                const pub = await S.importKey("jwk", rec.publicKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+                const priv = await S.importKey("jwk", rec.privateKey, { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+                const pubRaw = new Uint8Array(await S.exportKey("raw", pub));
+                return { pub, priv, pubRaw, fp: await getFpStr(pubRaw) };
+            } catch (e) {}
+        }
+        const kp = await S.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+        const pubJwk = await S.exportKey("jwk", kp.publicKey);
+        const privJwk = await S.exportKey("jwk", kp.privateKey);
+        await dbOp("identity", "put", { id: "self", publicKey: pubJwk, privateKey: privJwk, createdAt: Date.now() });
+        const pubRaw = new Uint8Array(await S.exportKey("raw", kp.publicKey));
+        return { pub: kp.publicKey, priv: kp.privateKey, pubRaw, fp: await getFpStr(pubRaw) };
+    }
+
+    async function getTrustInfo(idPubRaw, chatId) {
+        const idHash = toHex(await digest(idPubRaw));
+        const cid = idHash.slice(0, 16);
+        const fp = idHash.slice(0, 8).toUpperCase();
+        const all = await dbOp("contacts", "getAll");
+        const existing = all.find(c => c.id === cid);
+        if (existing) return { state: "known", fp, cid };
+        const otherInChat = all.find(c => c.chatId === chatId);
+        if (otherInChat) return { state: "changed", fp, cid, oldFp: otherInChat.id.slice(0, 8).toUpperCase() };
+        return { state: "new", fp, cid };
+    }
+
+    let _hsLock = Promise.resolve();
+    function hsLock(fn) {
+        let unlock;
+        const prev = _hsLock;
+        _hsLock = new Promise(r => unlock = r);
+        return prev.then(() => fn()).finally(() => unlock());
+    }
+
+    function renderHS(el, text, colorCode, fp = "", trustStr = "", onAction = null, btnText = "Accept & Connect") {
+        const c = colorCode === "ac" ? P.ac : (colorCode === "wrn" ? P.wrn : (colorCode === "err" ? P.err : P.txM));
+        const bg = colorCode === "ac" ? P.acSoft : (colorCode === "wrn" ? P.wrnBg : (colorCode === "err" ? "rgba(248,81,73,0.1)" : "rgba(255,255,255,0.05)"));
+        let html = `<div class="bb-hs-widget" style="border: 1px solid ${c}; background: ${bg};">`;
+        html += `<span class="bb-hs-title" style="color: ${c}; margin-bottom: ${fp ? '6px' : '0'}">${esc(text)}</span>`;
+        if (fp) {
+            html += `<div class="bb-hs-fp" style="color: ${P.ac};">Fingerprint: ${esc(fp)}</div>`;
+            const tColor = trustStr.includes('⚠️') ? P.err : P.txD;
+            const tWeight = trustStr.includes('⚠️') ? '700' : '500';
+            html += `<div style="color: ${tColor}; font-weight: ${tWeight}; margin-bottom: ${onAction ? '8px' : '0'}">${esc(trustStr)}</div>`;
+        }
+        if (onAction) {
+            html += `<button class="bb-hs-btn" style="background: ${c}; color: ${P.bg};">${esc(btnText)}</button>`;
+        }
+        html += `</div>`;
+        el.innerHTML = html;
+        if (onAction) {
+            const btn = el.querySelector(".bb-hs-btn");
+            if (btn) btn.onclick = e => { e.preventDefault(); e.stopPropagation(); btn.disabled = true; btn.innerText = "Processing..."; onAction(); };
+        }
+    }
+
+    async function startBridge() {
+        const id = await getMyId();
+        const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+        const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
+        const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
+        const nonce = crypto.getRandomValues(new Uint8Array(16));
+        const ts = Math.floor(Date.now() / 1000);
+        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
+        const payload = concatBytes(new Uint8Array([1, 1]), nonce, tsBuf, id.pubRaw, ephPubRaw);
+        const sig = await ecSign(id.priv, payload);
+        const finalMsg = concatBytes(payload, sig);
+        await dbOp("handshakes", "put", { nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", ephPrivJwk, ephPubRaw, theirIdentityKey: null, createdAt: Date.now(), payloadHash: await digest(payload) });
+        await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
+        toast("Bridge invite sent!");
+        syncVis();
+    }
+
+    async function acceptBridge(data, el) {
+        const id = await getMyId();
+        const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+        const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
+        const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
+        const derivedKey = await deriveSymmetric(ephPrivJwk, data.theirEphPubRaw);
+        const ts = Math.floor(Date.now() / 1000);
+        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
+        const payload = concatBytes(new Uint8Array([1, 2]), data.nonce, tsBuf, data.payloadHash, id.pubRaw, ephPubRaw);
+        const sig = await ecSign(id.priv, payload);
+        const finalMsg = concatBytes(payload, sig);
+        await dbOp("handshakes", "put", { nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", derivedKey, theirIdentityKey: data.theirIdPubRaw, createdAt: Date.now() });
+        renderHS(el, "🔄 Bridge accepted — waiting for confirmation", "wrn");
+        await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
+    }
+
+    async function processAccept(data, hs, el) {
+        const derivedKey = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw);
+        const hmacKey = await S.importKey("raw", new TextEncoder().encode(derivedKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, new TextEncoder().encode("bale-bridge-confirm")));
+        const id = await getMyId();
+        const ts = Math.floor(Date.now() / 1000);
+        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
+        const payload = concatBytes(new Uint8Array([1, 3]), data.nonce, tsBuf, hmacVal);
+        const sig = await ecSign(id.priv, payload);
+        const finalMsg = concatBytes(payload, sig);
+        setS({ enabled: true, customKey: derivedKey });
+        await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKey: data.theirIdPubRaw, lastSeen: Date.now() });
+        await dbOp("handshakes", "put", { ...hs, stage: "confirmed", derivedKey });
+        delete hs.ephPrivJwk;
+        syncVis();
+        await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
+        renderHS(el, "✅ Bridge established", "ac");
+        setTimeout(async () => {
+            const testEnc = await encChunk("✅ Bridge Established! Both sides should see fingerprints: " + id.fp + " ↔ " + data.fp);
+            if (testEnc) for (let c of testEnc) await sendRaw(c);
+        }, CFG.SEND_DLY + 400);
+    }
+
+    async function processConfirm(data, hs, el) {
+        const hmacKey = await S.importKey("raw", new TextEncoder().encode(hs.derivedKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, new TextEncoder().encode("bale-bridge-confirm")));
+        if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC mismatch");
+        setS({ enabled: true, customKey: hs.derivedKey });
+        const fpInfo = await getTrustInfo(hs.theirIdentityKey, getChatId());
+        await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKey: hs.theirIdentityKey, lastSeen: Date.now() });
+        await dbOp("handshakes", "put", { ...hs, stage: "confirmed" });
+        syncVis();
+        renderHS(el, "✅ Bridge established", "ac");
+    }
+
+    async function handleHandshake(b64, el) {
+        if (el._isDecrypted) return;
+        el._isDecrypted = true;
+        try {
+            const bytes = decodeB64Smart(b64);
+            if (!bytes || bytes.length < 50) throw new Error("Decode failed");
+            const ver = bytes[0], type = bytes[1];
+            if (ver !== 1) throw new Error("Unknown version");
+            const nonce = bytes.subarray(2, 18), hexNonce = toHex(nonce);
+            const ts = (bytes[18] << 24) | (bytes[19] << 16) | (bytes[20] << 8) | bytes[21];
+            if (Math.abs(Date.now() / 1000 - ts) > CFG.HS_EXP) return renderHS(el, "⌛ Expired", "wrn");
+            const myId = await getMyId();
+            const hs = await dbOp("handshakes", "get", hexNonce);
+
+            if (type === 1) {
+                const idPubRaw = bytes.subarray(22, 87), ephPubRaw = bytes.subarray(87, 152);
+                const payload = bytes.subarray(0, 152), sig = bytes.subarray(152);
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Sig fail");
+                if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge invite sent", "txM");
+                if (hs) {
+                    if (hs.stage === "accepted") return renderHS(el, "🔄 Waiting for confirmation", "wrn");
+                    if (hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
+                    return renderHS(el, "🤝 Processed", "txM");
+                }
+                const trust = await getTrustInfo(idPubRaw, getChatId());
+                let tStr = trust.state === "new" ? "🆕 New contact" : (trust.state === "known" ? "✅ Known contact" : `⚠️ IDENTITY CHANGED — old: ${trust.oldFp}, new: ${trust.fp}`);
+                renderHS(el, "🛡️ Secure Bridge Request", "ac", trust.fp, tStr, async () => {
+                    try { await acceptBridge({ nonce, ts, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
+                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                });
+            } else if (type === 2) {
+                const hash = bytes.subarray(22, 54), idPubRaw = bytes.subarray(54, 119), ephPubRaw = bytes.subarray(119, 184);
+                const payload = bytes.subarray(0, 184), sig = bytes.subarray(184);
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Sig fail");
+                if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge accept sent", "txM");
+                if (!hs || hs.role !== "initiator" || hs.stage !== "invited") {
+                    if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
+                    return renderHS(el, "🤝 Processed", "txM");
+                }
+                if (toHex(hash) !== toHex(hs.payloadHash)) throw new Error("Bind fail");
+                const trust = await getTrustInfo(idPubRaw, getChatId());
+                const doAccept = async () => {
+                    try { await processAccept({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, fp: trust.fp, cid: trust.cid }, hs, el); }
+                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                };
+                if (trust.state === "changed") {
+                    renderHS(el, "⚠️ Identity Changed During Bridge!", "err", trust.fp, `Old: ${trust.oldFp}, New: ${trust.fp}`, doAccept, "Acknowledge & Connect");
+                } else {
+                    renderHS(el, "✅ Bridge completing...", "ac");
+                    await doAccept();
+                }
+            } else if (type === 3) {
+                const hmac = bytes.subarray(22, 54), payload = bytes.subarray(0, 54), sig = bytes.subarray(54);
+                if (hs && hs.role === "responder" && hs.stage === "accepted") {
+                    if (!await ecVerify(hs.theirIdentityKey, sig, payload)) throw new Error("Sig fail");
+                    try { await processConfirm({ hmac }, hs, el); }
+                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                } else {
+                    if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
+                    renderHS(el, "🤝 Processed", "txM");
+                }
+            }
+        } catch (e) { renderHS(el, "❌ Invalid: " + e.message, "err"); }
     }
 
     function toast(m, d = CFG.TOAST_MS) {
@@ -252,226 +459,6 @@
         setTimeout(() => { el.style.opacity = "0"; el.style.transform = "translateX(-50%) translateY(8px)"; setTimeout(() => el.remove(), 250); }, d);
     }
 
-    function vizHs(el, txt) {
-        el.textContent = "";
-        const b = document.createElement("span"); b.textContent = txt;
-        Object.assign(b.style, {
-            display: "inline-block", margin: "2px 0", padding: "4px 12px", fontSize: "11px", fontWeight: "600",
-            fontFamily: "monospace", color: P.ac, background: P.srf, borderRadius: "8px",
-            border: `1px solid ${P.bdr}`, userSelect: "none",
-        });
-        el.appendChild(b); el.style.display = "block"; el.style.textAlign = "center"; el._isDecrypted = true;
-    }
-
-    function mHash(cid, h) {
-        const k = "bb_phs_" + cid;
-        try {
-            const a = JSON.parse(localStorage.getItem(k) || "[]");
-            if (!Array.isArray(a)) { localStorage.setItem(k, JSON.stringify([h])); return; }
-            if (!a.includes(h)) {
-                a.push(h); while (a.length > CFG.MAX_HASHES) a.shift();
-                localStorage.setItem(k, JSON.stringify(a));
-            }
-        } catch (_) {}
-    }
-    function isH(cid, h) { try { const a = JSON.parse(localStorage.getItem("bb_phs_" + cid) || "[]"); return Array.isArray(a) && a.includes(h); } catch (_) { return false; } }
-    function cH(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
-
-    function tsB() {
-        const t = (Date.now() / 1000) | 0;
-        return new Uint8Array([(t >>> 24) & 255, (t >>> 16) & 255, (t >>> 8) & 255, t & 255]);
-    }
-    function rdTs(b) { return ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0; }
-
-    // ── Send Logic & React Intercept ──────────────────────────────────────────
-    const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-    const isMob = el => el?.tagName === "TEXTAREA";
-
-    const getReal = () => {
-        const e1 = document.getElementById("editable-message-text");
-        const e2 = document.getElementById("main-message-input");
-        if (e1 && e1.getBoundingClientRect().height > 0) return e1;
-        if (e2 && e2.getBoundingClientRect().height > 0) return e2;
-        return e1 || e2;
-    };
-
-    async function sendRaw(text) {
-        const real = getReal(); if (!real) return;
-        const mob = isMob(real), ws = isSyncing; isSyncing = true;
-        unlockI(real);
-
-        try {
-            real.focus();
-            if (mob) {
-                _taSet?.call(real, text);
-                real.dispatchEvent(new Event("input", { bubbles: true }));
-            } else {
-                real.innerHTML = text;
-                real.dispatchEvent(new Event("input", { bubbles: true }));
-            }
-        } catch (e) {
-            if(!mob) { real.innerText = text; real.dispatchEvent(new Event("input", { bubbles: true })); }
-        }
-
-        await new Promise(r => setTimeout(r, CFG.SEND_DLY));
-
-        const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
-        let sent = false;
-
-        if (btn) {
-            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
-            try {
-                let node = btn[rk];
-                while(node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
-                let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
-                if (typeof clickFn === 'function') {
-                    clickFn({ preventDefault() {}, stopPropagation() {} });
-                    sent = true;
-                }
-            } catch (_) {}
-            if (!sent) { btn.click(); sent = true; }
-        }
-
-        if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13 }));
-
-        await new Promise(r => setTimeout(r, CFG.POST_DLY));
-
-        if (mob) {
-            _taSet?.call(real, "");
-            real.dispatchEvent(new Event("input", { bubbles: true }));
-        } else {
-            real.innerHTML = "";
-            real.dispatchEvent(new Event("input", { bubbles: true }));
-        }
-
-        if (encOn()) lockI(real);
-        isSyncing = ws;
-    }
-
-    // ── Handshake ─────────────────────────────────────────────────────────────
-    async function startHs() {
-        return hsLock(async () => {
-            try {
-                const cid = getChatId(), pair = await hsPair(), pub = await hsPubRaw(pair.publicKey);
-                const privJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
-                _hsState.set(cid, privJwk);
-
-                const pay = new Uint8Array(1 + 4 + pub.length);
-                pay[0] = CFG.HS_REQ; pay.set(tsB(), 1); pay.set(pub, 5);
-                const encoded = toB64(pay);
-                mHash(cid, cH(encoded));
-
-                await sendRaw(CFG.PFX_H + encoded);
-                toast("⏳ Waiting for friend to accept…");
-            } catch (e) { console.error("[BB] StartHs Error:", e); toast("❌ Bridge failed to start"); }
-        });
-    }
-
-    function renderAccept(el, them, mh, cid) {
-        el.textContent = ""; el._isDecrypted = true;
-        const box = document.createElement("div");
-        Object.assign(box.style, {
-            border: `1px solid ${P.ac}`, padding: "14px 18px", borderRadius: "12px",
-            background: P.card, display: "inline-block", fontFamily: "inherit", margin: "4px 0", maxWidth: "320px",
-        });
-        box.innerHTML = `<strong style="color:${P.ac};display:block;margin-bottom:6px;font-size:14px">🛡️ Secure Bridge Request</strong>
-                         <span style="font-size:12px;color:${P.txD};display:block;margin-bottom:10px;line-height:1.4">Your friend wants End-to-End Encryption.</span>`;
-
-        const b = document.createElement("button"); b.textContent = "Accept & Connect";
-        Object.assign(b.style, {
-            background: P.ac, color: P.bg, border: "none", padding: "8px 16px", borderRadius: "8px",
-            cursor: "pointer", fontWeight: "bold", fontSize: "13px", transition: "opacity .15s",
-        });
-        b.onmouseenter = () => b.style.opacity = ".85"; b.onmouseleave = () => b.style.opacity = "1";
-        b.onclick = async e => {
-            e.preventDefault(); e.stopPropagation(); b.disabled = true; b.textContent = "⏳ Connecting…"; b.style.opacity = ".6";
-            try {
-                await hsLock(async () => {
-                    const pair = await hsPair(), myPub = await hsPubRaw(pair.publicKey);
-                    const key = await hsDerive(pair.privateKey, them);
-                    setS({ enabled: true, customKey: key }); syncVis();
-
-                    const rp = new Uint8Array(1 + 4 + myPub.length); rp[0] = CFG.HS_RES; rp.set(tsB(), 1); rp.set(myPub, 5);
-                    const rb = toB64(rp);
-                    mHash(cid, mh); mHash(cid, cH(rb));
-
-                    await sendRaw(CFG.PFX_H + rb);
-                    vizHs(el, "✅ Bridge Accepted"); toast("🛡️ Fingerprint: " + fp(), 6000);
-                });
-            } catch (err) { console.error("[BB] Accept Error:", err); b.disabled = false; b.textContent = "Retry"; b.style.opacity = "1"; }
-        };
-        box.appendChild(b); el.appendChild(box); el.style.display = "block";
-    }
-
-    async function handleHs(b64raw, el) {
-        const cid = getChatId(), mh = cH(b64raw);
-        if (isH(cid, mh)) { vizHs(el, "🤝 Processed"); return; }
-        return hsLock(async () => {
-            if (isH(cid, mh)) { vizHs(el, "🤝 Processed"); return; }
-            try {
-                const raw = decodeB64Smart(b64raw);
-                if (!raw) {
-                    console.error("[BB] HS decode returned null for:", b64raw);
-                    mHash(cid, mh); vizHs(el, "❌ Decode Error"); return;
-                }
-
-                console.debug("[BB] HS decoded bytes:", raw.length, "hex:", Array.from(raw.slice(0, 10)).map(x => x.toString(16).padStart(2, '0')).join(' '));
-
-                // type(1) + timestamp(4) + pubkey(min 33 compressed, 65 uncompressed)
-                // Minimum valid = 1 + 4 + 33 = 38 bytes
-                if (raw.length < 38) {
-                    console.error("[BB] HS too short:", raw.length, "bytes");
-                    mHash(cid, mh); vizHs(el, "❌ Malformed (" + raw.length + "b)"); return;
-                }
-
-                const type = raw[0], ts = rdTs(raw.subarray(1, 5)), them = raw.subarray(5);
-                const now = (Date.now() / 1000) | 0;
-                const age = now - ts;
-
-                console.debug("[BB] HS type:", type, "ts:", ts, "now:", now, "age:", age, "s, pubkey:", them.length, "bytes");
-
-                // Validate type field
-                if (type !== CFG.HS_REQ && type !== CFG.HS_RES) {
-                    mHash(cid, mh); vizHs(el, "❌ Unknown type"); return;
-                }
-
-                // Validate timestamp — generous ±10 min window
-                if (Math.abs(age) > CFG.HS_EXP) {
-                    mHash(cid, mh); vizHs(el, "⌛ Expired (" + age + "s ago)"); return;
-                }
-
-                // Validate public key length (P-256: 65 uncompressed or 33 compressed)
-                if (them.length !== 65 && them.length !== 33) {
-                    console.error("[BB] HS invalid pubkey length:", them.length);
-                    mHash(cid, mh); vizHs(el, "❌ Bad key (" + them.length + "b)"); return;
-                }
-
-                if (type === CFG.HS_REQ) {
-                    if (!el._hsBound) { renderAccept(el, them, mh, cid); el._hsBound = true; }
-                }
-                else if (type === CFG.HS_RES) {
-                    const ps = _hsState.get(cid);
-                    if (!ps) { mHash(cid, mh); vizHs(el, "❌ Orphaned"); return; }
-
-                    const pk = await crypto.subtle.importKey("jwk", ps,
-                        { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-                    const key = await hsDerive(pk, them);
-                    _hsState.delete(cid);
-
-                    setS({ enabled: true, customKey: key }); syncVis(); mHash(cid, mh);
-                    vizHs(el, "✅ Bridge Complete"); toast("🛡️ Code: " + fp(), 6000);
-                    setTimeout(async () => {
-                        try { const f = fp(), ch = await encChunk(`✅ Bridge Established!\n🛡️ Both must see:\n# ${f}\nDifferent = intercepted.`); if (ch) for (const c of ch) await sendRaw(c); } catch (_) {}
-                    }, 800);
-                }
-            } catch (e) {
-                console.error("[BB] Handshake Error:", e, "input:", b64raw);
-                vizHs(el, "❌ Failed");
-            }
-        });
-    }
-
-    // ── Renderer ──────────────────────────────────────────────────────────────
     const _esc = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     const esc = s => s.replace(/[&<>"']/g, c => _esc[c]);
     function safeUrl(u) { try { const p = new URL(u); if (p.protocol === "http:" || p.protocol === "https:") return esc(p.href); } catch (_) {} return "#"; }
@@ -519,7 +506,47 @@
 
     document.addEventListener("click", e => { const s = e.target.closest(".bb-spoiler"); if (s) { s.style.color = "inherit"; s.style.background = P.bdr; } }, true);
 
-    // ── Scan & Auto-Decrypt ───────────────────────────────────────────────────
+    const _taSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    const isMob = el => el?.tagName === "TEXTAREA";
+
+    const getReal = () => {
+        const e1 = document.getElementById("editable-message-text");
+        const e2 = document.getElementById("main-message-input");
+        if (e1 && e1.getBoundingClientRect().height > 0) return e1;
+        if (e2 && e2.getBoundingClientRect().height > 0) return e2;
+        return e1 || e2;
+    };
+
+    async function sendRaw(text) {
+        const real = getReal(); if (!real) return;
+        const mob = isMob(real), ws = isSyncing; isSyncing = true;
+        unlockI(real);
+        try {
+            real.focus();
+            if (mob) { _taSet?.call(real, text); real.dispatchEvent(new Event("input", { bubbles: true })); }
+            else { real.innerHTML = text; real.dispatchEvent(new Event("input", { bubbles: true })); }
+        } catch (e) { if (!mob) { real.innerText = text; real.dispatchEvent(new Event("input", { bubbles: true })); } }
+        await new Promise(r => setTimeout(r, CFG.SEND_DLY));
+        const btn = document.querySelector('[aria-label="send-button"]') || document.querySelector('.RaTWwR');
+        let sent = false;
+        if (btn) {
+            const rk = Object.keys(btn).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+            try {
+                let node = btn[rk];
+                while (node && !node.onClick && !node.memoizedProps?.onClick) { node = node.return; }
+                let clickFn = node?.memoizedProps?.onClick || node?.onClick || btn[rk]?.onClick;
+                if (typeof clickFn === 'function') { clickFn({ preventDefault() {}, stopPropagation() {} }); sent = true; }
+            } catch (_) {}
+            if (!sent) { btn.click(); sent = true; }
+        }
+        if (!sent) real.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter", keyCode: 13 }));
+        await new Promise(r => setTimeout(r, CFG.POST_DLY));
+        if (mob) { _taSet?.call(real, ""); real.dispatchEvent(new Event("input", { bubbles: true })); }
+        else { real.innerHTML = ""; real.dispatchEvent(new Event("input", { bubbles: true })); }
+        if (encOn()) lockI(real);
+        isSyncing = ws;
+    }
+
     const SKIP = new Set(["secure-input-overlay", "secure-edit-overlay", "editable-message-text", "main-message-input", "bb-no-key-notice", "bale-bridge-menu", "bb-modal-overlay"]);
     const _infly = new WeakSet();
 
@@ -531,37 +558,28 @@
         const els = root.querySelectorAll('span, div, p');
         for (const el of els) {
             if (el._isDecrypted || _infly.has(el) || SKIP.has(el.id)) continue;
-
             let tc = el.textContent;
-            if (!tc || tc.length <= 20) continue;
-
+            if (!tc || tc.length <= 10) continue;
             const cleanTc = stripInvisibles(tc);
 
-            if (cleanTc.includes("!!") || cleanTc.includes("@@")) {
+            const hsIdx = cleanTc.indexOf(CFG.PFX_H);
+            if (hsIdx !== -1) {
                 let hasMatchingChild = false;
-                for (const c of el.children) {
-                    const childClean = stripInvisibles(c.textContent || '');
-                    if (childClean.includes("!!") || childClean.includes("@@")) {
-                        hasMatchingChild = true; break;
-                    }
-                }
+                for (const c of el.children) if (stripInvisibles(c.textContent || '').includes(CFG.PFX_H)) { hasMatchingChild = true; break; }
                 if (hasMatchingChild) continue;
-
-                // Handle Handshakes
-                const hsIdx = cleanTc.indexOf("!!");
-                if (hsIdx !== -1) {
-                    const afterPrefix = cleanTc.slice(hsIdx + 2);
-                    // Keep only URL-safe base64 chars (A-Z a-z 0-9 - _ ) and legacy (+ / = .)
-                    const cleanPayload = afterPrefix.replace(/[^A-Za-z0-9\-_+/.=]/g, '');
-                    if (cleanPayload.length >= 40) {
-                        el._isDecrypted = true;
-                        handleHs(cleanPayload, el).catch(console.error);
-                    }
+                const raw = cleanTc.slice(hsIdx + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g, '');
+                if (raw.length > 50) {
+                    _infly.add(el);
+                    hsLock(() => handleHandshake(raw, el).catch(console.error)).finally(() => _infly.delete(el));
                     continue;
                 }
+            }
 
-                // Handle Messages
-                const encIdx = cleanTc.indexOf("@@");
+            if (cleanTc.includes(CFG.PFX_E)) {
+                let hasMatchingChild = false;
+                for (const c of el.children) if (stripInvisibles(c.textContent || '').includes(CFG.PFX_E)) { hasMatchingChild = true; break; }
+                if (hasMatchingChild) continue;
+                const encIdx = cleanTc.indexOf(CFG.PFX_E);
                 if (encIdx !== -1) {
                     const raw = cleanTc.slice(encIdx);
                     _infly.add(el);
@@ -573,20 +591,18 @@
                             }
                             el.innerHTML = renderDec(plain) + `<span class="bb-enc-badge">🔒 encrypted <span class="bb-copy-btn" title="Copy">📋</span></span>`;
                             el.style.color = "inherit"; el._isDecrypted = true;
-
                             const cb = el.querySelector(".bb-copy-btn");
                             if (cb) cb.onclick = ev => {
                                 ev.preventDefault(); ev.stopPropagation();
                                 navigator.clipboard.writeText(plain).then(() => { cb.textContent = "✅"; setTimeout(() => cb.textContent = "📋", 1200); }).catch(() => {});
                             };
                         }
-                    }).catch(()=>{}).finally(() => _infly.delete(el));
+                    }).catch(() => {}).finally(() => _infly.delete(el));
                 }
             }
         }
     }
 
-    // ── Styles ─────────────────────────────────────────────────────────────────
     const sty = document.createElement("style");
     sty.textContent = `
 #secure-input-overlay{width:100%;box-sizing:border-box;min-height:42px;max-height:150px;overflow-y:auto;background:${P.srf};border:1.5px solid ${P.ac};border-radius:14px;padding:10px 16px;font-family:inherit;font-size:inherit;outline:none;white-space:pre-wrap;word-break:break-word;margin-right:10px;resize:none;color:${P.tx};z-index:100;position:relative;transition:border-color .15s;display:block}
@@ -615,7 +631,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
 .bb-key-tools{display:flex;gap:7px;margin-top:9px}
 .bb-tool-btn{flex:1;padding:7px 0;border-radius:8px;border:1px solid ${P.bdr};background:${P.srf};cursor:pointer;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px;transition:border-color .15s,color .15s;color:${P.tx}}
 .bb-tool-btn:hover{border-color:${P.ac};color:${P.ac}}
-.bb-tool-btn.bridge{border-color:${P.ac};color:${P.ac}}
 .bb-toggle-lbl{display:flex;align-items:center;gap:9px;font-size:14px;cursor:pointer}
 .bb-toggle-lbl input[type="checkbox"]{width:16px;height:16px;accent-color:${P.ac};cursor:pointer}
 .bb-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:22px}
@@ -655,10 +670,16 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
 .BAsWs0 .bb-copy-btn,.MRlMpm .bb-copy-btn,.dialog-item-content .bb-copy-btn,.aqFHpt .bb-copy-btn{display:none!important}
 .BAsWs0 .bb-li::after,.MRlMpm .bb-li::after,.dialog-item-content .bb-li::after,.aqFHpt .bb-li::after{content:" \\00a0•\\00a0 "}
 .BAsWs0 .bb-msg-container,.MRlMpm .bb-msg-container,.dialog-item-content .bb-msg-container,.aqFHpt .bb-msg-container{display:-webkit-box!important;-webkit-line-clamp:2!important;-webkit-box-orient:vertical!important;white-space:normal!important}
+.bb-hs-widget{border-radius:10px;padding:12px;margin:6px 0;font-family:inherit;font-size:13px;line-height:1.4;transition:border-color .15s}
+.bb-hs-title{display:block;font-weight:700;margin-bottom:6px;font-size:14px;display:flex;align-items:center;gap:6px}
+.bb-hs-fp{font-family:monospace;font-size:11.5px;margin-bottom:4px;font-weight:600}
+.bb-hs-btn{display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;transition:opacity .15s,transform .1s;margin-top:8px;font-size:13px}
+.bb-hs-btn:active{transform:scale(.97)}
+.bb-hs-btn:hover{opacity:.85}
+.bb-hs-btn:disabled{opacity:.6;cursor:not-allowed;transform:none}
 `;
     document.head.appendChild(sty);
 
-    // ── Menu ──────────────────────────────────────────────────────────────────
     const menu = document.createElement("div"); menu.id = "bale-bridge-menu";
     const m1 = document.createElement("div"); m1.className = "bale-menu-item"; m1.textContent = "🔒 Send Encrypted";
     m1.onclick = () => { menu.style.display = "none"; window._bbSend?.(true); };
@@ -668,7 +689,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
     const showMenu = (x, y) => Object.assign(menu.style, { display: "flex", left: Math.min(x, innerWidth - 210) + "px", top: Math.min(y, innerHeight - 130) + "px" });
     document.addEventListener("click", e => { if (!menu.contains(e.target)) menu.style.display = "none"; });
 
-    // ── Settings Modal ────────────────────────────────────────────────────────
     function openSettings() {
         document.getElementById("bb-modal-overlay")?.remove();
         const s = getS(), fv = s.enabled && s.customKey?.length === CFG.KEY_LEN ? s.customKey.substring(0, 5).toUpperCase() : "N/A";
@@ -690,8 +710,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         krow.appendChild(kinp); krow.appendChild(vb); krow.appendChild(cpb);
         const kt = document.createElement("div"); kt.className = "bb-key-tools";
         const gb = document.createElement("button"); gb.className = "bb-tool-btn"; gb.textContent = "⚡ Random Key";
-        const hb = document.createElement("button"); hb.className = "bb-tool-btn bridge"; hb.textContent = "🤝 Auto Bridge";
-        kt.appendChild(gb); kt.appendChild(hb);
+        kt.appendChild(gb);
         const km = document.createElement("div"); km.className = "bb-key-meta"; km.style.marginTop = "8px";
         const errEl = document.createElement("span"); errEl.className = "bb-key-error";
         const fpW = document.createElement("span"); fpW.style.cssText = `font-size:11px;color:${P.txD}`;
@@ -699,33 +718,65 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         const fpEl = document.createElement("strong"); fpEl.style.cssText = `font-family:monospace;color:${P.ac}`; fpEl.textContent = fv;
         fpW.appendChild(fpEl); km.appendChild(errEl); km.appendChild(fpW);
         ksec.appendChild(klbl); ksec.appendChild(krow); ksec.appendChild(kt); ksec.appendChild(km);
+
+        const bridgeSec = document.createElement("div"); bridgeSec.className = "bb-section-divider";
+        const bTitle = document.createElement("div"); Object.assign(bTitle.style, { fontSize: "14px", fontWeight: "700", marginBottom: "4px" }); bTitle.textContent = "🤝 Automatic Key Exchange";
+        const bDesc = document.createElement("div"); Object.assign(bDesc.style, { fontSize: "12px", color: P.txD, marginBottom: "10px" }); bDesc.textContent = "Establish encryption automatically with your contact.";
+        const bBtn = document.createElement("button"); bBtn.className = "bb-tool-btn"; bBtn.style.width = "100%"; bBtn.style.marginTop = "8px"; bBtn.textContent = "Loading...";
+        bridgeSec.appendChild(bTitle); bridgeSec.appendChild(bDesc); bridgeSec.appendChild(bBtn);
+
         const acts = document.createElement("div"); acts.className = "bb-actions";
         const canB = document.createElement("button"); canB.className = "bb-btn bb-btn-cancel"; canB.textContent = "Cancel";
         const savB = document.createElement("button"); savB.className = "bb-btn bb-btn-save"; savB.textContent = "Save";
         acts.appendChild(canB); acts.appendChild(savB);
-        cd.appendChild(t); cd.appendChild(d); cd.appendChild(elbl); cd.appendChild(ksec); cd.appendChild(acts);
+        cd.appendChild(t); cd.appendChild(d); cd.appendChild(elbl); cd.appendChild(ksec); cd.appendChild(bridgeSec); cd.appendChild(acts);
         ov.appendChild(cd); document.body.appendChild(ov);
 
         const validate = () => {
             const v = kinp.value, l = v.length, on = ecb.checked;
-            ksec.style.display = on ? "" : "none";
+            ksec.style.display = on ? "" : "none"; bridgeSec.style.display = on ? "" : "none";
             fpEl.textContent = l === CFG.KEY_LEN ? v.substring(0, 5).toUpperCase() : "N/A";
             if (!on) { errEl.textContent = ""; savB.disabled = false; return; }
             if (!l) { errEl.textContent = "Key required."; savB.disabled = true; }
             else if (l !== CFG.KEY_LEN) { errEl.textContent = `Need ${CFG.KEY_LEN} chars (${l}).`; savB.disabled = true; }
             else { errEl.textContent = ""; savB.disabled = false; }
         };
-        kinp.oninput = validate; ecb.onchange = validate; validate();
+
+        const updateBridgeUI = async () => {
+            try {
+                const hsList = await dbOp("handshakes", "getAll");
+                const activeHs = hsList.find(h => h.chatId === getChatId() && h.stage !== "confirmed" && (Date.now() - h.createdAt < CFG.HS_EXP * 1000));
+                if (activeHs) {
+                    bBtn.textContent = "🔄 Waiting for response... (Cancel)";
+                    bBtn.style.color = P.wrn; bBtn.style.borderColor = P.wrn;
+                    bBtn.onclick = async () => { await dbOp("handshakes", "del", activeHs.nonce); updateBridgeUI(); };
+                } else {
+                    const confHs = hsList.find(h => h.chatId === getChatId() && h.stage === "confirmed" && h.derivedKey === kinp.value);
+                    if (confHs && kinp.value.length === CFG.KEY_LEN) {
+                        bBtn.textContent = "✅ Connected via Bridge (Re-key)";
+                        bBtn.style.color = P.ac; bBtn.style.borderColor = P.ac;
+                    } else {
+                        bBtn.textContent = "🤝 Start Bridge";
+                        bBtn.style.color = P.tx; bBtn.style.borderColor = P.bdr;
+                    }
+                    bBtn.onclick = async () => {
+                        ov.remove();
+                        try { await startBridge(); } catch (e) { toast("Bridge error: " + e.message); }
+                    };
+                }
+            } catch(e) { bBtn.textContent = "Bridge unavailable"; bBtn.disabled = true; }
+        };
+        updateBridgeUI();
+
+        kinp.oninput = () => { validate(); updateBridgeUI(); }; ecb.onchange = validate; validate();
         vb.onclick = () => { const h = kinp.type === "password"; kinp.type = h ? "text" : "password"; vb.textContent = h ? "🙈" : "👁"; };
         cpb.onclick = () => { if (!kinp.value) return; navigator.clipboard.writeText(kinp.value).then(() => { cpb.textContent = "✅"; cpb.classList.add("copied"); setTimeout(() => { cpb.textContent = "📋"; cpb.classList.remove("copied"); }, 1200); }).catch(() => {}); };
-        gb.onclick = () => { kinp.value = genKey(); kinp.type = "text"; vb.textContent = "🙈"; validate(); };
-        hb.onclick = () => { ov.remove(); startHs(); };
+        gb.onclick = () => { kinp.value = genKey(); kinp.type = "text"; vb.textContent = "🙈"; validate(); updateBridgeUI(); };
         canB.onclick = () => ov.remove();
         savB.onclick = () => { if (savB.disabled) return; try { setS({ enabled: ecb.checked, customKey: kinp.value }); } catch (e) { toast("Error: " + e.message); return; } ov.remove(); syncVis(); };
         ov.onclick = e => { if (e.target === ov) ov.remove(); };
     }
 
-    // ── Input System ──────────────────────────────────────────────────────────
     let isSending = false, lastHasText = false, isSyncing = false;
     const lockI = el => Object.assign(el.style, { position: "absolute", opacity: "0", pointerEvents: "none", height: "0", width: "0", overflow: "hidden", zIndex: "-9999" });
     const unlockI = el => { el.style.position = ""; el.style.opacity = "1"; el.style.pointerEvents = "auto"; el.style.height = ""; el.style.width = "100%"; el.style.overflow = "auto"; el.style.zIndex = ""; };
@@ -794,13 +845,8 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
 
         const syncH = has => {
             if (has === lastHasText) return; lastHasText = has; isSyncing = true;
-            if (mob) {
-                _taSet?.call(ri, has ? " " : "");
-                ri.dispatchEvent(new Event("input", { bubbles: true }));
-            } else {
-                ri.innerHTML = has ? " " : "";
-                ri.dispatchEvent(new Event("input", { bubbles: true }));
-            }
+            if (mob) { _taSet?.call(ri, has ? " " : ""); ri.dispatchEvent(new Event("input", { bubbles: true })); }
+            else { ri.innerHTML = has ? " " : ""; ri.dispatchEvent(new Event("input", { bubbles: true })); }
             isSyncing = false;
         };
 
@@ -827,7 +873,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         syncVis();
     }
 
-    // ── Edit/Caption ──────────────────────────────────────────────────────────
     function ensureEdit() {
         const real = document.querySelector('textarea[aria-label="File Description"]');
         if (!real || real._bbE) return; real._bbE = true;
@@ -874,7 +919,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         se.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.stopPropagation(); const b = document.querySelector('[data-testid="confirm-button"]') || document.querySelector('button[aria-label="Send"]:not(#chat_footer button)'); if (b) encFwd(b); } });
     }
 
-    // ── Send Button Intercept ─────────────────────────────────────────────────
     const secTxt = () => { const s = document.getElementById("secure-input-overlay"); return s ? (s.tagName === "TEXTAREA" ? s.value.trim() : s.innerText.trim()) : ""; };
     const isSnB = t => !!(t.closest('[aria-label="send-button"]') || t.closest('.RaTWwR'));
 
@@ -910,7 +954,6 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY);
     }, true);
 
-    // ── Observer ──────────────────────────────────────────────────────────────
     let _dirty = false, _raf = 0, lastUrl = location.href;
     function tick() {
         _raf = 0; _dirty = false;
@@ -923,5 +966,15 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         if (!_dirty) { _dirty = true; if (_raf) cancelAnimationFrame(_raf); _raf = requestAnimationFrame(tick); }
     }).observe(document.body, { childList: true, subtree: true, characterData: true });
 
-    try { scan(document.body); ensureInput(); ensureEdit(); } catch (e) { console.error("[BB] init", e); }
+    function cleanupHs() {
+        dbOp("handshakes", "getAll").then(hs => {
+            const now = Date.now();
+            hs.forEach(h => { if (h.stage !== "confirmed" && (now - h.createdAt) > CFG.HS_CLEANUP_INTERVAL) dbOp("handshakes", "del", h.nonce); });
+        }).catch(() => {});
+    }
+
+    try {
+        scan(document.body); ensureInput(); ensureEdit();
+        setTimeout(cleanupHs, 2000); setInterval(cleanupHs, CFG.HS_CLEANUP_INTERVAL);
+    } catch (e) { console.error("[BB] init", e); }
 })();
