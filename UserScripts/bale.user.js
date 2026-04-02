@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor (Secure & Anti-XSS)
 // @namespace    http://tampermonkey.net/
-// @version      16.0
-// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge.
+// @version      16.1
+// @description  Fast dark UI, Invisible Char Immunity, Anti-XSS, Auto ECDH Bridge (No-Expiry Fix).
 // @author       You
 // @match        *://web.bale.ai/*
 // @match        *://*.bale.ai/*
@@ -20,7 +20,8 @@
         CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
         B85: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
         PFX_E: "@@", PFX_E2: "@@+",
-        PFX_H: "!!", HS_EXP: 600, HS_CLEANUP_INTERVAL: 600000
+        // HS_EXP expanded to 24 hours for UI states, cleanup expanded to 24 hours
+        PFX_H: "!!", HS_EXP: 86400, HS_CLEANUP_INTERVAL: 86400000
     });
 
     const P = Object.freeze({
@@ -197,22 +198,26 @@
             return await S.verify({name: "ECDSA", hash: "SHA-256"}, p, sig, buf);
         } catch(e) { return false; }
     }
-    async function deriveSymmetric(ephPrivJwk, theirEphPubRaw) {
-        const myPriv = await S.importKey("jwk", ephPrivJwk, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+    async function deriveSymmetric(myEphPrivJwk, theirEphPubRaw, nonce, initIdPub, respIdPub, initEphPub, respEphPub) {
+        const myPriv = await S.importKey("jwk", myEphPrivJwk, {name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
         const theirPub = await S.importKey("raw", theirEphPubRaw, {name: "ECDH", namedCurve: "P-256"}, true, []);
         const shared = await S.deriveBits({name: "ECDH", public: theirPub}, myPriv, 256);
         const hkdfKey = await S.importKey("raw", shared, {name: "HKDF"}, false, ["deriveBits"]);
+        const infoStr = new TextEncoder().encode("aes-session-key");
+        const info = concatBytes(infoStr, nonce, initIdPub, respIdPub, initEphPub, respEphPub);
         const material = new Uint8Array(await S.deriveBits({
             name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("bale-bridge-v16"),
-            info: new TextEncoder().encode("aes-session-key")
-        }, hkdfKey, 256 * 8));
+            info: info
+        }, hkdfKey, 96 * 8));
+        const keyMat = material.subarray(0, 64);
+        const hmacMat = material.subarray(64, 96);
         const c = CFG.CHARS, cl = c.length, mx = (cl * Math.floor(256 / cl)) | 0, r = [];
         let f = 0;
-        for (let i = 0; i < material.length && f < CFG.KEY_LEN; i++) {
-            if (material[i] < mx) r[f++] = c[material[i] % cl];
+        for (let i = 0; i < keyMat.length && f < CFG.KEY_LEN; i++) {
+            if (keyMat[i] < mx) r[f++] = c[keyMat[i] % cl];
         }
-        if (f < CFG.KEY_LEN) throw new Error("Derivation exhaustion");
-        return r.join('');
+        if (f < CFG.KEY_LEN) throw new Error();
+        return { sessionKey: r.join(''), hmacKeyBytes: hmacMat };
     }
 
     let _db, _memDB = { identity: {}, contacts: {}, handshakes: {} }, _useMem = false;
@@ -234,7 +239,7 @@
     async function dbOp(s, o, v) {
         try {
             const d = await getDB();
-            if (!d) throw new Error("Mem");
+            if (!d) throw new Error();
             return new Promise((res, rej) => {
                 const tx = d.transaction(s, o === "get" || o === "getAll" ? "readonly" : "readwrite");
                 const st = tx.objectStore(s);
@@ -319,11 +324,12 @@
         const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
         const nonce = crypto.getRandomValues(new Uint8Array(16));
         const ts = Math.floor(Date.now() / 1000);
-        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
+        // Safely extract bytes ensuring no overflow issues down the line
+        const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 1]), nonce, tsBuf, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        await dbOp("handshakes", "put", { nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", ephPrivJwk, ephPubRaw, theirIdentityKey: null, createdAt: Date.now(), payloadHash: await digest(payload) });
+        await dbOp("handshakes", "put", { nonce: toHex(nonce), chatId: getChatId(), role: "initiator", stage: "invited", ephPrivJwk, ephPubRaw, initIdPub: id.pubRaw, theirIdentityKey: null, createdAt: Date.now(), payloadHash: await digest(payload) });
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
         toast("Bridge invite sent!");
         syncVis();
@@ -334,31 +340,33 @@
         const eph = await S.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
         const ephPubRaw = new Uint8Array(await S.exportKey("raw", eph.publicKey));
         const ephPrivJwk = await S.exportKey("jwk", eph.privateKey);
-        const derivedKey = await deriveSymmetric(ephPrivJwk, data.theirEphPubRaw);
+        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(ephPrivJwk, data.theirEphPubRaw, data.nonce, data.theirIdPubRaw, id.pubRaw, data.theirEphPubRaw, ephPubRaw);
         const ts = Math.floor(Date.now() / 1000);
-        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
+        const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
         const payload = concatBytes(new Uint8Array([1, 2]), data.nonce, tsBuf, data.payloadHash, id.pubRaw, ephPubRaw);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        await dbOp("handshakes", "put", { nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", derivedKey, theirIdentityKey: data.theirIdPubRaw, createdAt: Date.now() });
+        await dbOp("handshakes", "put", { nonce: toHex(data.nonce), chatId: getChatId(), role: "responder", stage: "accepted", derivedKey: sessionKey, hmacKeyBytes: Array.from(hmacKeyBytes), theirIdentityKey: data.theirIdPubRaw, createdAt: Date.now() });
         renderHS(el, "🔄 Bridge accepted — waiting for confirmation", "wrn");
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
     }
 
     async function processAccept(data, hs, el) {
-        const derivedKey = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw);
-        const hmacKey = await S.importKey("raw", new TextEncoder().encode(derivedKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, new TextEncoder().encode("bale-bridge-confirm")));
         const id = await getMyId();
+        const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const { sessionKey, hmacKeyBytes } = await deriveSymmetric(hs.ephPrivJwk, data.theirEphPubRaw, hsNonceBuf, hs.initIdPub, data.theirIdPubRaw, hs.ephPubRaw, data.theirEphPubRaw);
+        const hmacKey = await S.importKey("raw", new Uint8Array(hmacKeyBytes), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
+        const hmacVal = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
         const ts = Math.floor(Date.now() / 1000);
-        const tsBuf = new Uint8Array([(ts >> 24) & 255, (ts >> 16) & 255, (ts >> 8) & 255, ts & 255]);
-        const payload = concatBytes(new Uint8Array([1, 3]), data.nonce, tsBuf, hmacVal);
+        const tsBuf = new Uint8Array([(ts >>> 24) & 255, (ts >>> 16) & 255, (ts >>> 8) & 255, ts & 255]);
+        const payload = concatBytes(new Uint8Array([1, 3]), hsNonceBuf, tsBuf, hmacVal);
         const sig = await ecSign(id.priv, payload);
         const finalMsg = concatBytes(payload, sig);
-        setS({ enabled: true, customKey: derivedKey });
+        setS({ enabled: true, customKey: sessionKey });
         await dbOp("contacts", "put", { id: data.cid, chatId: getChatId(), publicKey: data.theirIdPubRaw, lastSeen: Date.now() });
-        await dbOp("handshakes", "put", { ...hs, stage: "confirmed", derivedKey });
         delete hs.ephPrivJwk;
+        await dbOp("handshakes", "put", { ...hs, stage: "confirmed", derivedKey: sessionKey });
         syncVis();
         await sendRaw(CFG.PFX_H + " " + toB64(finalMsg));
         renderHS(el, "✅ Bridge established", "ac");
@@ -369,12 +377,16 @@
     }
 
     async function processConfirm(data, hs, el) {
-        const hmacKey = await S.importKey("raw", new TextEncoder().encode(hs.derivedKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-        const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, new TextEncoder().encode("bale-bridge-confirm")));
-        if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error("HMAC mismatch");
+        const hmacKeyBytes = new Uint8Array(hs.hmacKeyBytes);
+        const hmacKey = await S.importKey("raw", hmacKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const hsNonceBuf = new Uint8Array(hs.nonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const hmacData = concatBytes(new TextEncoder().encode("bale-bridge-confirm"), hsNonceBuf);
+        const expectedHmac = new Uint8Array(await S.sign("HMAC", hmacKey, hmacData));
+        if (toHex(data.hmac) !== toHex(expectedHmac)) throw new Error();
         setS({ enabled: true, customKey: hs.derivedKey });
         const fpInfo = await getTrustInfo(hs.theirIdentityKey, getChatId());
         await dbOp("contacts", "put", { id: fpInfo.cid, chatId: getChatId(), publicKey: hs.theirIdentityKey, lastSeen: Date.now() });
+        delete hs.hmacKeyBytes;
         await dbOp("handshakes", "put", { ...hs, stage: "confirmed" });
         syncVis();
         renderHS(el, "✅ Bridge established", "ac");
@@ -385,19 +397,25 @@
         el._isDecrypted = true;
         try {
             const bytes = decodeB64Smart(b64);
-            if (!bytes || bytes.length < 50) throw new Error("Decode failed");
+            if (!bytes || bytes.length < 118) throw new Error();
             const ver = bytes[0], type = bytes[1];
-            if (ver !== 1) throw new Error("Unknown version");
+            if (ver !== 1) throw new Error();
+
             const nonce = bytes.subarray(2, 18), hexNonce = toHex(nonce);
-            const ts = (bytes[18] << 24) | (bytes[19] << 16) | (bytes[20] << 8) | bytes[21];
-            if (Math.abs(Date.now() / 1000 - ts) > CFG.HS_EXP) return renderHS(el, "⌛ Expired", "wrn");
+
+            // =========================================================================
+            // TIME EXPIRATION CHECK HAS BEEN COMPLETELY REMOVED HERE
+            // Replay protection/abuse prevention now relies solely on IDB Nonce tracking
+            // =========================================================================
+
             const myId = await getMyId();
             const hs = await dbOp("handshakes", "get", hexNonce);
 
             if (type === 1) {
+                if (bytes.length !== 216) throw new Error();
+                const payload = bytes.subarray(0, 152), sig = bytes.subarray(152, 216);
                 const idPubRaw = bytes.subarray(22, 87), ephPubRaw = bytes.subarray(87, 152);
-                const payload = bytes.subarray(0, 152), sig = bytes.subarray(152);
-                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Sig fail");
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error();
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge invite sent", "txM");
                 if (hs) {
                     if (hs.stage === "accepted") return renderHS(el, "🔄 Waiting for confirmation", "wrn");
@@ -405,25 +423,33 @@
                     return renderHS(el, "🤝 Processed", "txM");
                 }
                 const trust = await getTrustInfo(idPubRaw, getChatId());
+                const hsList = await dbOp("handshakes", "getAll");
+                const activeOut = hsList.find(h => h.chatId === getChatId() && h.role === "initiator" && h.stage === "invited");
+                if (activeOut) {
+                    if (myId.fp < trust.fp) return renderHS(el, "🤝 Collision avoided (You are initiator)", "txM");
+                    else if (myId.fp > trust.fp) await dbOp("handshakes", "del", activeOut.nonce);
+                    else throw new Error();
+                }
                 let tStr = trust.state === "new" ? "🆕 New contact" : (trust.state === "known" ? "✅ Known contact" : `⚠️ IDENTITY CHANGED — old: ${trust.oldFp}, new: ${trust.fp}`);
                 renderHS(el, "🛡️ Secure Bridge Request", "ac", trust.fp, tStr, async () => {
-                    try { await acceptBridge({ nonce, ts, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                    try { await acceptBridge({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, payloadHash: await digest(payload) }, el); }
+                    catch (e) { renderHS(el, "❌ Error", "err"); }
                 });
             } else if (type === 2) {
-                const hash = bytes.subarray(22, 54), idPubRaw = bytes.subarray(54, 119), ephPubRaw = bytes.subarray(119, 184);
-                const payload = bytes.subarray(0, 184), sig = bytes.subarray(184);
-                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error("Sig fail");
+                if (bytes.length !== 248) throw new Error();
+                const payload = bytes.subarray(0, 184), sig = bytes.subarray(184, 248);
+                const inviteHash = bytes.subarray(22, 54), idPubRaw = bytes.subarray(54, 119), ephPubRaw = bytes.subarray(119, 184);
+                if (!await ecVerify(idPubRaw, sig, payload)) throw new Error();
                 if (toHex(idPubRaw) === toHex(myId.pubRaw)) return renderHS(el, "🔄 Bridge accept sent", "txM");
                 if (!hs || hs.role !== "initiator" || hs.stage !== "invited") {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     return renderHS(el, "🤝 Processed", "txM");
                 }
-                if (toHex(hash) !== toHex(hs.payloadHash)) throw new Error("Bind fail");
+                if (toHex(inviteHash) !== toHex(hs.payloadHash)) throw new Error();
                 const trust = await getTrustInfo(idPubRaw, getChatId());
                 const doAccept = async () => {
                     try { await processAccept({ nonce, theirIdPubRaw: idPubRaw, theirEphPubRaw: ephPubRaw, fp: trust.fp, cid: trust.cid }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                    catch (e) { renderHS(el, "❌ Error", "err"); }
                 };
                 if (trust.state === "changed") {
                     renderHS(el, "⚠️ Identity Changed During Bridge!", "err", trust.fp, `Old: ${trust.oldFp}, New: ${trust.fp}`, doAccept, "Acknowledge & Connect");
@@ -432,17 +458,19 @@
                     await doAccept();
                 }
             } else if (type === 3) {
-                const hmac = bytes.subarray(22, 54), payload = bytes.subarray(0, 54), sig = bytes.subarray(54);
+                if (bytes.length !== 118) throw new Error();
+                const payload = bytes.subarray(0, 54), sig = bytes.subarray(54, 118);
+                const hmac = bytes.subarray(22, 54);
                 if (hs && hs.role === "responder" && hs.stage === "accepted") {
-                    if (!await ecVerify(hs.theirIdentityKey, sig, payload)) throw new Error("Sig fail");
+                    if (!await ecVerify(hs.theirIdentityKey, sig, payload)) throw new Error();
                     try { await processConfirm({ hmac }, hs, el); }
-                    catch (e) { renderHS(el, "❌ Error: " + e.message, "err"); }
+                    catch (e) { renderHS(el, "❌ Error", "err"); }
                 } else {
                     if (hs && hs.stage === "confirmed") return renderHS(el, "✅ Bridge established", "ac");
                     renderHS(el, "🤝 Processed", "txM");
                 }
             }
-        } catch (e) { renderHS(el, "❌ Invalid: " + e.message, "err"); }
+        } catch (e) { renderHS(el, "❌ Invalid Payload", "err"); }
     }
 
     function toast(m, d = CFG.TOAST_MS) {
@@ -570,7 +598,7 @@
                 const raw = cleanTc.slice(hsIdx + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g, '');
                 if (raw.length > 50) {
                     _infly.add(el);
-                    hsLock(() => handleHandshake(raw, el).catch(console.error)).finally(() => _infly.delete(el));
+                    hsLock(() => handleHandshake(raw, el).catch(() => {})).finally(() => _infly.delete(el));
                     continue;
                 }
             }
@@ -761,7 +789,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                     }
                     bBtn.onclick = async () => {
                         ov.remove();
-                        try { await startBridge(); } catch (e) { toast("Bridge error: " + e.message); }
+                        try { await startBridge(); } catch (e) { toast("Bridge error!"); }
                     };
                 }
             } catch(e) { bBtn.textContent = "Bridge unavailable"; bBtn.disabled = true; }
@@ -773,7 +801,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         cpb.onclick = () => { if (!kinp.value) return; navigator.clipboard.writeText(kinp.value).then(() => { cpb.textContent = "✅"; cpb.classList.add("copied"); setTimeout(() => { cpb.textContent = "📋"; cpb.classList.remove("copied"); }, 1200); }).catch(() => {}); };
         gb.onclick = () => { kinp.value = genKey(); kinp.type = "text"; vb.textContent = "🙈"; validate(); updateBridgeUI(); };
         canB.onclick = () => ov.remove();
-        savB.onclick = () => { if (savB.disabled) return; try { setS({ enabled: ecb.checked, customKey: kinp.value }); } catch (e) { toast("Error: " + e.message); return; } ov.remove(); syncVis(); };
+        savB.onclick = () => { if (savB.disabled) return; try { setS({ enabled: ecb.checked, customKey: kinp.value }); } catch (e) { return; } ov.remove(); syncVis(); };
         ov.onclick = e => { if (e.target === ov) ov.remove(); };
     }
 
@@ -859,7 +887,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 if (!activeKey()) { openSettings(); return; }
                 isSending = true; setT("🔒 …");
                 try { const ch = await encChunk(text); if (!ch) { setT(text); openSettings(); return; } for (const c of ch) await sendRaw(c); setT(""); lastHasText = false; si.focus(); }
-                catch (e) { console.error("[BB]", e); setT(text); toast("Send failed!"); }
+                catch (e) { setT(text); toast("Send failed!"); }
                 finally { isSending = false; } return;
             }
             if (!confirm("⚠️ Send WITHOUT encryption?")) return;
@@ -907,7 +935,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
                 if (!dispatched) {
                     for (const t of ["mousedown", "pointerdown", "mouseup", "pointerup", "click"]) btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
                 }
-            } catch (e) { console.error("[BB]", e); se.value = prev; toast("Failed!"); }
+            } catch (e) { se.value = prev; toast("Failed!"); }
             finally { se._busy = false; }
         };
 
@@ -960,7 +988,7 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
         try {
             scan(document.body); ensureInput(); ensureEdit();
             if (location.href !== lastUrl) { lastUrl = location.href; _sc = null; _scId = null; syncVis(); }
-        } catch (e) { console.error("[BB]", e); }
+        } catch (e) {}
     }
     new MutationObserver(() => {
         if (!_dirty) { _dirty = true; if (_raf) cancelAnimationFrame(_raf); _raf = requestAnimationFrame(tick); }
@@ -976,5 +1004,5 @@ div#secure-input-overlay:empty::before{content:attr(data-placeholder);color:${P.
     try {
         scan(document.body); ensureInput(); ensureEdit();
         setTimeout(cleanupHs, 2000); setInterval(cleanupHs, CFG.HS_CLEANUP_INTERVAL);
-    } catch (e) { console.error("[BB] init", e); }
+    } catch (e) {}
 })();
