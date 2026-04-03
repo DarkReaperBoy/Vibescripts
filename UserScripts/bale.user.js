@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor
 // @namespace    http://tampermonkey.net/
-// @version      17.1
+// @version      17.2
 // @description  E2E encryption overlay for Bale Web with ECDH key exchange.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -322,7 +322,7 @@ document.addEventListener("click",e=>{
     const cb=e.target.closest(".bb-cblk-copy"); if(cb){e.preventDefault();e.stopPropagation();const pre=cb.closest(".bb-cblk")?.querySelector("code");if(pre)navigator.clipboard.writeText(pre.textContent).then(()=>{cb.textContent="\u2705";setTimeout(()=>cb.textContent="\ud83d\udccb",1200);}).catch(()=>{});}
 },true);
 
-const getReal=()=>document.getElementById("editable-message-text");
+const getReal=()=>document.getElementById("editable-message-text")||document.getElementById("main-message-input");
 
 async function sendRaw(text){
     const real=getReal(); if(!real) return;
