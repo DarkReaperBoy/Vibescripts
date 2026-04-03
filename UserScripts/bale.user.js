@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor
 // @namespace    http://tampermonkey.net/
-// @version      17.2
+// @version      17.3
 // @description  E2E encryption overlay for Bale Web with ECDH key exchange.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -327,14 +327,14 @@ const getReal=()=>document.getElementById("editable-message-text")||document.get
 async function sendRaw(text){
     const real=getReal(); if(!real) return;
     const ws=isSyncing; isSyncing=true; unlockI(real);
-    try{real.focus();real.innerText=text;real.dispatchEvent(new Event("input",{bubbles:true}));}catch(_){try{real.textContent=text;real.dispatchEvent(new Event("input",{bubbles:true}));}catch(_){}}
+    try{real.focus();const _sel=_W.getSelection();if(_sel){_sel.selectAllChildren(real);_sel.deleteFromDocument();}document.execCommand("insertText",false,text)||(() =>{real.innerText=text;real.dispatchEvent(new Event("input",{bubbles:true}));})();}catch(_){try{real.innerText=text;real.dispatchEvent(new Event("input",{bubbles:true}));}catch(_){}}
     await new Promise(r=>setTimeout(r,CFG.SEND_DLY));
     const btn=document.querySelector('[aria-label="send-button"]')||document.querySelector(".RaTWwR");
     let sent=false;
     if(btn){try{const u=btn.wrappedJSObject||btn,rk=Object.keys(u).find(k=>k.startsWith("__reactProps$")||k.startsWith("__reactFiber$"));if(rk){let n=u[rk];while(n&&!n.onClick&&!n.memoizedProps?.onClick)n=n.return;const fn=n?.memoizedProps?.onClick||n?.onClick||u[rk]?.onClick;if(typeof fn==="function"){fn({preventDefault(){},stopPropagation(){}});sent=true;}}}catch(_){} if(!sent){btn.click();sent=true;}}
     if(!sent) real.dispatchEvent(new KeyboardEvent("keydown",{bubbles:true,key:"Enter",code:"Enter",keyCode:13}));
     await new Promise(r=>setTimeout(r,CFG.POST_DLY));
-    real.innerText=""; real.dispatchEvent(new Event("input",{bubbles:true}));
+    try{real.focus();const _sel2=_W.getSelection();if(_sel2){_sel2.selectAllChildren(real);_sel2.deleteFromDocument();}real.dispatchEvent(new Event("input",{bubbles:true}));}catch(_){real.innerText="";real.dispatchEvent(new Event("input",{bubbles:true}));}
     if(encOn()) lockI(real); isSyncing=ws;
 }
 
@@ -551,7 +551,7 @@ function ensureInput(){
     const isNarrow=window.innerWidth<600; let si;
     if(isNarrow){si=document.createElement("textarea");si.dir="auto";si.placeholder="\ud83d\udd12 \u067e\u06cc\u0627\u0645 \u0627\u0645\u0646...";si.rows=1;si.addEventListener("input",()=>{si.style.height="auto";si.style.height=Math.min(si.scrollHeight,150)+"px";});}
     else{si=document.createElement("div");si.contentEditable="true";si.dir="auto";si.dataset.placeholder="\ud83d\udd12 \u067e\u06cc\u0627\u0645 \u0627\u0645\u0646...";wrap.style.overflow="visible";}
-    si.id="secure-input-overlay"; si.className=ri.className; wrap.insertBefore(si,ri);
+    si.id="secure-input-overlay"; wrap.insertBefore(si,ri);
     const siTA=si.tagName==="TEXTAREA";
     const getT=()=>siTA?si.value.trim():si.innerText.trim();
     const setT=v=>{if(siTA)si.value=v;else si.innerText=v;};
