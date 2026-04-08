@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.5
+// @version      8.6
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -1654,7 +1654,7 @@ function injectUI() {
         let text = getOverlayText();
         if (!text) return;
 
-        async function sendWithRetry(chunks, maxRetries) {
+        async function sendWithRetry(chunks, maxRetries, plaintext) {
             for (let attempt = 0; attempt <= maxRetries; attempt++) {
                 try {
                     for (let chunk of chunks) await injectAndSend(chunk);
@@ -1664,6 +1664,11 @@ function injectUI() {
                     if (attempt < maxRetries) {
                         setOverlayText("\u26a0\ufe0f Retrying... (" + (attempt+2) + "/" + (maxRetries+1) + ")");
                         await delay(1500 * (attempt + 1));
+                        // Re-encrypt with fresh IV — different ciphertext each retry
+                        if (plaintext) {
+                            let fresh = await splitEncrypt(plaintext);
+                            if (fresh) chunks = fresh;
+                        }
                     }
                 }
             }
@@ -1678,7 +1683,7 @@ function injectUI() {
             try {
                 let chunks = await splitEncrypt(text);
                 if (!chunks) { setOverlayText(text); openSettings(); return; }
-                let ok = await sendWithRetry(chunks, 2);
+                let ok = await sendWithRetry(chunks, 2, text);
                 if (ok) {
                     setOverlayText("");
                     hasContent = false;
