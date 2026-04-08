@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.3
+// @version      8.4
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -994,7 +994,7 @@ let isBypass = false;
 
 function overlayHasContent() {
     let el = document.getElementById("secure-input-overlay");
-    return !!el && !!el.innerText.trim();
+    return !!el && !!(el.value||el.innerText||"").trim();
 }
 
 function isSendTarget(el) {
@@ -1081,9 +1081,8 @@ button.toggle-emoticons { display: none !important; }
     box-shadow: 0 4px 16px rgba(0,171,128,.3);
     border-color: #00916d;
 }
-#secure-input-overlay:empty::before {
-    content: attr(data-placeholder);
-    color: #888; pointer-events: none; display: block;
+#secure-input-overlay::placeholder {
+    color: #888;
 }
 
 .is-mobile #secure-input-overlay {
@@ -1551,11 +1550,17 @@ function injectUI() {
         }
     }
 
-    let secureInput = document.createElement("div");
+    let secureInput = document.createElement("textarea");
     secureInput.id = "secure-input-overlay";
-    secureInput.contentEditable = "true";
     secureInput.dir = "auto";
-    secureInput.dataset.placeholder = "🔒 پیام امن...";
+    secureInput.placeholder = "\ud83d\udd12 \u067e\u06cc\u0627\u0645 \u0627\u0645\u0646...";
+    secureInput.rows = 1;
+    secureInput.style.cssText += ";resize:none;";
+    // Auto-grow height
+    secureInput.addEventListener("input", () => {
+        secureInput.style.height = "auto";
+        secureInput.style.height = Math.min(secureInput.scrollHeight, 150) + "px";
+    });
 
     let insertParent = inputWrapper?.parentElement || textarea.parentElement;
     let insertBefore = inputWrapper || textarea;
@@ -1565,8 +1570,8 @@ function injectUI() {
         secureInput.addEventListener(evt, e => { e.stopPropagation(); });
     });
 
-    function getOverlayText() { return secureInput.innerText.trim(); }
-    function setOverlayText(t) { secureInput.innerText = t; }
+    function getOverlayText() { return secureInput.value.trim(); }
+    function setOverlayText(t) { secureInput.value = t; secureInput.style.height = "auto"; secureInput.style.height = Math.min(secureInput.scrollHeight, 150) + "px"; }
 
     function syncHasContent(has) {
         if (has !== hasContent) {
@@ -1753,7 +1758,7 @@ function injectUI() {
 
             if (isEnabled() && !isSending) {
                 let ov = document.getElementById("secure-input-overlay");
-                if (ov) setSendButtonState(ov.innerText.trim().length > 0);
+                if (ov) setSendButtonState((ov.value||ov.innerText||"").trim().length > 0);
             }
 
             if (location.href !== lastHref) {
