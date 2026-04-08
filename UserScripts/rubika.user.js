@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      9.0
+// @version      9.1
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -987,20 +987,35 @@ function refreshUI() {
         blocker.addEventListener("touchstart", e => { e.preventDefault(); e.stopPropagation(); }, {passive:false});
     }
 
+    // Kill native input completely when encryption is on
+    let composer = textarea ? textarea.querySelector(".composer_rich_textarea") || textarea : null;
+    function lockNative() {
+        if (hideTarget) hideTarget.classList.add("rb-locked-input");
+        if (composer) { composer.contentEditable = "false"; composer.tabIndex = -1; }
+        if (textarea) { textarea.tabIndex = -1; }
+        if (inputWrapper) { inputWrapper.tabIndex = -1; }
+    }
+    function unlockNative() {
+        if (hideTarget) hideTarget.classList.remove("rb-locked-input");
+        if (composer) { composer.contentEditable = "true"; composer.removeAttribute("tabindex"); }
+        if (textarea) { textarea.removeAttribute("tabindex"); }
+        if (inputWrapper) { inputWrapper.removeAttribute("tabindex"); }
+    }
+
     if (on) {
         if (hasKey) {
-            if (hideTarget) hideTarget.classList.add("rb-locked-input");
+            lockNative();
             if (overlay) overlay.style.display = "";
             if (notice) notice.style.display = "none";
             if (blocker) blocker.style.display = "block";
         } else {
-            if (hideTarget) hideTarget.classList.add("rb-locked-input");
+            lockNative();
             if (overlay) overlay.style.display = "none";
             if (notice) notice.style.display = "flex";
             if (blocker) blocker.style.display = "block";
         }
     } else {
-        if (hideTarget) hideTarget.classList.remove("rb-locked-input");
+        unlockNative();
         if (overlay) overlay.style.display = "none";
         if (notice) notice.style.display = "none";
         if (blocker) blocker.style.display = "none";
@@ -1059,8 +1074,10 @@ html.night .bubble.is-out .bubble-tail use {
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
     z-index: 99;
-    background: transparent;
+    background: var(--surface-color, #fff);
     cursor: text;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 #bb-settings-btn.bb-shield-btn {
@@ -1583,6 +1600,26 @@ function injectUI() {
         }
     }
 
+    // Global keyboard redirect: any typing anywhere goes to secure overlay
+    if (!document._rbGlobalKeyGuard) {
+        document._rbGlobalKeyGuard = true;
+        document.addEventListener("keydown", e => {
+            if (isBypass || !isEnabled()) return;
+            let ov = document.getElementById("secure-input-overlay");
+            if (!ov || document.activeElement === ov) return;
+            // If user is typing a printable character and not in our overlay, redirect
+            if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                e.preventDefault(); e.stopPropagation();
+                ov.focus();
+                // Insert the character they typed
+                let start = ov.selectionStart, end = ov.selectionEnd;
+                ov.value = ov.value.slice(0, start) + e.key + ov.value.slice(end);
+                ov.selectionStart = ov.selectionEnd = start + 1;
+                ov.dispatchEvent(new Event("input", {bubbles:true}));
+            }
+        }, true);
+    }
+
     let secureInput = document.createElement("textarea");
     secureInput.id = "secure-input-overlay";
     secureInput.dir = "auto";
@@ -1622,6 +1659,11 @@ function injectUI() {
         let blocker = document.getElementById("rb-input-blocker");
         if (blocker) blocker.style.display = "none";
         hideTarget.classList.remove("rb-locked-input");
+        // Temporarily restore native input for injection
+        let composer = textarea.querySelector(".composer_rich_textarea") || textarea;
+        composer.contentEditable = "true";
+        if (textarea.tabIndex === -1) textarea.removeAttribute("tabindex");
+        if (inputWrapper && inputWrapper.tabIndex === -1) inputWrapper.removeAttribute("tabindex");
         hideTarget.style.cssText = "position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
 
         textarea.focus();
@@ -1678,6 +1720,11 @@ function injectUI() {
 
         hideTarget.style.cssText = "";
         hideTarget.classList.add("rb-locked-input");
+        // Relock native input completely
+        composer.contentEditable = "false";
+        composer.tabIndex = -1;
+        if (textarea) textarea.tabIndex = -1;
+        if (inputWrapper) inputWrapper.tabIndex = -1;
         if (blocker) blocker.style.display = "block";
         isBypass = false;
     }
