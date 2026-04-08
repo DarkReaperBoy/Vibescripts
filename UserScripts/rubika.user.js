@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.7
+// @version      7.8
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -1467,57 +1467,28 @@ function injectUI() {
         return;
     }
 
-    if (!textarea._hasStrictHijack) {
-        textarea._hasStrictHijack = true;
-        textarea.addEventListener("focus", () => {
+    // Block ALL input on every native input element when encryption is on
+    // textarea = .composer_rich_textarea, inputWrapper = .input-message-input
+    // Also block on .input-message-container which wraps both
+    let nativeContainer = document.querySelector(".input-message-container");
+    let allInputEls = [textarea, inputWrapper, nativeContainer].filter(Boolean);
+    for (let el of allInputEls) {
+        if (!el || el._hasStrictHijack) continue;
+        el._hasStrictHijack = true;
+        el.addEventListener("focus", e => {
             if (!isBypass && isEnabled()) {
-                textarea.blur();
+                e.preventDefault();
+                try { el.blur(); } catch(_) {}
                 document.getElementById("secure-input-overlay")?.focus();
             }
-        });
-        // Block ALL input on native textarea when encryption is on
-        for (const evt of ["keydown","keypress","keyup","input","beforeinput","paste","drop","compositionstart","compositionend"]) {
-            textarea.addEventListener(evt, e => {
+        }, true);
+        for (const evt of ["keydown","keypress","keyup","input","beforeinput","paste","drop","compositionstart","compositionend","click"]) {
+            el.addEventListener(evt, e => {
                 if (!isBypass && isEnabled()) {
                     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-                    document.getElementById("secure-input-overlay")?.focus();
-                }
-            }, true);
-        }
-        // Also block the contenteditable composer inside
-        let composer = textarea.querySelector(".composer_rich_textarea") || textarea;
-        if (composer !== textarea && !composer._hasStrictHijack) {
-            composer._hasStrictHijack = true;
-            for (const evt of ["keydown","keypress","keyup","input","beforeinput","paste","drop"]) {
-                composer.addEventListener(evt, e => {
-                    if (!isBypass && isEnabled()) {
-                        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+                    if (evt === "click" || evt === "keydown") {
                         document.getElementById("secure-input-overlay")?.focus();
                     }
-                }, true);
-            }
-        }
-    }
-
-    if (inputWrapper && !inputWrapper._hasStrictHijack) {
-        inputWrapper._hasStrictHijack = true;
-        inputWrapper.addEventListener("focus", e => {
-            if (!isBypass && isEnabled()) {
-                e.preventDefault();
-                document.getElementById("secure-input-overlay")?.focus();
-            }
-        }, true);
-        inputWrapper.addEventListener("click", e => {
-            if (!isBypass && isEnabled()) {
-                e.preventDefault();
-                e.stopPropagation();
-                document.getElementById("secure-input-overlay")?.focus();
-            }
-        }, true);
-        for (const evt of ["keydown","keypress","input","beforeinput"]) {
-            inputWrapper.addEventListener(evt, e => {
-                if (!isBypass && isEnabled()) {
-                    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
                 }
             }, true);
         }
