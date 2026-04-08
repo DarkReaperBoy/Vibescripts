@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      5.7
+// @version      5.8
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (fast DC racing, keepalive, reconnect, resync), draft blocker.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -597,439 +597,74 @@ setTimeout(() => {
 const _uiCSS = document.createElement("style");
 _uiCSS.id = "rb-ui-polish";
 _uiCSS.textContent = `
-/* ═══ Telegram Web A-inspired overhaul for Rubika ═══
-   All resources inline — works on Iran intranet.
-   Overrides via CSS variables + targeted selectors. */
+/* ═══ Rubika UI Polish ═══
+   High-specificity overrides using #page-chats prefix.
+   All inline — works on Iran intranet. */
 
-/* ── Foundations: Typography + Smoothing ── */
-
-html {
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    text-rendering: optimizeLegibility;
+/* ── Widen message area: remove max-width constraint ── */
+#page-chats .bubbles-inner {
+    --messages-container-width: 100% !important;
+    max-width: 100% !important;
+    padding-inline: 12px !important;
 }
 
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-    letter-spacing: -0.01em;
-}
-
-/* ── Color refinements (light mode) ── */
-
-:root {
-    --primary-color: #3390ec;
-    --surface-color: #ffffff;
-    --background-color: #ffffff;
-    --body-background-color: #f4f4f5;
-    --border-color: #e6e6e6;
-    --secondary-text-color: #8a8a8a;
-    --message-out-background-color: #eeffde;
-    --message-out-primary-color: #4fae4e;
-    --message-background-color: #ffffff;
-    --scrollbar-color: rgba(0,0,0,0.15);
-    --chatlist-pinned-color: #b0b5ba;
-    --ripple-color: rgba(0,0,0,0.06);
-    --hover-alpha: 0.04;
-    --line-height: 1.375;
-    --transition-standard-in-time: .25s;
-    --layer-transition: .2s cubic-bezier(.4,0,.2,1);
-}
-
-/* ── Color refinements (dark mode) ── */
-
-html.night {
-    --surface-color: #212121;
-    --background-color: #181818;
-    --body-background-color: #0e0e0e;
-    --border-color: #2a2a2a;
-    --secondary-text-color: #8a8a8a;
-    --scrollbar-color: rgba(255,255,255,0.12);
-    --ripple-color: rgba(255,255,255,0.06);
-}
-
-/* ── Scrollbars: thin, Telegram-style ── */
-
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-color);
-    border-radius: 3px;
-    transition: background .2s;
-}
-::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.3); }
-html.night ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
-
-* { scrollbar-width: thin; scrollbar-color: var(--scrollbar-color) transparent; }
-
-/* ── Sidebar / Chat List ──
-   Actual DOM: ul.chatlist > li[rb-chat-item].rp
-   Active chat: li.open */
-
-ul.chatlist {
+/* ── Chat list: tighter, rounder ── */
+#page-chats #column-left ul.chatlist {
     padding: 0 4px !important;
 }
-
-ul.chatlist > li {
-    padding-inline-start: 8px !important;
-    padding-inline-end: 8px !important;
-}
-
-ul.chatlist > li {
+#page-chats #column-left ul.chatlist > li[rb-chat-item] {
     border-radius: 10px !important;
     margin: 1px 0 !important;
-    transition: background .15s ease !important;
 }
-
-ul.chatlist > li:hover {
-    background: rgba(0,0,0,0.04) !important;
-}
-html.night ul.chatlist > li:hover {
-    background: rgba(255,255,255,0.06) !important;
-}
-
-ul.chatlist > li.open {
+#page-chats #column-left ul.chatlist > li.open {
     background: var(--primary-color) !important;
-    border-radius: 10px !important;
 }
-
-ul.chatlist > li.open .user-caption,
-ul.chatlist > li.open .user-caption * {
+#page-chats #column-left ul.chatlist > li.open .user-caption,
+#page-chats #column-left ul.chatlist > li.open .user-caption * {
     color: #fff !important;
 }
-
-ul.chatlist > li.open .user-last-message,
-ul.chatlist > li.open .dialog-subtitle,
-ul.chatlist > li.open .message-time,
-ul.chatlist > li.open .im_dialog_chat_from {
-    color: rgba(255,255,255,0.8) !important;
+#page-chats #column-left ul.chatlist > li.open .user-last-message,
+#page-chats #column-left ul.chatlist > li.open .dialog-subtitle,
+#page-chats #column-left ul.chatlist > li.open .message-time,
+#page-chats #column-left ul.chatlist > li.open .im_dialog_chat_from {
+    color: rgba(255,255,255,0.75) !important;
 }
-
-ul.chatlist > li.open .badge:not(.badge-ads) {
+#page-chats #column-left ul.chatlist > li.open .sending-status-icon {
+    color: rgba(255,255,255,0.7) !important;
+}
+#page-chats #column-left ul.chatlist > li.open .badge:not(.badge-ads) {
     background: #fff !important;
     color: var(--primary-color) !important;
 }
 
-ul.chatlist > li.open .sending-status-icon {
-    color: rgba(255,255,255,0.7) !important;
+/* ── Thin scrollbars ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }
+html.night ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); }
+* { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.15) transparent; }
+html.night * { scrollbar-color: rgba(255,255,255,0.12) transparent; }
+
+/* ── Handshake bridge widget: make text visible ── */
+div[rb-copyable] div[style*="border:1px solid #888"] {
+    border-color: var(--primary-color, #3390ec) !important;
+    background: rgba(51,144,236,0.08) !important;
+}
+div[rb-copyable] div[style*="border:1px solid #888"] span {
+    color: var(--primary-text-color, #000) !important;
 }
 
-/* Unread badge */
-.badge.badge-primary:not(.badge-ads) {
-    background: var(--primary-color) !important;
-    font-weight: 600 !important;
-    min-width: 22px !important;
-    height: 22px !important;
-    border-radius: 11px !important;
-    font-size: 12px !important;
-}
-
-/* Dialog preview text */
-.user-last-message,
-.dialog-subtitle {
-    font-size: 14px !important;
-    line-height: 1.35 !important;
-}
-
-/* Chat title in list */
-.user-title {
-    font-weight: 600 !important;
-    font-size: 15px !important;
-}
-
-/* Dialog date */
-.message-time {
-    font-size: 12px !important;
-    font-weight: 500 !important;
-    opacity: 0.55;
-}
-
-/* Avatars */
-.avatar-element {
-    border-radius: 50% !important;
-}
-
-/* Search bar */
-.sidebar-header .input-search {
-    border-radius: 22px !important;
-    background: var(--input-search-background-color) !important;
-    border: 1.5px solid var(--input-search-border-color) !important;
-    padding: 8px 16px !important;
-    transition: border-color .2s, box-shadow .2s !important;
-}
-
-.sidebar-header .input-search:focus-within {
-    border-color: var(--primary-color) !important;
-    box-shadow: 0 0 0 3px rgba(51,144,236,0.12) !important;
-}
-html.night .sidebar-header .input-search:focus-within {
-    box-shadow: 0 0 0 3px rgba(135,116,225,0.15) !important;
-}
-
-/* ── Message Bubbles ──
-   Actual DOM: .bubble > .bubble-content-wrapper > .bubble-content > .message
-   Outgoing: .bubble.is-out
-   Groups have .bubbles-group wrapping related bubbles */
-
-/* Keep Rubika's native bubble styling — just remove extra shadows */
-.bubble-content {
-    box-shadow: none !important;
-}
-
-/* Service/date messages — frosted glass pill */
-.bubble.service .bubble-content,
-.bubble.is-date .bubble-content {
-    background: rgba(0,0,0,0.35) !important;
-    color: #fff !important;
-    border-radius: 16px !important;
-    box-shadow: none !important;
-    font-size: 13px !important;
-    font-weight: 500 !important;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-}
-
-/* Message text */
-div[rb-copyable] {
-    font-size: var(--messages-text-size, 16px) !important;
-    line-height: var(--line-height, 1.375) !important;
-}
-
-/* Message time — inside .reactions-block */
-.time {
-    font-size: 11px !important;
-    font-weight: 500 !important;
-}
-
-/* Reactions */
-.bubble-hover-reaction,
-.bubble-hover-reaction-sticker {
-    border-radius: 50% !important;
-    transition: transform .2s cubic-bezier(.2,1,.2,1), opacity .15s !important;
-}
-
-/* ── Reply inside bubble ── */
-
-.bubble .reply {
-    border-radius: 6px !important;
-    overflow: hidden !important;
-}
-
-.reply-border {
-    border-radius: 2px !important;
-}
-
-/* ── Top bar ── */
-
-.topbar,
-.sidebar-header {
-    backdrop-filter: blur(16px) saturate(180%) !important;
-    -webkit-backdrop-filter: blur(16px) saturate(180%) !important;
-}
-
-/* ── Chat Input area ──
-   Actual DOM: .chat-input > .chat-input-container > .chat-input-content > .rows-wrapper */
-
-/* Don't override chat-input background — native handles it */
-
-/* The actual text input is .composer_rich_textarea[contenteditable] inside
-   .input-message-input inside .input-message-container */
-
-.composer_rich_textarea,
-.input-message-input {
-    font-size: var(--messages-text-size, 16px) !important;
-    line-height: var(--line-height, 1.375) !important;
-    caret-color: var(--primary-color) !important;
-}
-
-/* Don't override rows-wrapper — it uses bubble-tail SVG for its shape */
-
-/* Send button — from DOM: button.btn-send.animated-button-icon inside .btn-send-container
-   States: .record (mic icon) / .send (send icon) */
-.btn-send-container button.btn-send {
-    transition: transform .2s cubic-bezier(.2,1,.2,1), background .15s !important;
-}
-
-.btn-send-container button.btn-send.send {
+/* ── Send button highlight ── */
+#page-chats .btn-send-container button.btn-send.send {
     background: var(--primary-color) !important;
 }
-
-.btn-send-container button.btn-send.send .rbico-send {
+#page-chats .btn-send-container button.btn-send.send .rbico-send {
     color: #fff !important;
-}
-
-.btn-send-container button.btn-send:active {
-    transform: scale(0.9) !important;
-}
-
-/* ── Modals & Popups ── */
-
-#bb-modal-overlay {
-    backdrop-filter: blur(8px) !important;
-    -webkit-backdrop-filter: blur(8px) !important;
-}
-
-#bb-modal-card {
-    border-radius: 16px !important;
-    box-shadow: 0 16px 48px rgba(0,0,0,0.18), 0 0 0 1px rgba(0,0,0,0.05) !important;
-}
-
-html.night #bb-modal-card {
-    box-shadow: 0 16px 48px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.06) !important;
-}
-
-/* ── Context menu ── */
-
-#bale-bridge-menu {
-    border-radius: 10px !important;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.15) !important;
-    overflow: hidden !important;
-}
-
-html.night #bale-bridge-menu {
-    background: #2a2a2a !important;
-    border-color: #3a3a3a !important;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.4) !important;
-}
-
-.bale-menu-item {
-    padding: 11px 16px !important;
-    font-size: 14px !important;
-    transition: background .12s !important;
-}
-
-/* ── Pinned message bar ── */
-
-.pinned-container {
-    backdrop-filter: blur(12px) !important;
-    -webkit-backdrop-filter: blur(12px) !important;
-}
-
-/* ── Selection mode ── */
-
-.bubble-select-checkbox {
-    border-radius: 50% !important;
-    transition: transform .15s, opacity .15s !important;
-}
-
-/* ── Floating action buttons ── */
-
-.bubbles-go-down,
-.btn-circle {
-    border-radius: 50% !important;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
-    transition: transform .2s cubic-bezier(.2,1,.2,1), box-shadow .2s !important;
-}
-
-.bubbles-go-down:hover,
-.btn-circle:hover {
-    transform: scale(1.05) !important;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.2) !important;
-}
-
-/* ── Ripple effect — subtler ── */
-
-.c-ripple__circle {
-    opacity: 0.06 !important;
-}
-html.night .c-ripple__circle {
-    opacity: 0.08 !important;
-}
-
-/* ── Folder tabs ── */
-
-.chat-folders {
-    border-bottom: 1px solid var(--border-color) !important;
-}
-
-.chat-folders .chat-folder {
-    border-radius: 0 !important;
-    font-weight: 600 !important;
-    font-size: 14px !important;
-    transition: color .2s, border-color .2s !important;
-    border-bottom: 2px solid transparent;
-    padding: 10px 16px !important;
-}
-
-.chat-folders .chat-folder.active {
-    color: var(--primary-color) !important;
-    border-bottom-color: var(--primary-color) !important;
-}
-
-/* ── Sticker/Emoji panel ── */
-
-.composer_emoji_tooltip {
-    border-radius: 12px 12px 0 0 !important;
-    box-shadow: 0 -2px 12px rgba(0,0,0,0.1) !important;
 }
 
 /* ── Selection highlight ── */
-
-::selection {
-    background: rgba(51,144,236,0.25);
-}
-html.night ::selection {
-    background: rgba(135,116,225,0.3);
-}
-
-/* ── Smooth transitions on everything interactive ── */
-
-button, [role="button"], .rp {
-    transition: background .15s, transform .15s, opacity .15s !important;
-}
-
-/* ── Link styling ── */
-
-a:not([class]) {
-    color: var(--link-color) !important;
-    text-decoration: none !important;
-    transition: opacity .15s !important;
-}
-a:not([class]):hover {
-    opacity: 0.8 !important;
-    text-decoration: underline !important;
-}
-
-/* ── Connection status (our custom element) ── */
-
-#rb-conn-status {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-}
-
-/* ── Encryption overlay — match new input style ── */
-
-#secure-input-overlay {
-    border-radius: 18px !important;
-    border-width: 1.5px !important;
-    font-family: inherit !important;
-    transition: border-color .2s, box-shadow .2s !important;
-}
-
-#secure-input-overlay:focus {
-    box-shadow: 0 0 0 3px rgba(0,171,128,0.15) !important;
-}
-
-#bb-no-key-notice {
-    border-radius: 18px !important;
-}
-
-/* ── Smooth page transitions ── */
-
-.tabs-tab {
-    transition: opacity .25s, transform .25s !important;
-}
-
-/* ── Voice chat / call bar ── */
-
-.topbar-call {
-    border-radius: 0 0 12px 12px !important;
-}
-
-/* ── Empty chat placeholder ── */
-
-.chatlist-empty {
-    opacity: 0.6;
-    font-size: 14px !important;
-}
+::selection { background: rgba(51,144,236,0.25); }
+html.night ::selection { background: rgba(135,116,225,0.3); }
 `;
 
 (document.head || document.documentElement).appendChild(_uiCSS);
@@ -1338,10 +973,10 @@ async function splitEncrypt(text) {
 // ── Bridge / Handshake system ──
 
 function renderHS(el,text,cc,fp="",trust="",onAction=null,btnText="Accept & Connect"){
-    const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#888";
-    const bg=cc==="ac"?"rgba(0,171,128,0.1)":cc==="wrn"?"rgba(210,153,34,0.1)":cc==="err"?"rgba(248,81,73,0.1)":"rgba(255,255,255,0.05)";
-    let h=`<div style="border:1px solid ${c};background:${bg};border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;margin-bottom:${fp?"6px":"0"};font-size:14px;color:${c}">${escapeHtml(text)}</span>`;
-    if(fp){ h+=`<div style="font-family:monospace;font-size:11.5px;margin-bottom:4px;font-weight:600;color:#00ab80">Fingerprint: ${escapeHtml(fp)}</div>`; const tc=trust.includes("\u26a0\ufe0f")?"#d32f2f":"#888"; h+=`<div style="color:${tc};font-weight:${trust.includes("\u26a0\ufe0f")?"700":"500"};margin-bottom:${onAction?"8px":"0"}">${escapeHtml(trust)}</div>`; }
+    const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#555";
+    const bg=cc==="ac"?"rgba(0,171,128,0.1)":cc==="wrn"?"rgba(210,153,34,0.1)":cc==="err"?"rgba(248,81,73,0.1)":"rgba(0,0,0,0.06)";
+    let h=`<div style="border:1.5px solid ${c};background:${bg};border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;margin-bottom:${fp?"6px":"0"};font-size:14px;color:${c}">${escapeHtml(text)}</span>`;
+    if(fp){ h+=`<div style="font-family:monospace;font-size:11.5px;margin-bottom:4px;font-weight:600;color:#00ab80">Fingerprint: ${escapeHtml(fp)}</div>`; const tc=trust.includes("\u26a0\ufe0f")?"#d32f2f":"#555"; h+=`<div style="color:${tc};font-weight:${trust.includes("\u26a0\ufe0f")?"700":"500"};margin-bottom:${onAction?"8px":"0"}">${escapeHtml(trust)}</div>`; }
     if(onAction) h+=`<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:${c};color:#fff">${escapeHtml(btnText)}</button>`;
     h+="</div>"; el.innerHTML=h;
     if(onAction){ const btn=el.querySelector(".bb-hs-btn"); if(btn) btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();}; }
@@ -2568,12 +2203,16 @@ function injectUI() {
     let debounceTimer;
     let lastHref = location.href;
 
+    let hsRetryTimer;
     const observer = new MutationObserver(() => {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
             decryptMessages();
             decryptPreviews();
             injectUI();
+            // Delayed re-scan for handshakes that Angular hadn't finished rendering
+            clearTimeout(hsRetryTimer);
+            hsRetryTimer = setTimeout(decryptMessages, 500);
 
             if (isEnabled() && !isSending) {
                 let ov = document.getElementById("secure-input-overlay");
