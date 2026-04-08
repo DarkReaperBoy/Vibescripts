@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.4
+// @version      7.5
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -35,10 +35,11 @@ const _origProtoSend=OrigWS.prototype.send;
 OrigWS.prototype.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return _origProtoSend.apply(this,arguments);};
 
 // ── Notifications via WebSocket decryption ──
-let _authKey=null, _passKey=null, _myGuid=null, _lastFocusTime=Date.now();
-_W.addEventListener("focus",()=>{_lastFocusTime=Date.now();});
-_W.addEventListener("blur",()=>{_lastFocusTime=0;});
-document.addEventListener("visibilitychange",()=>{if(!document.hidden)_lastFocusTime=Date.now();else _lastFocusTime=0;});
+let _authKey=null, _passKey=null, _myGuid=null, _lastActivity=Date.now();
+// Track user activity — any interaction resets the timer
+["mousedown","mousemove","keydown","touchstart","scroll","wheel"].forEach(e=>{
+    _W.addEventListener(e,()=>{_lastActivity=Date.now();},{passive:true,capture:true});
+});
 function derivePassphrase(auth){
     if(auth.length!==32)return auth;
     const c0=auth.slice(0,8),c1=auth.slice(8,16),c2=auth.slice(16,24),c3=auth.slice(24,32);
@@ -127,8 +128,8 @@ function showMsgNotification(chatName,text,authorName){
                                             // Get chat name from sidebar
                                             const chatGuid=mm.object_guid||m.object_guid||"";
                                             let chatName=authorName||"New message";
-                                            // Skip if tab was recently focused (within 5s)
-                                            if(_lastFocusTime&&Date.now()-_lastFocusTime<5000)continue;
+                                            // Skip if user was active within last 5 seconds
+                                            if(Date.now()-_lastActivity<5000)continue;
                                             try{
                                                 const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
                                                 for(const li of items){
@@ -382,16 +383,11 @@ async function compress(text) {
 }
 
 async function decompress(data) {
-    try {
-        let ds = new DecompressionStream(COMPRESS);
-        let w = ds.writable.getWriter();
-        w.write(data);
-        w.close();
-        return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
-    } catch(_) {
-        // Fallback: data wasn't compressed (short messages skip compression)
-        return new TextDecoder().decode(data);
-    }
+    let ds = new DecompressionStream(COMPRESS);
+    let w = ds.writable.getWriter();
+    w.write(data);
+    w.close();
+    return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
 }
 
 const B85_DECODE = new Uint8Array(128);
@@ -436,8 +432,7 @@ async function encrypt(text) {
     let k = getKey();
     if (!k) return null;
     let iv = crypto.getRandomValues(new Uint8Array(12));
-    // Skip compression for short messages — faster encrypt
-    let data = text.length < 200 ? new TextEncoder().encode(text) : await compress(text);
+    let data = await compress(text);
     let aesKey = await deriveKey(k);
     let enc = new Uint8Array(await crypto.subtle.encrypt({ name: ALGO, iv }, aesKey, data));
     let combined = new Uint8Array(12 + enc.length);
@@ -516,9 +511,23 @@ async function startBridge(){
     const hsRec={nonce:toHex(nonce),chatId:getChatId(),role:"initiator",stage:"invited",ephPrivHex:toHex(ephPriv),ephPubHex:toHex(ephPub),initIdPubHex:toHex(id.pubRaw),theirIdentityKeyHex:null,createdAt:Date.now(),payloadHashHex:toHex(await digest(payload)),chatType:chatType()};
     if(isGroup())hsRec.groupKey=genKey();
     await dbOp("handshakes","put",hsRec);
-    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!");refreshUI();
-    // Force re-scan so the !! message renders as widget immediately
-    setTimeout(()=>decryptMessages(),300);setTimeout(()=>decryptMessages(),800);
+    const hsB64=toB64(msg);
+    await sendViaBridge(CFG.PFX_H+" "+hsB64);toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!");refreshUI();
+    // Poll for the !! node and render widget directly (don't rely on scanner)
+    let pollCount=0;
+    const pollForHS=setInterval(()=>{
+        if(++pollCount>20){clearInterval(pollForHS);return;}
+        const nodes=document.querySelectorAll("div[rb-copyable]");
+        for(const n of nodes){
+            if(n._hsProcessed)continue;
+            const ct=stripInvisibles(n.textContent.trim());
+            if(ct.indexOf(CFG.PFX_H)===0&&ct.includes(hsB64.slice(0,20))){
+                renderHS(n,"\ud83d\udd04 Bridge invite sent","txM");
+                clearInterval(pollForHS);
+                return;
+            }
+        }
+    },200);
 }
 async function acceptBridge(data,el){
     const id=await getMyId(),eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
@@ -1629,11 +1638,10 @@ function injectUI() {
             if (!getKey()) { openSettings(); return; }
             isSending = true;
             isBypass = true;
-            setOverlayText("\ud83d\udd12 Encrypting...");
+            setOverlayText("\ud83d\udd12 Sending...");
             try {
                 let chunks = await splitEncrypt(text);
                 if (!chunks) { setOverlayText(text); openSettings(); return; }
-                setOverlayText("\ud83d\udd12 Sending...");
                 let ok = await sendWithRetry(chunks, 2);
                 if (ok) {
                     setOverlayText("");
