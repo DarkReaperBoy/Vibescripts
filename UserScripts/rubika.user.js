@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.9
+// @version      7.0
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -171,7 +171,9 @@ function showMsgNotification(chatName,text,authorName){
 })();
 
 const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=15000;}return oO.call(this,m,u,...r);};
+// Adaptive XHR timeout: scales with connection speed. Fast=15s, slow=45s
+function adaptiveXhrTimeout(){if(rtt.length<3)return 20000;const avg=rtt.reduce((a,b)=>a+b,0)/rtt.length;return Math.max(15000,Math.min(45000,avg*15));}
+XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=adaptiveXhrTimeout();}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
 _W.addEventListener("online",()=>{setTimeout(()=>{if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));},1000);});
@@ -1552,43 +1554,70 @@ function injectUI() {
         let text = getOverlayText();
         if (!text) return;
 
+        async function sendWithRetry(chunks, maxRetries) {
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                try {
+                    for (let chunk of chunks) await injectAndSend(chunk);
+                    return true;
+                } catch(err) {
+                    console.error("[RB] Send attempt " + (attempt+1) + " failed:", err);
+                    if (attempt < maxRetries) {
+                        setOverlayText("\u26a0\ufe0f Retrying... (" + (attempt+2) + "/" + (maxRetries+1) + ")");
+                        await delay(1500 * (attempt + 1));
+                    }
+                }
+            }
+            return false;
+        }
+
         if (encrypted) {
             if (!getKey()) { openSettings(); return; }
             isSending = true;
             isBypass = true;
-            setOverlayText("🔒 Encrypting...");
+            setOverlayText("\ud83d\udd12 Encrypting...");
             try {
                 let chunks = await splitEncrypt(text);
                 if (!chunks) { setOverlayText(text); openSettings(); return; }
-                for (let chunk of chunks) await injectAndSend(chunk);
-                setOverlayText("");
-                hasContent = false;
-                syncHasContent(false);
-                secureInput.focus();
+                setOverlayText("\ud83d\udd12 Sending...");
+                let ok = await sendWithRetry(chunks, 2);
+                if (ok) {
+                    setOverlayText("");
+                    hasContent = false;
+                    syncHasContent(false);
+                    secureInput.focus();
+                } else {
+                    setOverlayText(text);
+                    toast("Send failed after 3 attempts. Tap send to retry.");
+                }
             } catch (err) {
-                console.error("[Rubika Bridge] Encrypted send failed:", err);
+                console.error("[RB] Encrypted send error:", err);
                 setOverlayText(text);
-                alert("Send failed!");
+                toast("Send failed. Tap send to retry.");
             } finally {
                 isSending = false;
                 isBypass = false;
             }
         } else {
-            let confirm_ = confirm("⚠️ You are about to send this message WITHOUT encryption.\n\nThis may expose sensitive information. Are you sure?");
+            let confirm_ = confirm("\u26a0\ufe0f You are about to send this message WITHOUT encryption.\n\nThis may expose sensitive information. Are you sure?");
             if (!confirm_) return;
             isSending = true;
             isBypass = true;
-            setOverlayText("🌐 Sending...");
+            setOverlayText("\ud83c\udf10 Sending...");
             try {
-                await injectAndSend(text);
-                setOverlayText("");
-                hasContent = false;
-                syncHasContent(false);
-                secureInput.focus();
+                let ok = await sendWithRetry([text], 2);
+                if (ok) {
+                    setOverlayText("");
+                    hasContent = false;
+                    syncHasContent(false);
+                    secureInput.focus();
+                } else {
+                    setOverlayText(text);
+                    toast("Send failed after 3 attempts. Tap send to retry.");
+                }
             } catch (err) {
-                console.error("[Rubika Bridge] Plain send failed:", err);
+                console.error("[RB] Plain send error:", err);
                 setOverlayText(text);
-                alert("Send failed!");
+                toast("Send failed. Tap send to retry.");
             } finally {
                 isSending = false;
                 isBypass = false;
