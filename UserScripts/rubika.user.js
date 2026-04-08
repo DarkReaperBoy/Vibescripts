@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.6
+// @version      6.7
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -117,7 +117,14 @@ function showMsgNotification(chatName,text,authorName){
                                                     if(pt&&li.innerHTML.includes(chatGuid)){chatName=pt.textContent.trim();break;}
                                                 }
                                             }catch(_){}
-                                            if(text||authorName)showMsgNotification(chatName,text,authorName);
+                                            if(text||authorName){
+                                                // Try to decrypt if it's an encrypted message
+                                                if(text.startsWith("@@")&&_W._rbDecrypt){
+                                                    _W._rbDecrypt(text).then(dec=>{
+                                                        showMsgNotification(chatName,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message",authorName);
+                                                    }).catch(()=>showMsgNotification(chatName,"\ud83d\udd12 Encrypted message",authorName));
+                                                } else { showMsgNotification(chatName,text,authorName); }
+                                            }
                                         }
                                     }
                                 }catch(_){}
@@ -1592,6 +1599,7 @@ function injectUI() {
     secureInput._triggerSend = triggerSend;
     window._bbSendMessage = triggerSend;
     window._bbInjectAndSend = injectAndSend;
+    window._rbDecrypt = tryDecryptWithAllKeys;
 
     secureInput.addEventListener("input", () => {
         syncHasContent(getOverlayText().length > 0);
