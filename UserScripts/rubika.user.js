@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.0
+// @version      8.1
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -473,11 +473,23 @@ function renderHS(el,text,cc,fp,trust,onAction,btnText){
     btnText=btnText||"Accept & Connect";
     const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#555";
     const bg=cc==="ac"?"rgba(0,171,128,.1)":cc==="wrn"?"rgba(210,153,34,.1)":cc==="err"?"rgba(248,81,73,.1)":"rgba(0,0,0,.06)";
-    let h='<div style="border:1.5px solid '+c+';background:'+bg+';border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;font-size:14px;color:'+c+'">'+escapeHtml(text)+'</span>';
+    let h='<div class="bb-hs-widget" style="border:1.5px solid '+c+';background:'+bg+';border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;font-size:14px;color:'+c+'">'+escapeHtml(text)+'</span>';
     if(fp){h+='<div style="font-family:monospace;font-size:11.5px;margin:4px 0;font-weight:600;color:#00ab80">Fingerprint: '+escapeHtml(fp)+'</div>';h+='<div style="color:'+(trust&&trust.includes("\u26a0")?"#d32f2f":"#555")+';font-weight:500;margin-bottom:'+(onAction?"8px":"0")+'">'+escapeHtml(trust||"")+'</div>';}
     if(onAction)h+='<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:'+c+';color:#fff">'+escapeHtml(btnText)+'</button>';
-    h+='</div>';el.innerHTML=h;el._hsProcessed=true;
-    if(onAction){const btn=el.querySelector(".bb-hs-btn");if(btn)btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();};}
+    h+='</div>';
+    // Instead of replacing innerHTML (Angular overwrites it), hide the rb-copyable
+    // and inject widget as a sibling that Angular can't touch
+    el.style.display="none";
+    el._hsProcessed=true;
+    // Remove any previous widget sibling
+    let prev=el.parentElement&&el.parentElement.querySelector(".bb-hs-widget");
+    if(prev)prev.remove();
+    // Insert widget after the hidden rb-copyable
+    let widget=document.createElement("div");
+    widget.innerHTML=h;
+    widget=widget.firstChild;
+    el.parentElement.insertBefore(widget,el.nextSibling);
+    if(onAction){const btn=widget.querySelector(".bb-hs-btn");if(btn)btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();};}
 }
 function toast(m,d){d=d||CFG.TOAST_MS;const el=document.createElement("div");el.textContent=m;Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s",whiteSpace:"nowrap"});document.body.appendChild(el);requestAnimationFrame(()=>{el.style.opacity="1";});setTimeout(()=>{el.style.opacity="0";setTimeout(()=>el.remove(),250);},d);}
 
@@ -1243,6 +1255,11 @@ function decryptMessages() {
     let nodes = document.body.querySelectorAll("div[rb-copyable]");
     for (let node of nodes) {
         if (node._isDecrypting || _hsInfly.has(node)) continue;
+        // If node was processed as handshake, keep it hidden (Angular may unhide)
+        if (node._hsProcessed) {
+            if (node.style.display !== "none") node.style.display = "none";
+            continue;
+        }
         let text = node.textContent.trim();
         let ct = stripInvisibles(text);
 
