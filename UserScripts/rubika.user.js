@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.3
+// @version      7.4
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -35,7 +35,10 @@ const _origProtoSend=OrigWS.prototype.send;
 OrigWS.prototype.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return _origProtoSend.apply(this,arguments);};
 
 // ── Notifications via WebSocket decryption ──
-let _authKey=null, _passKey=null, _myGuid=null;
+let _authKey=null, _passKey=null, _myGuid=null, _lastFocusTime=Date.now();
+_W.addEventListener("focus",()=>{_lastFocusTime=Date.now();});
+_W.addEventListener("blur",()=>{_lastFocusTime=0;});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)_lastFocusTime=Date.now();else _lastFocusTime=0;});
 function derivePassphrase(auth){
     if(auth.length!==32)return auth;
     const c0=auth.slice(0,8),c1=auth.slice(8,16),c2=auth.slice(16,24),c3=auth.slice(24,32);
@@ -124,8 +127,8 @@ function showMsgNotification(chatName,text,authorName){
                                             // Get chat name from sidebar
                                             const chatGuid=mm.object_guid||m.object_guid||"";
                                             let chatName=authorName||"New message";
-                                            // Skip if tab is focused
-                                            if(document.hasFocus())continue;
+                                            // Skip if tab was recently focused (within 5s)
+                                            if(_lastFocusTime&&Date.now()-_lastFocusTime<5000)continue;
                                             try{
                                                 const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
                                                 for(const li of items){
@@ -379,11 +382,16 @@ async function compress(text) {
 }
 
 async function decompress(data) {
-    let ds = new DecompressionStream(COMPRESS);
-    let w = ds.writable.getWriter();
-    w.write(data);
-    w.close();
-    return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+    try {
+        let ds = new DecompressionStream(COMPRESS);
+        let w = ds.writable.getWriter();
+        w.write(data);
+        w.close();
+        return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+    } catch(_) {
+        // Fallback: data wasn't compressed (short messages skip compression)
+        return new TextDecoder().decode(data);
+    }
 }
 
 const B85_DECODE = new Uint8Array(128);
@@ -428,9 +436,10 @@ async function encrypt(text) {
     let k = getKey();
     if (!k) return null;
     let iv = crypto.getRandomValues(new Uint8Array(12));
-    let comp = await compress(text);
+    // Skip compression for short messages — faster encrypt
+    let data = text.length < 200 ? new TextEncoder().encode(text) : await compress(text);
     let aesKey = await deriveKey(k);
-    let enc = new Uint8Array(await crypto.subtle.encrypt({ name: ALGO, iv }, aesKey, comp));
+    let enc = new Uint8Array(await crypto.subtle.encrypt({ name: ALGO, iv }, aesKey, data));
     let combined = new Uint8Array(12 + enc.length);
     combined.set(iv);
     combined.set(enc, 12);
@@ -1457,6 +1466,28 @@ function injectUI() {
                 document.getElementById("secure-input-overlay")?.focus();
             }
         });
+        // Block ALL input on native textarea when encryption is on
+        for (const evt of ["keydown","keypress","keyup","input","beforeinput","paste","drop","compositionstart","compositionend"]) {
+            textarea.addEventListener(evt, e => {
+                if (!isBypass && isEnabled()) {
+                    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+                    document.getElementById("secure-input-overlay")?.focus();
+                }
+            }, true);
+        }
+        // Also block the contenteditable composer inside
+        let composer = textarea.querySelector(".composer_rich_textarea") || textarea;
+        if (composer !== textarea && !composer._hasStrictHijack) {
+            composer._hasStrictHijack = true;
+            for (const evt of ["keydown","keypress","keyup","input","beforeinput","paste","drop"]) {
+                composer.addEventListener(evt, e => {
+                    if (!isBypass && isEnabled()) {
+                        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+                        document.getElementById("secure-input-overlay")?.focus();
+                    }
+                }, true);
+            }
+        }
     }
 
     if (inputWrapper && !inputWrapper._hasStrictHijack) {
@@ -1474,6 +1505,13 @@ function injectUI() {
                 document.getElementById("secure-input-overlay")?.focus();
             }
         }, true);
+        for (const evt of ["keydown","keypress","input","beforeinput"]) {
+            inputWrapper.addEventListener(evt, e => {
+                if (!isBypass && isEnabled()) {
+                    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+                }
+            }, true);
+        }
     }
 
     let secureInput = document.createElement("div");
