@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.5
+// @version      6.6
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -33,6 +33,136 @@ PW.CONNECTING=OrigWS.CONNECTING;PW.OPEN=OrigWS.OPEN;PW.CLOSING=OrigWS.CLOSING;PW
 // Draft blocker — must run before Angular creates WebSocket instances
 const _origProtoSend=OrigWS.prototype.send;
 OrigWS.prototype.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return _origProtoSend.apply(this,arguments);};
+
+// ── Notifications via WebSocket decryption ──
+let _authKey=null, _passKey=null, _myGuid=null;
+function derivePassphrase(auth){
+    if(auth.length!==32)return auth;
+    const c0=auth.slice(0,8),c1=auth.slice(8,16),c2=auth.slice(16,24),c3=auth.slice(24,32);
+    let r=c2+c0+c3+c1,out="";
+    for(let i=0;i<r.length;i++){const c=r.charCodeAt(i);
+        if(c>=48&&c<=57)out+=String.fromCharCode((c-48+5)%10+48);
+        else if(c>=97&&c<=122)out+=String.fromCharCode((c-97+9)%26+97);
+        else out+=r[i];}
+    return out;
+}
+async function aesCbcDecrypt(b64data,key){
+    try{
+        let raw=atob(b64data);const data=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)data[i]=raw.charCodeAt(i);
+        const iv=new Uint8Array(16); // zero IV
+        const keyBuf=new TextEncoder().encode(key);
+        const ck=await crypto.subtle.importKey("raw",keyBuf,{name:"AES-CBC"},false,["decrypt"]);
+        const dec=new Uint8Array(await crypto.subtle.decrypt({name:"AES-CBC",iv},ck,data));
+        // Remove PKCS7 padding
+        const pad=dec[dec.length-1];if(pad>0&&pad<=16){const unpd=dec.slice(0,dec.length-pad);return new TextDecoder().decode(unpd);}
+        return new TextDecoder().decode(dec);
+    }catch(_){return null;}
+}
+function showMsgNotification(chatName,text,authorName){
+    if(!("Notification" in _W))return;
+    if(Notification.permission==="default"){Notification.requestPermission();return;}
+    if(Notification.permission!=="granted")return;
+    let title=authorName&&authorName!==chatName?authorName+" in "+chatName:chatName;
+    let body=text||"New message";
+    if(body.length>120)body=body.slice(0,120)+"\u2026";
+    try{
+        const n=new Notification(title,{body,icon:"https://web.rubika.ir/assets/img/iphone_home120.png",tag:"rb-"+chatName,silent:false});
+        n.onclick=()=>{_W.focus();n.close();};
+        setTimeout(()=>n.close(),8000);
+    }catch(_){}
+}
+// Capture auth from handshake, intercept incoming messages
+(function(){
+    const origAddEL=OrigWS.prototype.addEventListener;
+    const pwSendOrig=PW.prototype.send;
+    // We already wrap ws.send in PW — enhance it to capture auth
+    const _origPWSend=_W.WebSocket;
+    // Intercept at the instance level — patch PW to also capture auth and messages
+    const _origPW=PW;
+    // Instead of re-patching PW, hook into each instance via the existing message listener
+    // We'll add a message interceptor to the OrigWS prototype
+    const _omsgHandlers=new WeakMap();
+    OrigWS.prototype.addEventListener=function(type,fn,...rest){
+        if(type==="message"){
+            const wrapped=function(e){
+                // Try to decrypt and notify
+                try{
+                    if(_passKey&&e.data&&typeof e.data==="string"){
+                        const msg=JSON.parse(e.data);
+                        if(msg.data_enc){
+                            aesCbcDecrypt(msg.data_enc,_passKey).then(plain=>{
+                                if(!plain)return;
+                                try{
+                                    const d=JSON.parse(plain);
+                                    // Chat updates with messages
+                                    if(d.message_updates||d.chat_updates){
+                                        const msgs=d.message_updates||[];
+                                        for(const m of msgs){
+                                            const mm=m.message||m;
+                                            const authorGuid=mm.author_object_guid||mm.author_guid||"";
+                                            // Don't notify for own messages
+                                            if(_myGuid&&authorGuid===_myGuid)continue;
+                                            const text=mm.text||"";
+                                            const authorName=mm.author_name||"";
+                                            // Get chat name from sidebar
+                                            const chatGuid=mm.object_guid||m.object_guid||"";
+                                            let chatName=authorName||"New message";
+                                            // Try to find chat name in DOM
+                                            const activeHash=location.hash;
+                                            if(activeHash==="#c="+chatGuid&&document.hasFocus())continue; // skip if viewing this chat
+                                            try{
+                                                const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
+                                                for(const li of items){
+                                                    const pt=li.querySelector(".peer-title");
+                                                    if(pt&&li.innerHTML.includes(chatGuid)){chatName=pt.textContent.trim();break;}
+                                                }
+                                            }catch(_){}
+                                            if(text||authorName)showMsgNotification(chatName,text,authorName);
+                                        }
+                                    }
+                                }catch(_){}
+                            }).catch(()=>{});
+                        }
+                    }
+                }catch(_){}
+                return fn.call(this,e);
+            };
+            _omsgHandlers.set(fn,wrapped);
+            return origAddEL.call(this,type,wrapped,...rest);
+        }
+        return origAddEL.call(this,type,fn,...rest);
+    };
+    // Capture auth from send
+    const _origSendProto=OrigWS.prototype.send;
+    const _prevSend=OrigWS.prototype.send;
+    OrigWS.prototype.send=function(d){
+        try{
+            if(typeof d==="string"){
+                const p=JSON.parse(d);
+                if(p.method==="handShake"&&p.auth&&p.auth.length===32){
+                    _authKey=p.auth;_passKey=derivePassphrase(p.auth);
+                    console.log("[RB] Auth captured, notifications enabled");
+                }
+                if(d.includes("EditParameter")&&d.includes("drafts_"))return;
+            }
+        }catch(_){}
+        return _origProtoSend.apply(this,arguments);
+    };
+    // Try to get myGuid from localStorage
+    try{
+        for(let i=0;i<localStorage.length;i++){
+            const k=localStorage.key(i);
+            if(k&&localStorage.getItem(k)){
+                try{const v=JSON.parse(localStorage.getItem(k));if(v&&v.user_guid){_myGuid=v.user_guid;break;}}catch(_){}
+            }
+        }
+    }catch(_){}
+    // Ask notification permission
+    if("Notification" in _W&&Notification.permission==="default"){
+        document.addEventListener("click",function ask(){Notification.requestPermission();document.removeEventListener("click",ask);},{once:true});
+    }
+})();
+
 const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=15000;}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
@@ -1507,77 +1637,7 @@ function injectUI() {
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
 
-// ── Notifications ──
-(function initNotifications() {
-    if (!("Notification" in window)) return;
-    if (Notification.permission === "default") {
-        // Ask permission on first user interaction
-        let asked = false;
-        document.addEventListener("click", function askPerm() {
-            if (!asked) { asked = true; Notification.requestPermission(); document.removeEventListener("click", askPerm); }
-        });
-    }
-
-    // Track unread state per chat
-    let prevUnreads = new Map();
-    let notifCooldown = new Map(); // prevent spam
-
-    function checkNotifications() {
-        if (Notification.permission !== "granted") return;
-        // Only notify when tab is hidden or not focused
-        if (document.hasFocus()) { prevUnreads.clear(); return; }
-
-        let chatItems = document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
-        for (let li of chatItems) {
-            // Skip active/open chat
-            if (li.classList.contains("open")) continue;
-
-            let badge = li.querySelector(".badge.badge-primary:not(.badge-ads):not([hidden])");
-            let count = badge ? parseInt(badge.textContent.trim()) || 0 : 0;
-            if (count <= 0) continue;
-
-            let nameEl = li.querySelector(".peer-title");
-            let name = nameEl ? nameEl.textContent.trim() : "New message";
-
-            let msgEl = li.querySelector(".user-last-message");
-            let preview = msgEl ? msgEl.textContent.trim() : "";
-            if (preview.length > 80) preview = preview.slice(0, 80) + "\u2026";
-
-            // Check if this is a NEW unread (count increased)
-            let key = name;
-            let prev = prevUnreads.get(key) || 0;
-            if (count > prev) {
-                // Cooldown: max 1 notif per chat per 10s
-                let lastNotif = notifCooldown.get(key) || 0;
-                if (Date.now() - lastNotif > 10000) {
-                    notifCooldown.set(key, Date.now());
-                    try {
-                        let n = new Notification(name, {
-                            body: preview || "New message",
-                            icon: "https://web.rubika.ir/assets/img/iphone_home120.png",
-                            tag: "rb-" + key, // replace previous notif from same chat
-                            silent: false
-                        });
-                        n.onclick = function() { window.focus(); li.click(); n.close(); };
-                        setTimeout(() => n.close(), 8000);
-                    } catch(e) { console.log("[RB] Notif error:", e); }
-                }
-            }
-            prevUnreads.set(key, count);
-        }
-    }
-
-    // Check every 2 seconds
-    setInterval(checkNotifications, 2000);
-
-    // Also check on visibility change (tab hidden → messages may arrive)
-    document.addEventListener("visibilitychange", () => {
-        if (document.hidden) {
-            // Reset so we detect new unreads while hidden
-            prevUnreads.clear();
-        }
-    });
-})();
+// Notifications now handled via WebSocket decryption in connectivity fix
 
 // Handshake cleanup
 function cleanupHs(){dbOp("handshakes","getAll").then(hs=>{const now=Date.now();hs.forEach(h=>{if(h.stage!=="confirmed"&&now-h.createdAt>CFG.HS_CLEANUP)dbOp("handshakes","del",h.nonce);});}).catch(()=>{});}
