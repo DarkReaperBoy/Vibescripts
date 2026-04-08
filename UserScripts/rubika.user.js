@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.7
+// @version      6.8
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -18,7 +18,10 @@ function bestS(){for(let i=0;i<_rk.sock.length;i++){const u=_rk.sock[(_ri.sock+i
 function rotS(b){if(b){_bad.add(b);setTimeout(()=>_bad.delete(b),30000);}if(_rk.sock.length>1)_ri.sock=(_ri.sock+1)%_rk.sock.length;}
 function bestA(){return _rk.api[_ri.api]||null;}
 function rotA(){if(_rk.api.length>1)_ri.api=(_ri.api+1)%_rk.api.length;}
-async function raceDCs(){try{const r=await fetch("https://getdcmess.iranlms.ir/",{signal:AbortSignal.timeout(12000)});const d=(await r.json()).data;let a=[],s=[];if(d.API)a=Object.values(d.API).filter(Boolean);if(d.socket)s=Object.values(d.socket).filter(Boolean);else if(d.Socket)s=Object.values(d.Socket).filter(Boolean);a=[...new Set(a.map(u=>u.endsWith("/")?u:u+"/"))];s=[...new Set(s)];if(a.length){const rs=await Promise.allSettled(a.map(async u=>{const t=performance.now();await fetch(u,{method:"POST",headers:{"Content-Type":"text/plain"},body:"{}",signal:AbortSignal.timeout(10000)});return{u,ms:performance.now()-t};}));_rk.api=rs.filter(x=>x.status==="fulfilled").map(x=>x.value).sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(_rk.api);a.forEach(u=>{if(!seen.has(u))_rk.api.push(u);});}
+// XHR-based API probe (avoids CORS issues that fetch has)
+function xhrProbe(url){return new Promise((res,rej)=>{const x=new XMLHttpRequest();x.open("POST",url,true);x.setRequestHeader("Content-Type","text/plain");x.timeout=10000;x.onload=()=>res();x.onerror=()=>rej();x.ontimeout=()=>rej();x.send("{}");});}
+async function raceDCs(){try{const r=await fetch("https://getdcmess.iranlms.ir/",{signal:AbortSignal.timeout(12000)});const d=(await r.json()).data;let a=[],s=[];if(d.API)a=Object.values(d.API).filter(Boolean);if(d.socket)s=Object.values(d.socket).filter(Boolean);else if(d.Socket)s=Object.values(d.Socket).filter(Boolean);a=[...new Set(a.map(u=>u.endsWith("/")?u:u+"/"))];s=[...new Set(s)];
+if(a.length){const rs=await Promise.allSettled(a.map(async u=>{const t=performance.now();await xhrProbe(u);return{u,ms:performance.now()-t};}));_rk.api=rs.filter(x=>x.status==="fulfilled").map(x=>x.value).sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(_rk.api);a.forEach(u=>{if(!seen.has(u))_rk.api.push(u);});}
 if(s.length)_rk.sock=await new Promise(res=>{const r=[],st={},ws=[];let n=s.length;const to=setTimeout(fin,10000);function fin(){clearTimeout(to);ws.forEach(w=>{try{w.close();}catch(_){}});const ok=r.sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(ok);s.forEach(u=>{if(!seen.has(u))ok.push(u);});res(ok);}s.forEach(u=>{try{st[u]=performance.now();const w=new OrigWS(u);ws.push(w);w.onopen=()=>{r.push({u,ms:performance.now()-st[u]});if(--n<=0)fin();};w.onerror=()=>{if(--n<=0)fin();};}catch(_){if(--n<=0)fin();}});if(n<=0)fin();});
 }catch(e){console.log("[RB] DC fail:",e.message);}}
 raceDCs();setTimeout(()=>{if(!_rk.api.length)raceDCs();},15000);
@@ -171,7 +174,7 @@ function showMsgNotification(chatName,text,authorName){
 })();
 
 const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=15000;}return oO.call(this,m,u,...r);};
+XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;if(typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){this.timeout=15000;}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
 _W.addEventListener("online",()=>{setTimeout(()=>{if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));},1000);});
