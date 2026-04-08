@@ -43,13 +43,88 @@ setInterval(()=>{if(!aSock||aSock.readyState!==1)return;if(Date.now()-lastM>aPiT
 function _rbInitEnc(){
 !function(){"use strict";
 
+const CFG = Object.freeze({
+    KEY_LEN:32, MAX_ENC:4000, TOAST_MS:4500, LONG_PRESS:400,
+    SEND_DLY:60, POST_DLY:100, MAX_DEPTH:10, KCACHE:16,
+    CHARS:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
+    B85:"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
+    PFX_E:"@@", PFX_E2:"@@+", PFX_H:"!!", HS_EXP:86400, HS_CLEANUP:86400000
+});
 const ALGO = "AES-GCM";
 const COMPRESS = "deflate";
 const SETTINGS_PREFIX = "rubika_bridge_settings_";
-const BASE85_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-const KEY_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~";
+const BASE85_CHARS = CFG.B85;
+const KEY_CHARS = CFG.CHARS;
 const HTML_ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"};
 const URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
+const _C = crypto, _S = crypto.subtle;
+
+function u8(ab){ const v=new Uint8Array(ab),c=new Uint8Array(v.length);c.set(v);return c; }
+function toB64(buf){ let b="";const a=buf instanceof Uint8Array?buf:new Uint8Array(buf);for(let i=0;i<a.byteLength;i++)b+=String.fromCharCode(a[i]);return btoa(b).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
+function fromB64(s){ let c=s.replace(/[^A-Za-z0-9\-_]/g,"").replace(/-/g,"+").replace(/_/g,"/");c+="=".repeat((4-(c.length%4))%4);const b=atob(c),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a; }
+function fromLegacyB64(s){ let c=s.replace(/[^A-Za-z0-9\-_.+/=]/g,"").replace(/-/g,"+").replace(/_/g,"/").replace(/\./g,"=").replace(/=+$/,"");c+="=".repeat((4-(c.length%4))%4);const b=atob(c),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a; }
+function decodeB64Smart(s){ try{const r=fromB64(s);if(r.length>0)return r;}catch(_){} try{const r=fromLegacyB64(s);if(r.length>0)return r;}catch(_){} return null; }
+
+// ── Crypto helpers ──
+async function digest(d){ return u8(await _S.digest("SHA-256",d)); }
+function toHex(b){ return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join(""); }
+function fromHex(h){ if(!h)return new Uint8Array(0);const a=new Uint8Array(h.length/2);for(let i=0;i<h.length;i+=2)a[i/2]=parseInt(h.substring(i,i+2),16);return a; }
+function concatBytes(...a){ let t=a.reduce((s,x)=>s+x.length,0),r=new Uint8Array(t),o=0;for(const x of a){r.set(x,o);o+=x.length;}return r; }
+async function getFpStr(pub){ return toHex(await digest(pub)).slice(0,8).toUpperCase(); }
+async function ecSign(priv,buf){ return u8(await _S.sign({name:"ECDSA",hash:"SHA-256"},priv,buf)); }
+async function ecVerify(pubRaw,sig,buf){ try{const p=await _S.importKey("raw",pubRaw,{name:"ECDSA",namedCurve:"P-256"},false,["verify"]);return await _S.verify({name:"ECDSA",hash:"SHA-256"},p,sig,buf);}catch(_){return false;} }
+async function deriveSymmetric(myPrivBuf,theirPubRaw,nonce,initIdPub,respIdPub,initEphPub,respEphPub){
+    const myPriv=await _S.importKey("pkcs8",myPrivBuf,{name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const theirPub=await _S.importKey("raw",theirPubRaw,{name:"ECDH",namedCurve:"P-256"},true,[]);
+    const shared=await _S.deriveBits({name:"ECDH",public:theirPub},myPriv,256);
+    const hkdfKey=await _S.importKey("raw",shared,{name:"HKDF"},false,["deriveBits"]);
+    const info=concatBytes(initEphPub,respEphPub,nonce,initIdPub,respIdPub);
+    const salt=u8(await _S.digest("SHA-256",concatBytes(nonce,initIdPub,respIdPub)));
+    const material=u8(await _S.deriveBits({name:"HKDF",hash:"SHA-256",salt,info},hkdfKey,96*8));
+    const keyMat=material.slice(0,64),hmacMat=material.slice(64,96);
+    const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[];let f=0;
+    for(let i=0;i<keyMat.length&&f<CFG.KEY_LEN;i++)if(keyMat[i]<mx)r[f++]=c[keyMat[i]%cl];
+    if(f<CFG.KEY_LEN)throw new Error("Key Exhaustion");
+    return{sessionKey:r.join(""),hmacKeyBytes:hmacMat};
+}
+function genKey(){ const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[];let f=0;while(f<CFG.KEY_LEN){const b=new Uint8Array(64);_C.getRandomValues(b);for(let i=0;i<64&&f<CFG.KEY_LEN;i++)if(b[i]<mx)r[f++]=c[b[i]%cl];}return r.join(""); }
+
+// ── IndexedDB ──
+function safeClone(obj){if(obj==null||typeof obj!=="object")return obj;try{return structuredClone(obj);}catch(_){}try{return JSON.parse(JSON.stringify(obj));}catch(_){}return obj;}
+let _db,_memDB={identity:{},contacts:{},handshakes:{}},_useMem=false;
+async function getDB(){
+    if(_useMem)return null;if(_db)return _db;
+    return new Promise((res,rej)=>{const rq=indexedDB.open("rubika_bridge_db",2);
+    rq.onupgradeneeded=e=>{const d=e.target.result;if(e.oldVersion<2){for(const n of["identity","contacts","handshakes"])if(d.objectStoreNames.contains(n))d.deleteObjectStore(n);}for(const[n,k]of[["identity","id"],["contacts","id"],["handshakes","nonce"]])if(!d.objectStoreNames.contains(n))d.createObjectStore(n,{keyPath:k});};
+    rq.onsuccess=e=>{_db=e.target.result;res(_db);};rq.onerror=()=>{_useMem=true;rej(rq.error);};});
+}
+async function dbOp(s,o,v){
+    try{const d=await getDB();if(!d)throw 0;return new Promise((res,rej)=>{const tx=d.transaction(s,o==="get"||o==="getAll"?"readonly":"readwrite"),st=tx.objectStore(s);let rq;if(o==="get")rq=st.get(v);else if(o==="put")rq=st.put(safeClone(v));else if(o==="del")rq=st.delete(v);else rq=st.getAll();rq.onsuccess=()=>{try{res(rq.result!=null&&typeof rq.result==="object"?safeClone(rq.result):rq.result);}catch(_){res(rq.result);}};rq.onerror=()=>rej(rq.error);});
+    }catch(_){_useMem=true;if(o==="get")return _memDB[s][v]?safeClone(_memDB[s][v]):undefined;if(o==="put"){_memDB[s][v.id||v.nonce]=safeClone(v);return v;}if(o==="del"){delete _memDB[s][v];return;}return Object.values(_memDB[s]).map(safeClone);}
+}
+
+// ── Identity & Trust ──
+async function getMyId(){
+    let rec=await dbOp("identity","get","self");
+    if(rec&&rec.pubHex&&rec.privHex){try{const pubBuf=fromHex(rec.pubHex),privBuf=fromHex(rec.privHex);const pub=await _S.importKey("raw",pubBuf,{name:"ECDSA",namedCurve:"P-256"},true,["verify"]);const priv=await _S.importKey("pkcs8",privBuf,{name:"ECDSA",namedCurve:"P-256"},true,["sign"]);return{pub,priv,pubRaw:pubBuf,fp:await getFpStr(pubBuf)};}catch(_){}}
+    const kp=await _S.generateKey({name:"ECDSA",namedCurve:"P-256"},true,["sign","verify"]);
+    const pubRaw=u8(await _S.exportKey("raw",kp.publicKey)),privPkcs8=u8(await _S.exportKey("pkcs8",kp.privateKey));
+    await dbOp("identity","put",{id:"self",pubHex:toHex(pubRaw),privHex:toHex(privPkcs8),createdAt:Date.now()});
+    return{pub:kp.publicKey,priv:kp.privateKey,pubRaw,fp:await getFpStr(pubRaw)};
+}
+async function getTrustInfo(idPubRaw,chatId){
+    const h=toHex(await digest(idPubRaw)),cid=h.slice(0,16),fp=h.slice(0,8).toUpperCase(),all=await dbOp("contacts","getAll");
+    const ex=all.find(c=>c.id===cid);if(ex)return{state:"known",fp,cid};
+    const oc=all.find(c=>c.chatId===chatId);if(oc)return{state:"changed",fp,cid,oldFp:oc.id.slice(0,8).toUpperCase()};
+    return{state:"new",fp,cid};
+}
+let _hsLock=Promise.resolve();
+function hsLock(fn){let unlock;const prev=_hsLock;_hsLock=new Promise(r=>unlock=r);return prev.then(()=>fn()).finally(()=>unlock());}
+function formatError(e){if(!e)return"Unknown Error";return(e.name?e.name+": ":"")+(e.message||String(e));}
+function tsBuf(){const ts=Math.floor(Date.now()/1000);return new Uint8Array([(ts>>>24)&255,(ts>>>16)&255,(ts>>>8)&255,ts&255]);}
+const chatType=()=>{const h=location.hash;if(h.includes("g0"))return"group";if(h.includes("c0"))return"channel";return"dm";};
+const isGroup=()=>chatType()==="group";
+function stripInvisibles(s){return s.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFFF9-\uFFFB]/g,"");}
 
 let cachedChatId = null;
 let cachedSettings = null;
@@ -231,6 +306,145 @@ async function splitEncrypt(text) {
     return a && b ? [...a, ...b] : null;
 }
 
+// ── ECDH Bridge ──
+function renderHS(el,text,cc,fp,trust,onAction,btnText){
+    btnText=btnText||"Accept & Connect";
+    const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#555";
+    const bg=cc==="ac"?"rgba(0,171,128,.1)":cc==="wrn"?"rgba(210,153,34,.1)":cc==="err"?"rgba(248,81,73,.1)":"rgba(0,0,0,.06)";
+    let h='<div style="border:1.5px solid '+c+';background:'+bg+';border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;font-size:14px;color:'+c+'">'+escapeHtml(text)+'</span>';
+    if(fp){h+='<div style="font-family:monospace;font-size:11.5px;margin:4px 0;font-weight:600;color:#00ab80">Fingerprint: '+escapeHtml(fp)+'</div>';h+='<div style="color:'+(trust&&trust.includes("\u26a0")?"#d32f2f":"#555")+';font-weight:500;margin-bottom:'+(onAction?"8px":"0")+'">'+escapeHtml(trust||"")+'</div>';}
+    if(onAction)h+='<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:'+c+';color:#fff">'+escapeHtml(btnText)+'</button>';
+    h+='</div>';el.innerHTML=h;
+    if(onAction){const btn=el.querySelector(".bb-hs-btn");if(btn)btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();};}
+}
+function toast(m,d){d=d||CFG.TOAST_MS;const el=document.createElement("div");el.textContent=m;Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s",whiteSpace:"nowrap"});document.body.appendChild(el);requestAnimationFrame(()=>{el.style.opacity="1";});setTimeout(()=>{el.style.opacity="0";setTimeout(()=>el.remove(),250);},d);}
+
+async function sendViaBridge(text){
+    let ta=findTextarea();if(!ta)return;
+    let hide=findInputWrapper()||ta;
+    hide.classList.remove("rb-locked-input");
+    hide.style.cssText="position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
+    ta.focus();document.execCommand("selectAll",false,null);document.execCommand("insertText",false,text);
+    ta.dispatchEvent(new Event("input",{bubbles:true}));
+    await delay(200);
+    let btn=findSendButton();
+    if(btn){let o={bubbles:true,cancelable:true,view:window};btn.dispatchEvent(new PointerEvent("pointerdown",o));btn.dispatchEvent(new MouseEvent("mousedown",o));btn.dispatchEvent(new PointerEvent("pointerup",o));btn.dispatchEvent(new MouseEvent("mouseup",o));btn.dispatchEvent(new MouseEvent("click",o));btn.click();}
+    await delay(300);ta.focus();document.execCommand("selectAll",false,null);document.execCommand("insertText",false,"");ta.dispatchEvent(new Event("input",{bubbles:true}));
+    hide.style.cssText="";hide.classList.add("rb-locked-input");
+}
+
+async function startBridge(){
+    const id=await getMyId(),eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
+    const nonce=new Uint8Array(16);_C.getRandomValues(nonce);
+    const payload=concatBytes(new Uint8Array([1,1]),nonce,tsBuf(),id.pubRaw,ephPub);
+    const sig=await ecSign(id.priv,payload),msg=concatBytes(payload,sig);
+    const hsRec={nonce:toHex(nonce),chatId:getChatId(),role:"initiator",stage:"invited",ephPrivHex:toHex(ephPriv),ephPubHex:toHex(ephPub),initIdPubHex:toHex(id.pubRaw),theirIdentityKeyHex:null,createdAt:Date.now(),payloadHashHex:toHex(await digest(payload)),chatType:chatType()};
+    if(isGroup())hsRec.groupKey=genKey();
+    await dbOp("handshakes","put",hsRec);
+    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!");refreshUI();
+}
+async function acceptBridge(data,el){
+    const id=await getMyId(),eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
+    const{sessionKey,hmacKeyBytes}=await deriveSymmetric(ephPriv,data.theirEphPubRaw,data.nonce,data.theirIdPubRaw,id.pubRaw,data.theirEphPubRaw,ephPub);
+    const payload=concatBytes(new Uint8Array([1,2]),data.nonce,tsBuf(),data.payloadHash,id.pubRaw,ephPub);
+    const sig=await ecSign(id.priv,payload),msg=concatBytes(payload,sig);
+    await dbOp("handshakes","put",{nonce:toHex(data.nonce),chatId:getChatId(),role:"responder",stage:"accepted",derivedKey:sessionKey,hmacKeyHex:toHex(hmacKeyBytes),theirIdentityKeyHex:toHex(data.theirIdPubRaw),createdAt:Date.now()});
+    renderHS(el,"\ud83d\udd04 Bridge accepted — waiting for confirmation","wrn");
+    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));
+}
+async function processAccept(data,hs,el){
+    const id=await getMyId();
+    const hsNonce=fromHex(hs.nonce),hsInitPub=fromHex(hs.initIdPubHex),hsEphPub=fromHex(hs.ephPubHex),myPriv=fromHex(hs.ephPrivHex);
+    const{sessionKey,hmacKeyBytes}=await deriveSymmetric(myPriv,data.theirEphPubRaw,hsNonce,hsInitPub,data.theirIdPubRaw,hsEphPub,data.theirEphPubRaw);
+    const hmacKey=await _S.importKey("raw",hmacKeyBytes,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const hmacVal=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),hsNonce)));
+    const useGK=hs.chatType==="group"&&hs.groupKey;
+    const activeKey=useGK?hs.groupKey:sessionKey;
+    let payload,encBlob;
+    if(useGK){const pw=await _S.importKey("raw",new TextEncoder().encode(sessionKey),{name:"AES-GCM"},false,["encrypt"]);const iv=new Uint8Array(12);_C.getRandomValues(iv);const ct=u8(await _S.encrypt({name:"AES-GCM",iv},pw,new TextEncoder().encode(hs.groupKey)));encBlob=concatBytes(iv,ct);payload=concatBytes(new Uint8Array([1,4]),hsNonce,tsBuf(),hmacVal,encBlob);}
+    else{payload=concatBytes(new Uint8Array([1,3]),hsNonce,tsBuf(),hmacVal);}
+    const sig=await ecSign(id.priv,payload),msg=concatBytes(payload,sig);
+    saveSettings({enabled:true,customKey:activeKey});
+    await dbOp("contacts","put",{id:data.cid,chatId:getChatId(),pubHex:toHex(data.theirIdPubRaw),lastSeen:Date.now()});
+    delete hs.ephPrivHex;hs.derivedKey=sessionKey;hs.stage="confirmed";await dbOp("handshakes","put",hs);
+    refreshUI();await sendViaBridge(CFG.PFX_H+" "+toB64(msg));renderHS(el,useGK?"\u2705 Group bridge — key delivered":"\u2705 Bridge established","ac");
+}
+async function processConfirm(data,hs,el){
+    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
+    if(toHex(data.hmac)!==toHex(expected))throw new Error("HMAC Verification Failed");
+    saveSettings({enabled:true,customKey:hs.derivedKey});
+    const fp=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
+    await dbOp("contacts","put",{id:fp.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
+    delete hs.hmacKeyHex;hs.stage="confirmed";await dbOp("handshakes","put",hs);
+    refreshUI();renderHS(el,"\u2705 Bridge established","ac");
+}
+async function processGroupConfirm(data,hs,el){
+    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
+    if(toHex(data.hmac)!==toHex(expected))throw new Error("HMAC Verification Failed");
+    const pw=await _S.importKey("raw",new TextEncoder().encode(hs.derivedKey),{name:"AES-GCM"},false,["decrypt"]);
+    const gkIv=data.encBlob.slice(0,12),gkCt=data.encBlob.slice(12);
+    const groupKey=new TextDecoder().decode(u8(await _S.decrypt({name:"AES-GCM",iv:gkIv},pw,gkCt)));
+    if(groupKey.length!==CFG.KEY_LEN)throw new Error("Invalid group key length");
+    saveSettings({enabled:true,customKey:groupKey});
+    const fp=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
+    await dbOp("contacts","put",{id:fp.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
+    delete hs.hmacKeyHex;hs.stage="confirmed";hs.groupKey=groupKey;await dbOp("handshakes","put",hs);
+    refreshUI();renderHS(el,"\u2705 Group bridge established","ac");
+}
+async function handleHandshake(b64,el){
+    if(el._hsProcessed)return;el._hsProcessed=true;
+    try{
+        const bytes=decodeB64Smart(b64);if(!bytes||bytes.length<118)return;
+        const ver=bytes[0],type=bytes[1];if(ver!==1)return;
+        const nonce=bytes.slice(2,18),hexNonce=toHex(nonce);
+        const myId=await getMyId(),hs=await dbOp("handshakes","get",hexNonce);
+        if(type===1){
+            if(bytes.length!==216)return;
+            const payload=bytes.slice(0,152),sig=bytes.slice(152,216),idPub=bytes.slice(22,87),ephPub=bytes.slice(87,152);
+            if(!await ecVerify(idPub,sig,payload))return;
+            if(toHex(idPub)===toHex(myId.pubRaw))return renderHS(el,"\ud83d\udd04 Bridge invite sent","txM");
+            if(hs){if(hs.stage==="accepted")return renderHS(el,"\ud83d\udd04 Waiting for confirmation","wrn");if(hs.stage==="confirmed")return renderHS(el,"\u2705 Bridge established","ac");return renderHS(el,"\ud83e\udd1d Processed","txM");}
+            const trust=await getTrustInfo(idPub,getChatId()),hsList=await dbOp("handshakes","getAll");
+            const out=hsList.find(h=>h.chatId===getChatId()&&h.role==="initiator"&&h.stage==="invited");
+            if(out){if(myId.fp<trust.fp)return renderHS(el,"\ud83e\udd1d Collision avoided","txM");else if(myId.fp>trust.fp)await dbOp("handshakes","del",out.nonce);else return;}
+            const tStr=trust.state==="new"?"\ud83c\udd95 New contact":trust.state==="known"?"\u2705 Known contact":"\u26a0\ufe0f IDENTITY CHANGED — old: "+trust.oldFp+", new: "+trust.fp;
+            renderHS(el,isGroup()?"\ud83d\udee1\ufe0f Group Bridge Request":"\ud83d\udee1\ufe0f Secure Bridge Request","ac",trust.fp,tStr,async()=>{
+                try{await acceptBridge({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,payloadHash:await digest(payload)},el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            },isGroup()?"Join Group Bridge":"Accept & Connect");
+        }else if(type===2){
+            if(bytes.length!==248)return;
+            const payload=bytes.slice(0,184),sig=bytes.slice(184,248),invHash=bytes.slice(22,54),idPub=bytes.slice(54,119),ephPub=bytes.slice(119,184);
+            if(!await ecVerify(idPub,sig,payload))return;
+            if(toHex(idPub)===toHex(myId.pubRaw))return renderHS(el,"\ud83d\udd04 Bridge accept sent","txM");
+            if(!hs||hs.role!=="initiator"||hs.stage!=="invited"){if(hs&&hs.stage==="confirmed")return renderHS(el,"\u2705 Bridge established","ac");return renderHS(el,"\ud83e\udd1d Processed","txM");}
+            if(toHex(invHash)!==toHex(fromHex(hs.payloadHashHex)))return;
+            const trust=await getTrustInfo(idPub,getChatId());
+            const doAccept=async()=>{try{await processAccept({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,fp:trust.fp,cid:trust.cid},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}};
+            if(trust.state==="changed")renderHS(el,"\u26a0\ufe0f Identity Changed!","err",trust.fp,"Old: "+trust.oldFp+", New: "+trust.fp,doAccept,"Acknowledge & Connect");
+            else{renderHS(el,"\u2705 Bridge completing...","ac");await doAccept();}
+        }else if(type===3){
+            if(bytes.length!==118)return;
+            const hmac=bytes.slice(22,54),sig=bytes.slice(54,118);
+            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
+                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,bytes.slice(0,54)))return;
+                try{await processConfirm({hmac},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            }else{if(hs&&hs.stage==="confirmed")return renderHS(el,"\u2705 Bridge established","ac");renderHS(el,"\ud83e\udd1d Processed","txM");}
+        }else if(type===4){
+            if(bytes.length<178)return;
+            const hmac=bytes.slice(22,54),encBlob=bytes.slice(54,bytes.length-64);
+            const payload=bytes.slice(0,bytes.length-64),sig=bytes.slice(bytes.length-64);
+            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
+                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,payload))return;
+                try{await processGroupConfirm({hmac,encBlob},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            }else{if(hs&&hs.stage==="confirmed")return renderHS(el,"\u2705 Group bridge established","ac");renderHS(el,"\ud83e\udd1d Processed","txM");}
+        }
+    }catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+}
+
 function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 
 function renderInline(s) {
@@ -350,6 +564,11 @@ function openSettings() {
                     <span class="bb-key-counter" id="bb-key-counter">0 / 32</span>
                 </div>
             </div>
+            <div id="bb-bridge-section" style="margin-top:16px;border-top:1px solid #f4f5f7;padding-top:16px">
+                <div style="font-size:14px;font-weight:700;margin-bottom:4px">\ud83e\udd1d Automatic Key Exchange</div>
+                <div style="font-size:12px;color:#888;margin-bottom:10px" id="bb-bridge-desc">Establish encryption automatically with your contact.</div>
+                <button class="bb-tool-btn" id="bb-bridge-btn" style="width:100%;margin-top:8px">Loading...</button>
+            </div>
             <div class="bb-actions">
                 <button class="bb-btn bb-btn-cancel" id="bb-btn-cancel">Cancel</button>
                 <button class="bb-btn bb-btn-save" id="bb-btn-save">Save</button>
@@ -360,6 +579,8 @@ function openSettings() {
     let overlay = document.getElementById("bb-modal-overlay");
     let keyInput = document.getElementById("bb-custom-key");
     let keySection = document.getElementById("bb-key-section");
+    let bridgeSection = document.getElementById("bb-bridge-section");
+    let bridgeBtn = document.getElementById("bb-bridge-btn");
     let counter = document.getElementById("bb-key-counter");
     let error = document.getElementById("bb-key-error");
     let saveBtn = document.getElementById("bb-btn-save");
@@ -368,47 +589,65 @@ function openSettings() {
     let genBtn = document.getElementById("bb-gen-key");
     let visBtn = document.getElementById("bb-toggle-vis");
 
+    let _ig = isGroup();
+    if(_ig) document.getElementById("bb-bridge-desc").textContent = "Start a group bridge — each member joins individually.";
+
     function validate() {
         let len = keyInput.value.length;
         let on = enableChk.checked;
         counter.textContent = `${len} / 32`;
         counter.className = "bb-key-counter" + (len === 32 ? " exact" : "");
         keySection.style.display = on ? "" : "none";
+        bridgeSection.style.display = on ? "" : "none";
         if (!on) { error.textContent = ""; saveBtn.disabled = false; return; }
         if (len === 0) { error.textContent = "A key is required when encryption is enabled."; saveBtn.disabled = true; }
         else if (len !== 32) { error.textContent = `Key must be exactly 32 characters (currently ${len}).`; saveBtn.disabled = true; }
         else { error.textContent = ""; saveBtn.disabled = false; }
     }
 
-    keyInput.addEventListener("input", validate);
+    async function updateBridgeUI(){
+        try{
+            const hsList=await dbOp("handshakes","getAll");
+            const ahs=hsList.find(h=>h.chatId===getChatId()&&h.stage!=="confirmed"&&Date.now()-h.createdAt<CFG.HS_EXP*1000);
+            if(ahs){bridgeBtn.textContent="\ud83d\udd04 Waiting for response... (Cancel)";bridgeBtn.style.color="#d29922";bridgeBtn.onclick=async()=>{await dbOp("handshakes","del",ahs.nonce);updateBridgeUI();};}
+            else{const ch=hsList.find(h=>h.chatId===getChatId()&&h.stage==="confirmed"&&(h.derivedKey===keyInput.value||h.groupKey===keyInput.value));
+            if(ch&&keyInput.value.length===CFG.KEY_LEN){bridgeBtn.textContent=_ig?"\u2705 Group bridge active (Re-key)":"\u2705 Connected via Bridge (Re-key)";bridgeBtn.style.color="#00ab80";}
+            else{bridgeBtn.textContent=_ig?"\ud83e\udd1d Start Group Bridge":"\ud83e\udd1d Start Bridge";bridgeBtn.style.color="inherit";}
+            bridgeBtn.onclick=async()=>{overlay.remove();try{await startBridge();}catch(_){toast("Bridge error!");}};}
+        }catch(_){bridgeBtn.textContent="Bridge unavailable";bridgeBtn.disabled=true;}
+    }
+    updateBridgeUI();
+
+    keyInput.addEventListener("input", ()=>{validate();updateBridgeUI();});
     enableChk.addEventListener("change", validate);
     validate();
 
     visBtn.addEventListener("click", () => {
         let show = keyInput.type === "password";
         keyInput.type = show ? "text" : "password";
-        visBtn.textContent = show ? "🙈" : "👁";
+        visBtn.textContent = show ? "\ud83d\ude48" : "\ud83d\udc41";
     });
 
     copyBtn.addEventListener("click", () => {
         if (keyInput.value) {
             navigator.clipboard.writeText(keyInput.value).then(() => {
-                copyBtn.textContent = "✅";
+                copyBtn.textContent = "\u2705";
                 copyBtn.classList.add("copied");
-                setTimeout(() => { copyBtn.textContent = "📋"; copyBtn.classList.remove("copied"); }, 1500);
+                setTimeout(() => { copyBtn.textContent = "\ud83d\udccb"; copyBtn.classList.remove("copied"); }, 1500);
             });
         }
     });
 
     genBtn.addEventListener("click", () => {
-        let bytes = crypto.getRandomValues(new Uint8Array(32));
-        keyInput.value = Array.from(bytes, b => KEY_CHARS[b % KEY_CHARS.length]).join("");
+        keyInput.value = genKey();
         keyInput.type = "text";
-        visBtn.textContent = "🙈";
+        visBtn.textContent = "\ud83d\ude48";
         validate();
+        updateBridgeUI();
     });
 
     document.getElementById("bb-btn-cancel").onclick = () => overlay.remove();
+    overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
     saveBtn.onclick = () => {
         if (saveBtn.disabled) return;
         saveSettings({ enabled: enableChk.checked, customKey: keyInput.value });
@@ -821,19 +1060,32 @@ document.addEventListener("click", e => {
 }, true);
 
 // ── Auto-decrypt main messages ──
+const _hsInfly = new WeakSet();
 function decryptMessages() {
     let nodes = document.body.querySelectorAll("div[rb-copyable]");
     for (let node of nodes) {
-        if (node._isDecrypting) continue;
+        if (node._isDecrypting || _hsInfly.has(node)) continue;
         let text = node.textContent.trim();
+        let ct = stripInvisibles(text);
+
+        // Detect handshake !! prefix
+        let hi = ct.indexOf(CFG.PFX_H);
+        if (hi !== -1 && !node._hsProcessed) {
+            let raw = ct.slice(hi + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g,"");
+            if (raw.length > 50) {
+                _hsInfly.add(node);
+                hsLock(() => handleHandshake(raw, node).catch(() => {})).finally(() => _hsInfly.delete(node));
+                continue;
+            }
+        }
 
         if (node._isDecrypted) {
-            if (!text.startsWith("@@") || node.querySelector(".bb-copy-btn")) continue;
+            if (!ct.startsWith("@@") || node.querySelector(".bb-copy-btn")) continue;
             node._isDecrypted = false;
             node.removeAttribute("data-orig-text");
         }
 
-        if (!text.startsWith("@@") || text.length <= 20) continue;
+        if (!ct.startsWith("@@") || ct.length <= 20) continue;
 
         if (!node.hasAttribute("data-orig-text")) node.setAttribute("data-orig-text", text);
         let raw = node.getAttribute("data-orig-text").replace(/\s/g, "");
@@ -1245,6 +1497,10 @@ function injectUI() {
 
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
+
+// Handshake cleanup
+function cleanupHs(){dbOp("handshakes","getAll").then(hs=>{const now=Date.now();hs.forEach(h=>{if(h.stage!=="confirmed"&&now-h.createdAt>CFG.HS_CLEANUP)dbOp("handshakes","del",h.nonce);});}).catch(()=>{});}
+setTimeout(cleanupHs,2000);setInterval(cleanupHs,CFG.HS_CLEANUP);
 
 }();
 } // end _rbInitEnc
