@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -323,17 +323,24 @@ function renderHS(el,text,cc,fp,trust,onAction,btnText){
 function toast(m,d){d=d||CFG.TOAST_MS;const el=document.createElement("div");el.textContent=m;Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s",whiteSpace:"nowrap"});document.body.appendChild(el);requestAnimationFrame(()=>{el.style.opacity="1";});setTimeout(()=>{el.style.opacity="0";setTimeout(()=>el.remove(),250);},d);}
 
 async function sendViaBridge(text){
-    let ta=findTextarea();if(!ta)return;
-    let hide=findInputWrapper()||ta;
-    hide.classList.remove("rb-locked-input");
-    hide.style.cssText="position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
-    ta.focus();document.execCommand("selectAll",false,null);document.execCommand("insertText",false,text);
-    ta.dispatchEvent(new Event("input",{bubbles:true}));
-    await delay(200);
-    let btn=findSendButton();
-    if(btn){let o={bubbles:true,cancelable:true,view:window};btn.dispatchEvent(new PointerEvent("pointerdown",o));btn.dispatchEvent(new MouseEvent("mousedown",o));btn.dispatchEvent(new PointerEvent("pointerup",o));btn.dispatchEvent(new MouseEvent("mouseup",o));btn.dispatchEvent(new MouseEvent("click",o));btn.click();}
-    await delay(300);ta.focus();document.execCommand("selectAll",false,null);document.execCommand("insertText",false,"");ta.dispatchEvent(new Event("input",{bubbles:true}));
-    hide.style.cssText="";hide.classList.add("rb-locked-input");
+    // Use the exposed injectAndSend which properly handles isBypass flag
+    if(window._bbInjectAndSend){
+        await window._bbInjectAndSend(text);
+    } else {
+        // Fallback if injectUI hasn't run yet — inject directly
+        let ta=findTextarea();if(!ta)return;
+        ta.focus();
+        document.execCommand("selectAll",false,null);
+        document.execCommand("insertText",false,text);
+        ta.dispatchEvent(new Event("input",{bubbles:true}));
+        await delay(200);
+        let btn=findSendButton();
+        if(btn){btn.click();}
+        await delay(300);
+        ta.focus();document.execCommand("selectAll",false,null);
+        document.execCommand("insertText",false,"");
+        ta.dispatchEvent(new Event("input",{bubbles:true}));
+    }
 }
 
 async function startBridge(){
@@ -1447,6 +1454,7 @@ function injectUI() {
 
     secureInput._triggerSend = triggerSend;
     window._bbSendMessage = triggerSend;
+    window._bbInjectAndSend = injectAndSend;
 
     secureInput.addEventListener("input", () => {
         syncHasContent(getOverlayText().length > 0);
