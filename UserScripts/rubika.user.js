@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.4
+// @version      8.5
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -458,7 +458,7 @@ async function decrypt(text) {
 async function splitEncrypt(text) {
     let result = await encrypt(text);
     if (!result) return null;
-    if (result.length <= 4000) return [result];
+    if (result.length <= 3000) return [result];
     let mid = Math.floor(text.length / 2);
     let splitAt = text.lastIndexOf("\n", mid);
     if (splitAt <= 0) splitAt = text.lastIndexOf(" ", mid);
