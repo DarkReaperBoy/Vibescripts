@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.8
+// @version      7.9
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -1470,8 +1470,7 @@ function injectUI() {
     // Block ALL input on every native input element when encryption is on
     // textarea = .composer_rich_textarea, inputWrapper = .input-message-input
     // Also block on .input-message-container which wraps both
-    let nativeContainer = document.querySelector(".input-message-container");
-    let allInputEls = [textarea, inputWrapper, nativeContainer].filter(Boolean);
+    let allInputEls = [textarea, inputWrapper].filter(Boolean);
     for (let el of allInputEls) {
         if (!el || el._hasStrictHijack) continue;
         el._hasStrictHijack = true;
