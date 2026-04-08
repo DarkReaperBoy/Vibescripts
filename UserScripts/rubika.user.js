@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.9
+// @version      8.0
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -512,16 +512,16 @@ async function startBridge(){
     if(isGroup())hsRec.groupKey=genKey();
     await dbOp("handshakes","put",hsRec);
     const hsB64=toB64(msg);
+    const hsSnippet=hsB64.slice(0,16);
     await sendViaBridge(CFG.PFX_H+" "+hsB64);toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!");refreshUI();
-    // Poll for the !! node and render widget directly (don't rely on scanner)
+    // Poll for the !! node and render widget directly
     let pollCount=0;
     const pollForHS=setInterval(()=>{
-        if(++pollCount>20){clearInterval(pollForHS);return;}
+        if(++pollCount>50){clearInterval(pollForHS);return;} // 10 seconds
         const nodes=document.querySelectorAll("div[rb-copyable]");
         for(const n of nodes){
-            if(n._hsProcessed)continue;
-            const ct=stripInvisibles(n.textContent.trim());
-            if(ct.indexOf(CFG.PFX_H)===0&&ct.includes(hsB64.slice(0,20))){
+            const raw=n.textContent;
+            if(raw&&raw.includes("!!")&&raw.includes(hsSnippet)){
                 renderHS(n,"\ud83d\udd04 Bridge invite sent","txM");
                 clearInterval(pollForHS);
                 return;
