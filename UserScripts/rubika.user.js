@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.2
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -26,10 +26,13 @@ let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null;
 function aPoT(){if(rtt.length<3)return 12000;const s=[...rtt].sort((a,b)=>a-b);return Math.max(5000,Math.min(20000,s[Math.floor(s.length*.9)]*3));}
 function aPiT(){if(rtt.length<3)return 15000;return Math.max(10000,Math.min(25000,(rtt.reduce((a,b)=>a+b,0)/rtt.length)*8));}
 function clrP(){clearInterval(piT);clearTimeout(poT);piT=poT=null;}
-function PW(url,pr){const bs=bestS();if(bs&&url&&url.includes("iranlms.ir")&&!url.includes("getdcmess"))url=bs;const ws=pr!==undefined?new OrigWS(url,pr):new OrigWS(url);if(!url||!url.includes("iranlms.ir"))return ws;aSock=ws;lastM=Date.now();const os=ws.send.bind(ws);ws.send=function(d){return os(d);};
+function PW(url,pr){const bs=bestS();if(bs&&url&&url.includes("iranlms.ir")&&!url.includes("getdcmess"))url=bs;const ws=pr!==undefined?new OrigWS(url,pr):new OrigWS(url);if(!url||!url.includes("iranlms.ir"))return ws;aSock=ws;lastM=Date.now();const os=ws.send.bind(ws);ws.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return os(d);};
 function sP(){clrP();piT=setInterval(()=>{if(ws.readyState===1){pS=performance.now();try{os("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{ws.close(4000,"pt");}catch(_){}},aPoT());}},aPiT());}
 ws.addEventListener("open",()=>{lastM=Date.now();sP();});ws.addEventListener("message",()=>{lastM=Date.now();clearTimeout(poT);poT=null;if(pS>0){rtt.push(performance.now()-pS);if(rtt.length>10)rtt.shift();pS=0;}});ws.addEventListener("close",()=>{clrP();rotS(url);aSock=null;});return ws;}
 PW.CONNECTING=OrigWS.CONNECTING;PW.OPEN=OrigWS.OPEN;PW.CLOSING=OrigWS.CLOSING;PW.CLOSED=OrigWS.CLOSED;PW.prototype=OrigWS.prototype;_W.WebSocket=PW;
+// Draft blocker — must run before Angular creates WebSocket instances
+const _origProtoSend=OrigWS.prototype.send;
+OrigWS.prototype.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return _origProtoSend.apply(this,arguments);};
 const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=15000;}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
@@ -775,16 +778,7 @@ function isSendTarget(el) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-(function() {
-    let origSend = WebSocket.prototype.send;
-    WebSocket.prototype.send = function(data) {
-        try {
-            let str = typeof data === "string" ? data : new TextDecoder().decode(data);
-            if (str.includes("EditParameter") && str.includes("drafts_")) return;
-        } catch {}
-        return origSend.apply(this, arguments);
-    };
-})();
+// Draft blocker moved to connectivity fix (document-start) for correct timing
 
 document.head.insertAdjacentHTML("beforeend", `<style>
 button.toggle-emoticons { display: none !important; }
