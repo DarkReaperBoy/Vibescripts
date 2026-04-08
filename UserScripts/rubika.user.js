@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.8
+// @version      8.9
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -720,6 +720,19 @@ function renderMarkdown(text) {
             result.push(`<ol dir="auto" style="margin:4px 0;padding-inline-start:22px;list-style:decimal;unicode-bidi:plaintext;">${items.join("")}</ol>`);
             continue;
         }
+        // Markdown tables: | col | col |
+        if (/^\|(.+\|)+\s*$/.test(line) && i + 1 < lines.length && /^\|[\s:-]+\|/.test(lines[i+1])) {
+            let headerCells = line.split("|").filter(c => c.trim()).map(c => `<th style="padding:4px 10px;text-align:left;font-weight:600;border-bottom:2px solid rgba(0,0,0,.15)">${renderWithUrls(c.trim())}</th>`);
+            i += 2; // skip header + separator
+            let rows = [];
+            while (i < lines.length && /^\|(.+\|)+\s*$/.test(lines[i])) {
+                let cells = lines[i].split("|").filter(c => c.trim()).map(c => `<td style="padding:4px 10px;border-bottom:1px solid rgba(0,0,0,.08)">${renderWithUrls(c.trim())}</td>`);
+                rows.push(`<tr>${cells.join("")}</tr>`);
+                i++;
+            }
+            result.push(`<table style="border-collapse:collapse;margin:4px 0;font-size:inherit;width:100%;max-width:100%;overflow-x:auto;display:block"><thead><tr>${headerCells.join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`);
+            continue;
+        }
         let hMatch = line.match(/^(#{1,3}) (.+)/);
         if (hMatch) {
             let sizes = ["1.25em", "1.1em", "1em"];
@@ -1014,6 +1027,20 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 document.head.insertAdjacentHTML("beforeend", `<style>
 button.toggle-emoticons { display: none !important; }
+
+/* Outgoing bubble — Telegram-style soft green/gray */
+.bubble.is-out .bubble-content {
+    background-color: #eeffde !important;
+}
+html.night .bubble.is-out .bubble-content {
+    background-color: #2b5278 !important;
+}
+.bubble.is-out .bubble-tail use {
+    fill: #eeffde !important;
+}
+html.night .bubble.is-out .bubble-tail use {
+    fill: #2b5278 !important;
+}
 
 .rb-locked-input {
     position: absolute !important;
