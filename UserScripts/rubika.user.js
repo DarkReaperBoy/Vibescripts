@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.1
+// @version      8.2
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -941,20 +941,39 @@ function refreshUI() {
 
     let hideTarget = inputWrapper || textarea;
 
+    // Manage blocker overlay — sits on top of native input, makes it untouchable
+    let blocker = document.getElementById("rb-input-blocker");
+    if (!blocker && hideTarget) {
+        blocker = document.createElement("div");
+        blocker.id = "rb-input-blocker";
+        // Make the native input's container position:relative so blocker positions correctly
+        if (hideTarget.parentElement) hideTarget.parentElement.style.position = "relative";
+        hideTarget.parentElement.insertBefore(blocker, hideTarget);
+        blocker.addEventListener("click", () => {
+            let ov = document.getElementById("secure-input-overlay");
+            if (ov) ov.focus();
+        });
+        blocker.addEventListener("mousedown", e => { e.preventDefault(); e.stopPropagation(); });
+        blocker.addEventListener("touchstart", e => { e.preventDefault(); e.stopPropagation(); }, {passive:false});
+    }
+
     if (on) {
         if (hasKey) {
             if (hideTarget) hideTarget.classList.add("rb-locked-input");
             if (overlay) overlay.style.display = "";
             if (notice) notice.style.display = "none";
+            if (blocker) blocker.style.display = "block";
         } else {
             if (hideTarget) hideTarget.classList.add("rb-locked-input");
             if (overlay) overlay.style.display = "none";
             if (notice) notice.style.display = "flex";
+            if (blocker) blocker.style.display = "block";
         }
     } else {
         if (hideTarget) hideTarget.classList.remove("rb-locked-input");
         if (overlay) overlay.style.display = "none";
         if (notice) notice.style.display = "none";
+        if (blocker) blocker.style.display = "none";
     }
 }
 
@@ -989,6 +1008,15 @@ button.toggle-emoticons { display: none !important; }
     width: 0 !important;
     height: 0 !important;
     overflow: hidden !important;
+}
+
+/* Solid blocker overlay — covers native input completely */
+#rb-input-blocker {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 99;
+    background: transparent;
+    cursor: text;
 }
 
 #bb-settings-btn.bb-shield-btn {
@@ -1540,6 +1568,8 @@ function injectUI() {
         isBypass = true;
 
         let hideTarget = inputWrapper || textarea;
+        let blocker = document.getElementById("rb-input-blocker");
+        if (blocker) blocker.style.display = "none";
         hideTarget.classList.remove("rb-locked-input");
         hideTarget.style.cssText = "position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
 
@@ -1597,6 +1627,7 @@ function injectUI() {
 
         hideTarget.style.cssText = "";
         hideTarget.classList.add("rb-locked-input");
+        if (blocker) blocker.style.display = "block";
         isBypass = false;
     }
 
