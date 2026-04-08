@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      5.6
+// @version      5.7
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (fast DC racing, keepalive, reconnect, resync), draft blocker.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -666,7 +666,12 @@ html.night ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25);
    Active chat: li.open */
 
 ul.chatlist {
-    padding: 0 6px !important;
+    padding: 0 4px !important;
+}
+
+ul.chatlist > li {
+    padding-inline-start: 8px !important;
+    padding-inline-end: 8px !important;
 }
 
 ul.chatlist > li {
@@ -765,44 +770,9 @@ html.night .sidebar-header .input-search:focus-within {
    Outgoing: .bubble.is-out
    Groups have .bubbles-group wrapping related bubbles */
 
-/* Tighten spacing between bubbles in a group */
-.bubbles-group .bubble {
-    margin-bottom: 1px !important;
-}
-
-/* Space between different groups */
-.bubbles-group + .bubbles-group {
-    margin-top: 6px !important;
-}
-
-/* Don't override padding on bubble-content — Rubika needs it for layout.
-   Only refine the border-radius */
+/* Keep Rubika's native bubble styling — just remove extra shadows */
 .bubble-content {
-    border-radius: 12px !important;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.06) !important;
-}
-
-html.night .bubble-content {
-    box-shadow: 0 1px 3px rgba(0,0,0,0.2) !important;
-}
-
-/* Outgoing: round all corners except bottom-right (where tail is) for RTL: bottom-left */
-.rtl .bubble.is-out .bubble-content {
-    border-radius: 12px !important;
-    border-bottom-left-radius: 4px !important;
-}
-.rtl .bubble:not(.is-out):not(.service):not(.is-date) .bubble-content {
-    border-radius: 12px !important;
-    border-bottom-right-radius: 4px !important;
-}
-/* LTR fallback */
-body:not(.rtl) .bubble.is-out .bubble-content {
-    border-radius: 12px !important;
-    border-bottom-right-radius: 4px !important;
-}
-body:not(.rtl) .bubble:not(.is-out):not(.service):not(.is-date) .bubble-content {
-    border-radius: 12px !important;
-    border-bottom-left-radius: 4px !important;
+    box-shadow: none !important;
 }
 
 /* Service/date messages — frosted glass pill */
@@ -859,9 +829,7 @@ div[rb-copyable] {
 /* ── Chat Input area ──
    Actual DOM: .chat-input > .chat-input-container > .chat-input-content > .rows-wrapper */
 
-.chat-input {
-    background: var(--surface-color) !important;
-}
+/* Don't override chat-input background — native handles it */
 
 /* The actual text input is .composer_rich_textarea[contenteditable] inside
    .input-message-input inside .input-message-container */
@@ -873,15 +841,7 @@ div[rb-copyable] {
     caret-color: var(--primary-color) !important;
 }
 
-/* The rows-wrapper has a bubble-tail SVG background — that's the input "bubble".
-   We just clean up the corners. */
-.rows-wrapper {
-    border-radius: 12px !important;
-}
-
-.rows-wrapper > .bubble-tail {
-    opacity: 0.7;
-}
+/* Don't override rows-wrapper — it uses bubble-tail SVG for its shape */
 
 /* Send button — from DOM: button.btn-send.animated-button-icon inside .btn-send-container
    States: .record (mic icon) / .send (send icon) */
