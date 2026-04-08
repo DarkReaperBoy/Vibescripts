@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.5
+// @version      7.6
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -128,8 +128,8 @@ function showMsgNotification(chatName,text,authorName){
                                             // Get chat name from sidebar
                                             const chatGuid=mm.object_guid||m.object_guid||"";
                                             let chatName=authorName||"New message";
-                                            // Skip if user was active within last 5 seconds
-                                            if(Date.now()-_lastActivity<5000)continue;
+                                            // Skip if user was active within last 15 seconds
+                                            if(Date.now()-_lastActivity<15000)continue;
                                             try{
                                                 const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
                                                 for(const li of items){
