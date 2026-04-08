@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -376,10 +376,12 @@ async function processAccept(data,hs,el){
     if(useGK){const pw=await _S.importKey("raw",new TextEncoder().encode(sessionKey),{name:"AES-GCM"},false,["encrypt"]);const iv=new Uint8Array(12);_C.getRandomValues(iv);const ct=u8(await _S.encrypt({name:"AES-GCM",iv},pw,new TextEncoder().encode(hs.groupKey)));encBlob=concatBytes(iv,ct);payload=concatBytes(new Uint8Array([1,4]),hsNonce,tsBuf(),hmacVal,encBlob);}
     else{payload=concatBytes(new Uint8Array([1,3]),hsNonce,tsBuf(),hmacVal);}
     const sig=await ecSign(id.priv,payload),msg=concatBytes(payload,sig);
-    saveSettings({enabled:true,customKey:activeKey});
     await dbOp("contacts","put",{id:data.cid,chatId:getChatId(),pubHex:toHex(data.theirIdPubRaw),lastSeen:Date.now()});
     delete hs.ephPrivHex;hs.derivedKey=sessionKey;hs.stage="confirmed";await dbOp("handshakes","put",hs);
-    refreshUI();await sendViaBridge(CFG.PFX_H+" "+toB64(msg));renderHS(el,useGK?"\u2705 Group bridge — key delivered":"\u2705 Bridge established","ac");
+    // Send confirmation FIRST, then apply key — so we don't encrypt before other side has the key
+    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));
+    saveSettings({enabled:true,customKey:activeKey});
+    refreshUI();renderHS(el,useGK?"\u2705 Group bridge — key delivered":"\u2705 Bridge established","ac");
 }
 async function processConfirm(data,hs,el){
     const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
@@ -407,8 +409,9 @@ async function processGroupConfirm(data,hs,el){
 }
 async function handleHandshake(b64,el){
     if(el._hsProcessed)return;el._hsProcessed=true;
+    console.log("[RB] handleHandshake called, b64 len:", b64.length);
     try{
-        const bytes=decodeB64Smart(b64);if(!bytes||bytes.length<118)return;
+        const bytes=decodeB64Smart(b64);if(!bytes||bytes.length<118){console.log("[RB] HS: bad decode, bytes:",bytes?.length);return;}
         const ver=bytes[0],type=bytes[1];if(ver!==1)return;
         const nonce=bytes.slice(2,18),hexNonce=toHex(nonce);
         const myId=await getMyId(),hs=await dbOp("handshakes","get",hexNonce);
@@ -1075,7 +1078,11 @@ function decryptMessages() {
             let raw = ct.slice(hi + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g,"");
             if (raw.length > 50) {
                 _hsInfly.add(node);
-                hsLock(() => handleHandshake(raw, node).catch(() => {})).finally(() => _hsInfly.delete(node));
+                hsLock(() => handleHandshake(raw, node).catch(e => {
+                    console.error("[RB] Handshake error:", e);
+                    node.innerHTML = '<div style="border:1.5px solid #d32f2f;background:rgba(248,81,73,.1);border-radius:10px;padding:12px;margin:6px 0"><span style="font-weight:700;color:#d32f2f">\u274c Bridge error: ' + (e.message||e) + '</span></div>';
+                    node._hsProcessed = true;
+                })).finally(() => _hsInfly.delete(node));
                 continue;
             }
         }
