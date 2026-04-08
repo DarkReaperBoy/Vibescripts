@@ -21,19 +21,51 @@ const _W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
 const OrigWebSocket = _W.WebSocket;
 const DC_URL = "https://getdcmess.iranlms.ir/";
 
-// ── DC Racing: test all endpoints in parallel, use fastest ──
+// ── DC Racing: test all endpoints in parallel, rank by speed ──
 
-let _bestApiUrl = null;
-let _bestSocketUrl = null;
+let _rankedApiUrls = [];   // sorted fastest→slowest
+let _rankedSocketUrls = []; // sorted fastest→slowest
+let _apiIdx = 0;           // current index into ranked list
+let _socketIdx = 0;
 let _allApiUrls = [];
 let _allSocketUrls = [];
 let _dcReady = false;
+let _failedSockets = new Set(); // blacklist dead sockets temporarily
+
+function getBestApiUrl() { return _rankedApiUrls[_apiIdx] || _rankedApiUrls[0] || null; }
+function getBestSocketUrl() {
+    // Skip blacklisted sockets
+    for (let i = 0; i < _rankedSocketUrls.length; i++) {
+        const idx = (_socketIdx + i) % _rankedSocketUrls.length;
+        if (!_failedSockets.has(_rankedSocketUrls[idx])) return _rankedSocketUrls[idx];
+    }
+    return _rankedSocketUrls[0] || null; // everything failed, try first anyway
+}
+
+function rotateApiUrl() {
+    if (_rankedApiUrls.length > 1) {
+        _apiIdx = (_apiIdx + 1) % _rankedApiUrls.length;
+        console.log(`[RB-Fix] Rotated API → ${_rankedApiUrls[_apiIdx]}`);
+    }
+}
+
+function rotateSocketUrl(failedUrl) {
+    if (failedUrl) {
+        _failedSockets.add(failedUrl);
+        // Unblacklist after 30s — it might recover
+        setTimeout(() => _failedSockets.delete(failedUrl), 30000);
+    }
+    if (_rankedSocketUrls.length > 1) {
+        _socketIdx = (_socketIdx + 1) % _rankedSocketUrls.length;
+        console.log(`[RB-Fix] Rotated socket → ${getBestSocketUrl()}`);
+    }
+}
 
 async function raceDCs() {
     try {
         const resp = await fetch(DC_URL, {
             headers: {"User-Agent": navigator.userAgent},
-            signal: AbortSignal.timeout(8000)
+            signal: AbortSignal.timeout(12000)
         });
         const json = await resp.json();
         const d = json.data || json;
@@ -62,76 +94,88 @@ async function raceDCs() {
         _allApiUrls = [...new Set(_allApiUrls.map(u => u.endsWith("/") ? u : u + "/"))];
         _allSocketUrls = [...new Set(_allSocketUrls)];
 
-        // Race API endpoints — whoever responds first wins
+        // Race ALL endpoints in parallel — rank by response time
         if (_allApiUrls.length > 0) {
-            _bestApiUrl = await raceEndpoints(_allApiUrls, "api");
+            _rankedApiUrls = await rankEndpoints(_allApiUrls, "api");
         }
-
-        // For sockets we can't easily race, but we sort by TCP reachability
         if (_allSocketUrls.length > 0) {
-            _bestSocketUrl = await raceSocketEndpoints(_allSocketUrls);
+            _rankedSocketUrls = await rankSocketEndpoints(_allSocketUrls);
         }
 
         _dcReady = true;
-        console.log("[RB-Fix] DC race complete. Best API:", _bestApiUrl, "Best Socket:", _bestSocketUrl);
+        console.log("[RB-Fix] DC race complete. API ranked:", _rankedApiUrls, "Socket ranked:", _rankedSocketUrls);
     } catch(e) {
         console.log("[RB-Fix] DC race failed:", e.message);
     }
 }
 
-async function raceEndpoints(urls, type) {
-    // Race: first endpoint to respond with valid HTTP gets used
-    const controller = new AbortController();
-    try {
-        const winner = await Promise.any(urls.map(async url => {
-            const start = performance.now();
-            const resp = await fetch(url, {
-                method: "POST",
-                headers: {"Content-Type": "text/plain"},
-                body: "{}",
-                signal: controller.signal
-            });
-            if (!resp.ok && resp.status !== 200) throw new Error("bad status");
-            const latency = performance.now() - start;
-            console.log(`[RB-Fix] ${type} ${url} responded in ${Math.round(latency)}ms`);
-            return url;
-        }));
-        controller.abort(); // cancel the rest
-        return winner;
-    } catch(_) {
-        return urls[0]; // fallback to first
+async function rankEndpoints(urls, type) {
+    // Race all, collect results with latency, sort fastest→slowest
+    const results = await Promise.allSettled(urls.map(async url => {
+        const start = performance.now();
+        const resp = await fetch(url, {
+            method: "POST",
+            headers: {"Content-Type": "text/plain"},
+            body: "{}",
+            signal: AbortSignal.timeout(10000)
+        });
+        const latency = performance.now() - start;
+        console.log(`[RB-Fix] ${type} ${url} → ${Math.round(latency)}ms`);
+        return { url, latency };
+    }));
+
+    const ranked = results
+        .filter(r => r.status === "fulfilled")
+        .map(r => r.value)
+        .sort((a, b) => a.latency - b.latency)
+        .map(r => r.url);
+
+    // Append any that failed (as fallbacks at the end)
+    const responded = new Set(ranked);
+    for (const url of urls) {
+        if (!responded.has(url)) ranked.push(url);
     }
+    return ranked;
 }
 
-async function raceSocketEndpoints(urls) {
-    // Test WebSocket connections in parallel, first to open wins
+async function rankSocketEndpoints(urls) {
+    // Race all sockets, rank by open time
     return new Promise(resolve => {
-        let resolved = false;
+        const results = [];
+        const starts = {};
+        let pending = urls.length;
         const sockets = [];
-        const timeout = setTimeout(() => {
-            if (!resolved) { resolved = true; cleanup(); resolve(urls[0]); }
-        }, 5000);
 
-        function cleanup() {
+        const timeout = setTimeout(() => finish(), 10000);
+
+        function finish() {
             clearTimeout(timeout);
             for (const s of sockets) try { s.close(); } catch(_) {}
+            // Sort by open time, append any that didn't open
+            const ranked = results.sort((a, b) => a.latency - b.latency).map(r => r.url);
+            const opened = new Set(ranked);
+            for (const url of urls) {
+                if (!opened.has(url)) ranked.push(url);
+            }
+            resolve(ranked);
         }
 
         for (const url of urls) {
             try {
+                starts[url] = performance.now();
                 const ws = new OrigWebSocket(url);
                 sockets.push(ws);
                 ws.onopen = () => {
-                    if (!resolved) {
-                        resolved = true;
-                        console.log(`[RB-Fix] Fastest socket: ${url}`);
-                        cleanup();
-                        resolve(url);
-                    }
+                    results.push({ url, latency: performance.now() - starts[url] });
+                    console.log(`[RB-Fix] socket ${url} → ${Math.round(results[results.length-1].latency)}ms`);
+                    pending--;
+                    if (pending <= 0) finish();
                 };
-                ws.onerror = () => {};
-            } catch(_) {}
+                ws.onerror = () => { pending--; if (pending <= 0) finish(); };
+            } catch(_) { pending--; }
         }
+
+        if (pending <= 0) finish();
     });
 }
 
@@ -207,9 +251,10 @@ function clearTimers() {
 
 function PatchedWebSocket(url, protocols) {
     // If we have a faster socket URL and this is a Rubika socket, swap it
-    if (_bestSocketUrl && url && url.includes("iranlms.ir") && !url.includes("getdcmess")) {
-        console.log(`[RB-Fix] Redirecting socket: ${url} → ${_bestSocketUrl}`);
-        url = _bestSocketUrl;
+    const best = getBestSocketUrl();
+    if (best && url && url.includes("iranlms.ir") && !url.includes("getdcmess")) {
+        console.log(`[RB-Fix] Redirecting socket: ${url} → ${best}`);
+        url = best;
     }
 
     const ws = protocols !== undefined
@@ -273,8 +318,16 @@ function PatchedWebSocket(url, protocols) {
     Object.defineProperty(ws, "onclose", { get:()=>_onclose, set(fn){
         _onclose = function(e) {
             console.log("[RB-Fix] Socket closed:", e.code, e.reason);
-            clearTimers(); activeSocket = null;
-            if (e.code !== 4000) showStatus("\u274c Disconnected", "rgba(211,47,47,.9)", true);
+            clearTimers();
+            // Blacklist this DC and rotate to next one for the reconnect
+            rotateSocketUrl(url);
+            const next = getBestSocketUrl();
+            if (next && next !== url) {
+                showStatus(`\ud83d\udd04 Switching DC...`, "rgba(210,153,34,.95)", true);
+            } else if (e.code !== 4000) {
+                showStatus("\u274c Disconnected", "rgba(211,47,47,.9)", true);
+            }
+            activeSocket = null;
             if (fn) fn.call(ws, e);
         };
     }});
@@ -299,21 +352,38 @@ _W.WebSocket = PatchedWebSocket;
 // ── Intercept XHR to redirect API calls to fastest endpoint ──
 
 const OrigOpen = XMLHttpRequest.prototype.open;
+const OrigXhrSend = XMLHttpRequest.prototype.send;
+
 XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    if (_bestApiUrl && typeof url === "string" && url.includes("iranlms.ir") && !url.includes("getdcmess") && method === "POST") {
-        // Replace the domain with our fastest API
+    this._rbOrigUrl = url;
+    const bestApi = getBestApiUrl();
+    if (bestApi && typeof url === "string" && url.includes("iranlms.ir") && !url.includes("getdcmess") && method === "POST") {
         try {
             const u = new URL(url);
-            const best = new URL(_bestApiUrl);
+            const best = new URL(bestApi);
             if (u.hostname !== best.hostname) {
                 const newUrl = best.origin + u.pathname + u.search;
-                console.log(`[RB-Fix] API redirect: ${u.hostname} → ${best.hostname}`);
                 url = newUrl;
             }
         } catch(_) {}
-        this.timeout = 15000; // shorter timeout
+        this.timeout = 15000;
     }
     return OrigOpen.call(this, method, url, ...rest);
+};
+
+// On XHR error, rotate API endpoint so next request tries a different DC
+XMLHttpRequest.prototype.send = function(...args) {
+    this.addEventListener("error", () => {
+        if (this._rbOrigUrl && this._rbOrigUrl.includes("iranlms.ir")) {
+            rotateApiUrl();
+        }
+    }, {once: true});
+    this.addEventListener("timeout", () => {
+        if (this._rbOrigUrl && this._rbOrigUrl.includes("iranlms.ir")) {
+            rotateApiUrl();
+        }
+    }, {once: true});
+    return OrigXhrSend.apply(this, args);
 };
 
 // ── Visibility + network handlers ──
