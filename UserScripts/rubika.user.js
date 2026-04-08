@@ -1,787 +1,55 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      5.8
-// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (fast DC racing, keepalive, reconnect, resync), draft blocker.
+// @version      6.0
+// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  PHASE 1: CONNECTIVITY FIX (runs at document-start)        ║
-// ║  Patches WebSocket before Angular bootstraps.               ║
-// ╚══════════════════════════════════════════════════════════════╝
-
+// ── CONNECTIVITY FIX (document-start) ──
 (function(){
 "use strict";
-
-const _W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-const OrigWebSocket = _W.WebSocket;
-const DC_URL = "https://getdcmess.iranlms.ir/";
-
-// ── DC Racing: test all endpoints in parallel, rank by speed ──
-
-let _rankedApiUrls = [];   // sorted fastest→slowest
-let _rankedSocketUrls = []; // sorted fastest→slowest
-let _apiIdx = 0;           // current index into ranked list
-let _socketIdx = 0;
-let _allApiUrls = [];
-let _allSocketUrls = [];
-let _dcReady = false;
-let _failedSockets = new Set(); // blacklist dead sockets temporarily
-
-function getBestApiUrl() { return _rankedApiUrls[_apiIdx] || _rankedApiUrls[0] || null; }
-function getBestSocketUrl() {
-    // Skip blacklisted sockets
-    for (let i = 0; i < _rankedSocketUrls.length; i++) {
-        const idx = (_socketIdx + i) % _rankedSocketUrls.length;
-        if (!_failedSockets.has(_rankedSocketUrls[idx])) return _rankedSocketUrls[idx];
-    }
-    return _rankedSocketUrls[0] || null; // everything failed, try first anyway
-}
-
-function rotateApiUrl() {
-    if (_rankedApiUrls.length > 1) {
-        _apiIdx = (_apiIdx + 1) % _rankedApiUrls.length;
-        console.log(`[RB-Fix] Rotated API → ${_rankedApiUrls[_apiIdx]}`);
-    }
-}
-
-function rotateSocketUrl(failedUrl) {
-    if (failedUrl) {
-        _failedSockets.add(failedUrl);
-        // Unblacklist after 30s — it might recover
-        setTimeout(() => _failedSockets.delete(failedUrl), 30000);
-    }
-    if (_rankedSocketUrls.length > 1) {
-        _socketIdx = (_socketIdx + 1) % _rankedSocketUrls.length;
-        console.log(`[RB-Fix] Rotated socket → ${getBestSocketUrl()}`);
-    }
-}
-
-async function raceDCs() {
-    try {
-        const resp = await fetch(DC_URL, {
-            headers: {"User-Agent": navigator.userAgent},
-            signal: AbortSignal.timeout(12000)
-        });
-        const json = await resp.json();
-        const d = json.data || json;
-
-        // Collect all API URLs
-        if (d.API) _allApiUrls = Object.values(d.API).filter(u => u);
-        if (d.default_api) {
-            const da = String(d.default_api);
-            if (d.API && d.API[da]) _allApiUrls.unshift(d.API[da]);
-        }
-        if (d.default_apis) {
-            for (const code of d.default_apis) {
-                if (d.API && d.API[String(code)]) _allApiUrls.unshift(d.API[String(code)]);
-            }
-        }
-
-        // Collect all Socket URLs
-        if (d.socket) _allSocketUrls = Object.values(d.socket).filter(u => u);
-        if (d.Socket) _allSocketUrls = Object.values(d.Socket).filter(u => u);
-        if (d.default_socket) {
-            const ds = String(d.default_socket);
-            if ((d.socket||d.Socket) && (d.socket||d.Socket)[ds]) _allSocketUrls.unshift((d.socket||d.Socket)[ds]);
-        }
-
-        // Deduplicate
-        _allApiUrls = [...new Set(_allApiUrls.map(u => u.endsWith("/") ? u : u + "/"))];
-        _allSocketUrls = [...new Set(_allSocketUrls)];
-
-        // Race ALL endpoints in parallel — rank by response time
-        if (_allApiUrls.length > 0) {
-            _rankedApiUrls = await rankEndpoints(_allApiUrls, "api");
-        }
-        if (_allSocketUrls.length > 0) {
-            _rankedSocketUrls = await rankSocketEndpoints(_allSocketUrls);
-        }
-
-        _dcReady = true;
-        console.log("[RB-Fix] DC race complete. API ranked:", _rankedApiUrls, "Socket ranked:", _rankedSocketUrls);
-    } catch(e) {
-        console.log("[RB-Fix] DC race failed:", e.message);
-    }
-}
-
-async function rankEndpoints(urls, type) {
-    // Race all, collect results with latency, sort fastest→slowest
-    const results = await Promise.allSettled(urls.map(async url => {
-        const start = performance.now();
-        const resp = await fetch(url, {
-            method: "POST",
-            headers: {"Content-Type": "text/plain"},
-            body: "{}",
-            signal: AbortSignal.timeout(10000)
-        });
-        const latency = performance.now() - start;
-        console.log(`[RB-Fix] ${type} ${url} → ${Math.round(latency)}ms`);
-        return { url, latency };
-    }));
-
-    const ranked = results
-        .filter(r => r.status === "fulfilled")
-        .map(r => r.value)
-        .sort((a, b) => a.latency - b.latency)
-        .map(r => r.url);
-
-    // Append any that failed (as fallbacks at the end)
-    const responded = new Set(ranked);
-    for (const url of urls) {
-        if (!responded.has(url)) ranked.push(url);
-    }
-    return ranked;
-}
-
-async function rankSocketEndpoints(urls) {
-    // Race all sockets, rank by open time
-    return new Promise(resolve => {
-        const results = [];
-        const starts = {};
-        let pending = urls.length;
-        const sockets = [];
-
-        const timeout = setTimeout(() => finish(), 10000);
-
-        function finish() {
-            clearTimeout(timeout);
-            for (const s of sockets) try { s.close(); } catch(_) {}
-            // Sort by open time, append any that didn't open
-            const ranked = results.sort((a, b) => a.latency - b.latency).map(r => r.url);
-            const opened = new Set(ranked);
-            for (const url of urls) {
-                if (!opened.has(url)) ranked.push(url);
-            }
-            resolve(ranked);
-        }
-
-        for (const url of urls) {
-            try {
-                starts[url] = performance.now();
-                const ws = new OrigWebSocket(url);
-                sockets.push(ws);
-                ws.onopen = () => {
-                    results.push({ url, latency: performance.now() - starts[url] });
-                    console.log(`[RB-Fix] socket ${url} → ${Math.round(results[results.length-1].latency)}ms`);
-                    pending--;
-                    if (pending <= 0) finish();
-                };
-                ws.onerror = () => { pending--; if (pending <= 0) finish(); };
-            } catch(_) { pending--; }
-        }
-
-        if (pending <= 0) finish();
-    });
-}
-
-// Start racing immediately
-raceDCs();
-
-// ── Connectivity state ──
-
-let activeSocket = null;
-let activeSocketUrl = null;
-let pingTimer = null;
-let pongTimer = null;
-let reconnectAttempts = 0;
-let lastMessageTime = Date.now();
-let lastVisibleTime = Date.now();
-let wasHidden = false;
-let statusEl = null;
-let statusHideTimer = null;
-let statusGraceTimer = null;
-let handshakeData = null;
-
-// Adaptive RTT tracking
-let rttSamples = [];
-let lastPingSentAt = 0;
-const RTT_WINDOW = 10; // keep last 10 samples
-
-function getAdaptivePongTimeout() {
-    if (rttSamples.length < 3) return 12000; // conservative default until we have data
-    const sorted = [...rttSamples].sort((a,b) => a - b);
-    const p90 = sorted[Math.floor(sorted.length * 0.9)]; // 90th percentile
-    return Math.max(5000, Math.min(20000, p90 * 3)); // 3x p90, clamped 5s–20s
-}
-
-function getAdaptivePingInterval() {
-    if (rttSamples.length < 3) return 15000;
-    const avg = rttSamples.reduce((a,b) => a+b, 0) / rttSamples.length;
-    // Slower connections get less frequent pings to avoid congestion
-    return Math.max(10000, Math.min(25000, avg * 8));
-}
-
-function recordRtt(ms) {
-    rttSamples.push(ms);
-    if (rttSamples.length > RTT_WINDOW) rttSamples.shift();
-}
-
-const CONN = {
-    RECONNECT_BASE: 1000,
-    RECONNECT_MAX: 30000,
-    RECONNECT_MULT: 1.5,
-    VISIBILITY_GRACE: 5000,
-    STATUS_SHOW_MS: 4000,
-    DISCONNECT_GRACE: 3000, // don't show "disconnected" for blips shorter than this
-    PRECONNECT_RTT_THRESH: 3, // if pong takes >3x avg RTT, preemptively prepare backup
-};
-
-// ── Status indicator with grace period ──
-
-function ensureStatusUI() {
-    if (statusEl && document.body && document.body.contains(statusEl)) return;
-    if (!document.body) return;
-    statusEl = document.createElement("div");
-    statusEl.id = "rb-conn-status";
-    Object.assign(statusEl.style, {
-        position:"fixed",top:"8px",left:"50%",
-        transform:"translateX(-50%) translateY(-50px)",
-        background:"rgba(0,0,0,0.85)",color:"#fff",
-        padding:"6px 16px",borderRadius:"20px",fontSize:"12px",
-        fontWeight:"600",fontFamily:"inherit",zIndex:"9999999",
-        pointerEvents:"none",transition:"transform .3s cubic-bezier(.2,.8,.2,1),opacity .3s",
-        opacity:"0",whiteSpace:"nowrap",backdropFilter:"blur(8px)",
-        WebkitBackdropFilter:"blur(8px)",letterSpacing:".02em"
-    });
-    document.body.appendChild(statusEl);
-}
-
-function showStatus(text, color, persistent) {
-    ensureStatusUI();
-    if (!statusEl) return;
-    statusEl.textContent = text;
-    statusEl.style.background = color || "rgba(0,0,0,0.85)";
-    statusEl.style.transform = "translateX(-50%) translateY(0)";
-    statusEl.style.opacity = "1";
-    clearTimeout(statusHideTimer);
-    if (!persistent) statusHideTimer = setTimeout(hideStatus, CONN.STATUS_SHOW_MS);
-}
-
-// Show disconnect status only after grace period (avoids flashing on brief blips)
-function showDisconnectGraceful(text, color) {
-    clearTimeout(statusGraceTimer);
-    statusGraceTimer = setTimeout(() => {
-        // Only show if still disconnected
-        if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) {
-            showStatus(text, color, true);
-        }
-    }, CONN.DISCONNECT_GRACE);
-}
-
-function cancelDisconnectGrace() {
-    clearTimeout(statusGraceTimer);
-}
-
-function hideStatus() {
-    if (!statusEl) return;
-    statusEl.style.transform = "translateX(-50%) translateY(-50px)";
-    statusEl.style.opacity = "0";
-}
-
-// ── Pre-connect: open backup DC before current one fully dies ──
-
-let backupSocket = null;
-let backupSocketUrl = null;
-
-function preconnectBackup() {
-    if (backupSocket && backupSocket.readyState <= OrigWebSocket.OPEN) return; // already have one
-    const nextUrl = getBestSocketUrl();
-    if (!nextUrl || nextUrl === activeSocketUrl) {
-        // Try the one after current
-        rotateSocketUrl(null); // don't blacklist, just rotate index
-        const alt = getBestSocketUrl();
-        if (!alt || alt === activeSocketUrl) return;
-        backupSocketUrl = alt;
-    } else {
-        backupSocketUrl = nextUrl;
-    }
-
-    console.log(`[RB-Fix] Pre-connecting backup socket: ${backupSocketUrl}`);
-    try {
-        backupSocket = new OrigWebSocket(backupSocketUrl);
-        backupSocket.onopen = () => {
-            console.log(`[RB-Fix] Backup socket ready: ${backupSocketUrl}`);
-            // Send handshake to keep it warm
-            if (handshakeData) {
-                try { backupSocket.send(handshakeData); } catch(_) {}
-            }
-        };
-        backupSocket.onerror = () => { backupSocket = null; backupSocketUrl = null; };
-        backupSocket.onclose = () => { backupSocket = null; backupSocketUrl = null; };
-        // Auto-close backup after 60s if not used (don't waste resources)
-        setTimeout(() => {
-            if (backupSocket && activeSocket && activeSocket.readyState === OrigWebSocket.OPEN) {
-                try { backupSocket.close(); } catch(_) {}
-                backupSocket = null; backupSocketUrl = null;
-            }
-        }, 60000);
-    } catch(_) { backupSocket = null; backupSocketUrl = null; }
-}
-
-// ── WebSocket interceptor ──
-
-function clearTimers() {
-    clearInterval(pingTimer); clearTimeout(pongTimer);
-    pingTimer = null; pongTimer = null;
-}
-
-function PatchedWebSocket(url, protocols) {
-    // If we have a faster socket URL and this is a Rubika socket, swap it
-    const best = getBestSocketUrl();
-    if (best && url && url.includes("iranlms.ir") && !url.includes("getdcmess")) {
-        console.log(`[RB-Fix] Redirecting socket: ${url} → ${best}`);
-        url = best;
-    }
-
-    const ws = protocols !== undefined
-        ? new OrigWebSocket(url, protocols)
-        : new OrigWebSocket(url);
-
-    if (!url || !url.includes("iranlms.ir")) return ws;
-
-    activeSocket = ws;
-    activeSocketUrl = url;
-    reconnectAttempts = 0;
-    lastMessageTime = Date.now();
-    cancelDisconnectGrace();
-    console.log("[RB-Fix] Intercepted socket:", url);
-
-    const origSend = ws.send.bind(ws);
-    ws.send = function(data) {
-        try {
-            if (typeof data === "string") {
-                let p = JSON.parse(data);
-                if (p.method === "handShake") handshakeData = data;
-            }
-        } catch(_) {}
-        return origSend(data);
-    };
-
-    function setupPing() {
-        clearTimers();
-        const interval = getAdaptivePingInterval();
-        pingTimer = setInterval(() => {
-            if (ws.readyState === OrigWebSocket.OPEN) {
-                lastPingSentAt = performance.now();
-                try { origSend("{}"); } catch(_) {}
-                clearTimeout(pongTimer);
-                const timeout = getAdaptivePongTimeout();
-                pongTimer = setTimeout(() => {
-                    console.log(`[RB-Fix] Pong timeout (adaptive: ${Math.round(timeout)}ms)`);
-                    // Don't flash disconnect — just quietly switch
-                    showStatus("\ud83d\udd04 Switching...", "rgba(210,153,34,.95)", true);
-                    try { ws.close(4000, "pong_timeout"); } catch(_) {}
-                }, timeout);
-            }
-        }, interval);
-        console.log(`[RB-Fix] Ping interval: ${Math.round(interval)}ms, pong timeout: ${Math.round(getAdaptivePongTimeout())}ms`);
-    }
-
-    // Wrap event handlers set by Angular (via property assignment)
-    let _onopen=null, _onclose=null, _onerror=null, _onmessage=null;
-
-    Object.defineProperty(ws, "onopen", { get:()=>_onopen, set(fn){
-        _onopen = function(e) {
-            console.log("[RB-Fix] Socket opened");
-            cancelDisconnectGrace();
-            showStatus("\u2705 Connected", "rgba(0,171,128,.9)");
-            reconnectAttempts = 0; lastMessageTime = Date.now();
-            setupPing();
-            if (fn) fn.call(ws, e);
-        };
-    }});
-
-    Object.defineProperty(ws, "onmessage", { get:()=>_onmessage, set(fn){
-        _onmessage = function(e) {
-            const now = performance.now();
-            lastMessageTime = Date.now();
-            cancelDisconnectGrace();
-
-            // Record RTT if this is a pong response to our ping
-            if (lastPingSentAt > 0) {
-                const rtt = now - lastPingSentAt;
-                recordRtt(rtt);
-                lastPingSentAt = 0;
-
-                // If RTT is degrading badly, pre-connect a backup
-                if (rttSamples.length >= 3) {
-                    const avg = rttSamples.slice(0, -1).reduce((a,b)=>a+b,0) / (rttSamples.length-1);
-                    if (rtt > avg * CONN.PRECONNECT_RTT_THRESH) {
-                        console.log(`[RB-Fix] RTT spike: ${Math.round(rtt)}ms (avg: ${Math.round(avg)}ms) — pre-connecting backup`);
-                        preconnectBackup();
-                    }
-                }
-            }
-
-            clearTimeout(pongTimer); pongTimer = null;
-            if (fn) fn.call(ws, e);
-        };
-    }});
-
-    Object.defineProperty(ws, "onclose", { get:()=>_onclose, set(fn){
-        _onclose = function(e) {
-            console.log("[RB-Fix] Socket closed:", e.code, e.reason);
-            clearTimers();
-            // Blacklist this DC and rotate to next one for the reconnect
-            rotateSocketUrl(url);
-
-            // Use graceful disconnect display — don't flash for brief reconnects
-            showDisconnectGraceful("\u274c Disconnected — reconnecting...", "rgba(211,47,47,.9)");
-
-            activeSocket = null;
-            activeSocketUrl = null;
-            if (fn) fn.call(ws, e);
-        };
-    }});
-
-    Object.defineProperty(ws, "onerror", { get:()=>_onerror, set(fn){
-        _onerror = function(e) { if (fn) fn.call(ws, e); };
-    }});
-
-    ws.addEventListener("message", () => {
-        lastMessageTime = Date.now();
-        clearTimeout(pongTimer); pongTimer = null;
-    });
-    ws.addEventListener("open", () => {
-        reconnectAttempts = 0; lastMessageTime = Date.now();
-        cancelDisconnectGrace();
-        setupPing();
-    });
-
-    return ws;
-}
-
-PatchedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
-PatchedWebSocket.OPEN = OrigWebSocket.OPEN;
-PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
-PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
-PatchedWebSocket.prototype = OrigWebSocket.prototype;
-_W.WebSocket = PatchedWebSocket;
-
-// ── Intercept XHR to redirect API calls to fastest endpoint ──
-
-const OrigOpen = XMLHttpRequest.prototype.open;
-const OrigXhrSend = XMLHttpRequest.prototype.send;
-
-XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this._rbOrigUrl = url;
-    const bestApi = getBestApiUrl();
-    if (bestApi && typeof url === "string" && url.includes("iranlms.ir") && !url.includes("getdcmess") && method === "POST") {
-        try {
-            const u = new URL(url);
-            const best = new URL(bestApi);
-            if (u.hostname !== best.hostname) {
-                const newUrl = best.origin + u.pathname + u.search;
-                url = newUrl;
-            }
-        } catch(_) {}
-        this.timeout = 15000;
-    }
-    return OrigOpen.call(this, method, url, ...rest);
-};
-
-// On XHR error, rotate API endpoint so next request tries a different DC
-XMLHttpRequest.prototype.send = function(...args) {
-    this.addEventListener("error", () => {
-        if (this._rbOrigUrl && this._rbOrigUrl.includes("iranlms.ir")) {
-            rotateApiUrl();
-        }
-    }, {once: true});
-    this.addEventListener("timeout", () => {
-        if (this._rbOrigUrl && this._rbOrigUrl.includes("iranlms.ir")) {
-            rotateApiUrl();
-        }
-    }, {once: true});
-    return OrigXhrSend.apply(this, args);
-};
-
-// ── Visibility + network handlers ──
-
-function forceResync() {
-    try { window.dispatchEvent(new HashChangeEvent("hashchange")); } catch(_) {}
-    try {
-        let ac = document.querySelector("ul.chatlist > li.open");
-        if (ac) { ac.dispatchEvent(new MouseEvent("mousedown",{bubbles:true})); setTimeout(()=>{ ac.dispatchEvent(new MouseEvent("mouseup",{bubbles:true})); ac.dispatchEvent(new MouseEvent("click",{bubbles:true})); },50); }
-    } catch(_) {}
-    try { window.dispatchEvent(new Event("focus")); } catch(_) {}
-}
-
-function triggerReconnect() {
-    if (activeSocket && activeSocket.readyState === OrigWebSocket.OPEN) {
-        showStatus("\u2705 Connected", "rgba(0,171,128,.9)");
-        forceResync();
-        return;
-    }
-    window.dispatchEvent(new Event("online"));
-    setTimeout(forceResync, 500);
-}
-
-document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { wasHidden = true; lastVisibleTime = Date.now(); }
-    else {
-        let dur = Date.now() - lastVisibleTime;
-        if (wasHidden && dur > CONN.VISIBILITY_GRACE) {
-            if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) {
-                // Don't flash — just quietly reconnect
-                triggerReconnect();
-            } else if (Date.now() - lastMessageTime > getAdaptivePingInterval() * 2) {
-                // Socket might be stale — probe it
-                lastPingSentAt = performance.now();
-                try { activeSocket.send("{}"); } catch(_) {}
-                clearTimeout(pongTimer);
-                pongTimer = setTimeout(() => {
-                    // Stale — preconnect was hopefully already warming up a backup
-                    try { activeSocket.close(4000, "stale"); } catch(_) {}
-                }, getAdaptivePongTimeout());
-            } else { forceResync(); }
-        }
-        wasHidden = false;
-    }
-});
-
-_W.addEventListener("online", () => {
-    cancelDisconnectGrace();
-    showStatus("\ud83c\udf10 Network restored", "rgba(0,171,128,.9)");
-    setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 500);
-});
-_W.addEventListener("offline", () => {
-    showDisconnectGraceful("\u274c No network", "rgba(211,47,47,.9)");
-});
-
-if (navigator.connection) {
-    navigator.connection.addEventListener("change", () => {
-        if (navigator.onLine) {
-            setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 300);
-        }
-    });
-}
-
-// Adaptive health check — interval adjusts to connection speed
-setInterval(() => {
-    if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) return;
-    const pingInt = getAdaptivePingInterval();
-    if (Date.now() - lastMessageTime > pingInt * 2.5) {
-        console.log("[RB-Fix] Health check — probing");
-        lastPingSentAt = performance.now();
-        try { activeSocket.send("{}"); } catch(_) {}
-        clearTimeout(pongTimer);
-        pongTimer = setTimeout(() => {
-            try { activeSocket.close(4000, "health"); } catch(_) {}
-        }, getAdaptivePongTimeout());
-    }
-}, 20000); // check every 20s regardless
-
-// Retry DC discovery if initial race failed (important for flaky intranet)
-setTimeout(() => {
-    if (!_dcReady) {
-        console.log("[RB-Fix] DC race didn't complete — retrying");
-        raceDCs();
-    }
-}, 15000);
-setTimeout(() => {
-    if (!_dcReady) {
-        console.log("[RB-Fix] DC race retry 2");
-        raceDCs();
-    }
-}, 45000);
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  PHASE 1.5: UI POLISH (inject CSS early to prevent FOUC)   ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-const _uiCSS = document.createElement("style");
-_uiCSS.id = "rb-ui-polish";
-_uiCSS.textContent = `
-/* ═══ Rubika UI Polish ═══
-   High-specificity overrides using #page-chats prefix.
-   All inline — works on Iran intranet. */
-
-/* ── Widen message area: remove max-width constraint ── */
-#page-chats .bubbles-inner {
-    --messages-container-width: 100% !important;
-    max-width: 100% !important;
-    padding-inline: 12px !important;
-}
-
-/* ── Chat list: tighter, rounder ── */
-#page-chats #column-left ul.chatlist {
-    padding: 0 4px !important;
-}
-#page-chats #column-left ul.chatlist > li[rb-chat-item] {
-    border-radius: 10px !important;
-    margin: 1px 0 !important;
-}
-#page-chats #column-left ul.chatlist > li.open {
-    background: var(--primary-color) !important;
-}
-#page-chats #column-left ul.chatlist > li.open .user-caption,
-#page-chats #column-left ul.chatlist > li.open .user-caption * {
-    color: #fff !important;
-}
-#page-chats #column-left ul.chatlist > li.open .user-last-message,
-#page-chats #column-left ul.chatlist > li.open .dialog-subtitle,
-#page-chats #column-left ul.chatlist > li.open .message-time,
-#page-chats #column-left ul.chatlist > li.open .im_dialog_chat_from {
-    color: rgba(255,255,255,0.75) !important;
-}
-#page-chats #column-left ul.chatlist > li.open .sending-status-icon {
-    color: rgba(255,255,255,0.7) !important;
-}
-#page-chats #column-left ul.chatlist > li.open .badge:not(.badge-ads) {
-    background: #fff !important;
-    color: var(--primary-color) !important;
-}
-
-/* ── Thin scrollbars ── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }
-html.night ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); }
-* { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.15) transparent; }
-html.night * { scrollbar-color: rgba(255,255,255,0.12) transparent; }
-
-/* ── Handshake bridge widget: make text visible ── */
-div[rb-copyable] div[style*="border:1px solid #888"] {
-    border-color: var(--primary-color, #3390ec) !important;
-    background: rgba(51,144,236,0.08) !important;
-}
-div[rb-copyable] div[style*="border:1px solid #888"] span {
-    color: var(--primary-text-color, #000) !important;
-}
-
-/* ── Send button highlight ── */
-#page-chats .btn-send-container button.btn-send.send {
-    background: var(--primary-color) !important;
-}
-#page-chats .btn-send-container button.btn-send.send .rbico-send {
-    color: #fff !important;
-}
-
-/* ── Selection highlight ── */
-::selection { background: rgba(51,144,236,0.25); }
-html.night ::selection { background: rgba(135,116,225,0.3); }
-`;
-
-(document.head || document.documentElement).appendChild(_uiCSS);
-console.log("[RB-Fix] UI polish CSS injected");
-
-console.log("[RB-Fix] Connectivity fix loaded (document-start)");
+const _W=typeof unsafeWindow!=="undefined"?unsafeWindow:window,OrigWS=_W.WebSocket;
+let _rk={api:[],sock:[]},_ri={api:0,sock:0},_bad=new Set();
+function bestS(){for(let i=0;i<_rk.sock.length;i++){const u=_rk.sock[(_ri.sock+i)%_rk.sock.length];if(!_bad.has(u))return u;}return _rk.sock[0]||null;}
+function rotS(b){if(b){_bad.add(b);setTimeout(()=>_bad.delete(b),30000);}if(_rk.sock.length>1)_ri.sock=(_ri.sock+1)%_rk.sock.length;}
+function bestA(){return _rk.api[_ri.api]||null;}
+function rotA(){if(_rk.api.length>1)_ri.api=(_ri.api+1)%_rk.api.length;}
+async function raceDCs(){try{const r=await fetch("https://getdcmess.iranlms.ir/",{signal:AbortSignal.timeout(12000)});const d=(await r.json()).data;let a=[],s=[];if(d.API)a=Object.values(d.API).filter(Boolean);if(d.socket)s=Object.values(d.socket).filter(Boolean);else if(d.Socket)s=Object.values(d.Socket).filter(Boolean);a=[...new Set(a.map(u=>u.endsWith("/")?u:u+"/"))];s=[...new Set(s)];if(a.length){const rs=await Promise.allSettled(a.map(async u=>{const t=performance.now();await fetch(u,{method:"POST",headers:{"Content-Type":"text/plain"},body:"{}",signal:AbortSignal.timeout(10000)});return{u,ms:performance.now()-t};}));_rk.api=rs.filter(x=>x.status==="fulfilled").map(x=>x.value).sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(_rk.api);a.forEach(u=>{if(!seen.has(u))_rk.api.push(u);});}
+if(s.length)_rk.sock=await new Promise(res=>{const r=[],st={},ws=[];let n=s.length;const to=setTimeout(fin,10000);function fin(){clearTimeout(to);ws.forEach(w=>{try{w.close();}catch(_){}});const ok=r.sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(ok);s.forEach(u=>{if(!seen.has(u))ok.push(u);});res(ok);}s.forEach(u=>{try{st[u]=performance.now();const w=new OrigWS(u);ws.push(w);w.onopen=()=>{r.push({u,ms:performance.now()-st[u]});if(--n<=0)fin();};w.onerror=()=>{if(--n<=0)fin();};}catch(_){if(--n<=0)fin();}});if(n<=0)fin();});
+}catch(e){console.log("[RB] DC fail:",e.message);}}
+raceDCs();setTimeout(()=>{if(!_rk.api.length)raceDCs();},15000);
+let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null;
+function aPoT(){if(rtt.length<3)return 12000;const s=[...rtt].sort((a,b)=>a-b);return Math.max(5000,Math.min(20000,s[Math.floor(s.length*.9)]*3));}
+function aPiT(){if(rtt.length<3)return 15000;return Math.max(10000,Math.min(25000,(rtt.reduce((a,b)=>a+b,0)/rtt.length)*8));}
+function clrP(){clearInterval(piT);clearTimeout(poT);piT=poT=null;}
+function PW(url,pr){const bs=bestS();if(bs&&url&&url.includes("iranlms.ir")&&!url.includes("getdcmess"))url=bs;const ws=pr!==undefined?new OrigWS(url,pr):new OrigWS(url);if(!url||!url.includes("iranlms.ir"))return ws;aSock=ws;lastM=Date.now();const os=ws.send.bind(ws);ws.send=function(d){return os(d);};
+function sP(){clrP();piT=setInterval(()=>{if(ws.readyState===1){pS=performance.now();try{os("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{ws.close(4000,"pt");}catch(_){}},aPoT());}},aPiT());}
+ws.addEventListener("open",()=>{lastM=Date.now();sP();});ws.addEventListener("message",()=>{lastM=Date.now();clearTimeout(poT);poT=null;if(pS>0){rtt.push(performance.now()-pS);if(rtt.length>10)rtt.shift();pS=0;}});ws.addEventListener("close",()=>{clrP();rotS(url);aSock=null;});return ws;}
+PW.CONNECTING=OrigWS.CONNECTING;PW.OPEN=OrigWS.OPEN;PW.CLOSING=OrigWS.CLOSING;PW.CLOSED=OrigWS.CLOSED;PW.prototype=OrigWS.prototype;_W.WebSocket=PW;
+const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=15000;}return oO.call(this,m,u,...r);};
+XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
+_W.addEventListener("online",()=>{setTimeout(()=>{if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));},1000);});
+if(navigator.connection)navigator.connection.addEventListener("change",()=>{if(navigator.onLine&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
+setInterval(()=>{if(!aSock||aSock.readyState!==1)return;if(Date.now()-lastM>aPiT()*2.5){pS=performance.now();try{aSock.send("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{aSock.close(4000,"hc");}catch(_){}},aPoT());}},20000);
 })();
 
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  PHASE 2: E2E ENCRYPTION (deferred until DOM ready)        ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-function _initEncryption() {
-"use strict";
-
-const CFG = Object.freeze({
-    KEY_LEN:32, MAX_ENC:4000, TOAST_MS:4500, LONG_PRESS:400,
-    SEND_DLY:60, POST_DLY:100, MAX_DEPTH:10, KCACHE:16,
-    CHARS:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
-    B85:"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
-    PFX_E:"@@", PFX_E2:"@@+", PFX_H:"!!", HS_EXP:86400, HS_CLEANUP:86400000
-});
+// ── E2E ENCRYPTION (deferred to DOM ready) ──
+function _rbInitEnc(){
+!function(){"use strict";
 
 const ALGO = "AES-GCM";
 const COMPRESS = "deflate";
 const SETTINGS_PREFIX = "rubika_bridge_settings_";
-const BASE85_CHARS = CFG.B85;
-const KEY_CHARS = CFG.CHARS;
+const BASE85_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+const KEY_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~";
 const HTML_ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"};
 const URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
-
-const _W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-const _C = crypto, _S = crypto.subtle;
-
-function u8(ab){ const v = new Uint8Array(ab), c = new Uint8Array(v.length); c.set(v); return c; }
-
-// ── Base64url encoding (@@+ format) ──
-
-function toB64(buf){ let b = ""; const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf); for(let i=0;i<a.byteLength;i++) b += String.fromCharCode(a[i]); return btoa(b).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
-function fromB64(s){ let c = s.replace(/[^A-Za-z0-9\-_]/g,"").replace(/-/g,"+").replace(/_/g,"/"); c += "=".repeat((4-(c.length%4))%4); const b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
-function fromStdB64(s){ const c = s.replace(/[^A-Za-z0-9+/=]/g,""), b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
-function fromLegacyB64(s){ let c = s.replace(/[^A-Za-z0-9\-_.+/=]/g,"").replace(/-/g,"+").replace(/_/g,"/").replace(/\./g,"=").replace(/=+$/,""); c += "=".repeat((4-(c.length%4))%4); const b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
-function decodeB64Smart(s){ try{const r=fromB64(s);if(r.length>0)return r;}catch(_){} try{const r=fromLegacyB64(s);if(r.length>0)return r;}catch(_){} try{const r=fromStdB64(s);if(r.length>0)return r;}catch(_){} return null; }
-
-// ── Crypto helpers for bridge ──
-
-async function digest(d){ return u8(await _S.digest("SHA-256",d)); }
-function toHex(b){ return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join(""); }
-function fromHex(h){ if(!h) return new Uint8Array(0); const a=new Uint8Array(h.length/2); for(let i=0;i<h.length;i+=2) a[i/2]=parseInt(h.substring(i,i+2),16); return a; }
-function concatBytes(...a){ let t=a.reduce((s,x)=>s+x.length,0),r=new Uint8Array(t),o=0; for(const x of a){r.set(x,o);o+=x.length;} return r; }
-async function getFpStr(pub){ return toHex(await digest(pub)).slice(0,8).toUpperCase(); }
-async function ecSign(priv,buf){ return u8(await _S.sign({name:"ECDSA",hash:"SHA-256"},priv,buf)); }
-async function ecVerify(pubRaw,sig,buf){ try{ const p=await _S.importKey("raw",pubRaw,{name:"ECDSA",namedCurve:"P-256"},false,["verify"]); return await _S.verify({name:"ECDSA",hash:"SHA-256"},p,sig,buf); }catch(_){return false;} }
-
-async function deriveSymmetric(myPrivBuf,theirPubRaw,nonce,initIdPub,respIdPub,initEphPub,respEphPub){
-    const myPriv=await _S.importKey("pkcs8",myPrivBuf,{name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
-    const theirPub=await _S.importKey("raw",theirPubRaw,{name:"ECDH",namedCurve:"P-256"},true,[]);
-    const shared=await _S.deriveBits({name:"ECDH",public:theirPub},myPriv,256);
-    const hkdfKey=await _S.importKey("raw",shared,{name:"HKDF"},false,["deriveBits"]);
-    const info=concatBytes(initEphPub,respEphPub,nonce,initIdPub,respIdPub);
-    const salt=u8(await _S.digest("SHA-256",concatBytes(nonce,initIdPub,respIdPub)));
-    const material=u8(await _S.deriveBits({name:"HKDF",hash:"SHA-256",salt,info},hkdfKey,96*8));
-    const keyMat=material.slice(0,64),hmacMat=material.slice(64,96);
-    const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[]; let f=0;
-    for(let i=0;i<keyMat.length&&f<CFG.KEY_LEN;i++) if(keyMat[i]<mx) r[f++]=c[keyMat[i]%cl];
-    if(f<CFG.KEY_LEN) throw new Error("Key Exhaustion");
-    return {sessionKey:r.join(""), hmacKeyBytes:hmacMat};
-}
-
-// ── IndexedDB storage ──
-
-function safeClone(obj){
-    if(obj==null||typeof obj!=="object") return obj;
-    try{return structuredClone(obj);}catch(_){}
-    try{return JSON.parse(JSON.stringify(obj));}catch(_){}
-    try{ if(Array.isArray(obj)) return obj.map(safeClone); const o={}; let keys; try{keys=Object.keys(obj);}catch(_){keys=[];for(const k in obj)keys.push(k);} for(const k of keys) try{o[k]=typeof obj[k]==="object"&&obj[k]!==null?safeClone(obj[k]):obj[k];}catch(_){} return o; }catch(_){return obj;}
-}
-
-let _db,_memDB={identity:{},contacts:{},handshakes:{}},_useMem=false;
-async function getDB(){
-    if(_useMem) return null; if(_db) return _db;
-    return new Promise((res,rej)=>{
-        const rq=indexedDB.open("rubika_bridge_db",2);
-        rq.onupgradeneeded=e=>{const d=e.target.result; if(e.oldVersion<2){for(const n of["identity","contacts","handshakes"])if(d.objectStoreNames.contains(n))d.deleteObjectStore(n);} for(const[n,k]of[["identity","id"],["contacts","id"],["handshakes","nonce"]])if(!d.objectStoreNames.contains(n))d.createObjectStore(n,{keyPath:k});};
-        rq.onsuccess=e=>{_db=e.target.result;res(_db);}; rq.onerror=()=>{_useMem=true;rej(rq.error);};
-    });
-}
-async function dbOp(s,o,v){
-    try{ const d=await getDB(); if(!d) throw 0; return new Promise((res,rej)=>{ const tx=d.transaction(s,o==="get"||o==="getAll"?"readonly":"readwrite"),st=tx.objectStore(s); let rq; if(o==="get")rq=st.get(v);else if(o==="put")rq=st.put(safeClone(v));else if(o==="del")rq=st.delete(v);else rq=st.getAll(); rq.onsuccess=()=>{try{res(rq.result!=null&&typeof rq.result==="object"?safeClone(rq.result):rq.result);}catch(_){res(rq.result);}}; rq.onerror=()=>rej(rq.error); });
-    }catch(_){ _useMem=true; if(o==="get") return _memDB[s][v]?safeClone(_memDB[s][v]):undefined; if(o==="put"){_memDB[s][v.id||v.nonce]=safeClone(v);return v;} if(o==="del"){delete _memDB[s][v];return;} return Object.values(_memDB[s]).map(safeClone); }
-}
-
-// ── Identity & trust ──
-
-async function getMyId(){
-    let rec=await dbOp("identity","get","self");
-    if(rec&&rec.pubHex&&rec.privHex){ try{ const pubBuf=fromHex(rec.pubHex),privBuf=fromHex(rec.privHex); const pub=await _S.importKey("raw",pubBuf,{name:"ECDSA",namedCurve:"P-256"},true,["verify"]); const priv=await _S.importKey("pkcs8",privBuf,{name:"ECDSA",namedCurve:"P-256"},true,["sign"]); return {pub,priv,pubRaw:pubBuf,fp:await getFpStr(pubBuf)}; }catch(_){} }
-    const kp=await _S.generateKey({name:"ECDSA",namedCurve:"P-256"},true,["sign","verify"]);
-    const pubRaw=u8(await _S.exportKey("raw",kp.publicKey)),privPkcs8=u8(await _S.exportKey("pkcs8",kp.privateKey));
-    await dbOp("identity","put",{id:"self",pubHex:toHex(pubRaw),privHex:toHex(privPkcs8),createdAt:Date.now()});
-    return {pub:kp.publicKey,priv:kp.privateKey,pubRaw,fp:await getFpStr(pubRaw)};
-}
-
-async function getTrustInfo(idPubRaw,chatId){
-    const h=toHex(await digest(idPubRaw)),cid=h.slice(0,16),fp=h.slice(0,8).toUpperCase(),all=await dbOp("contacts","getAll");
-    const ex=all.find(c=>c.id===cid); if(ex) return {state:"known",fp,cid};
-    const oc=all.find(c=>c.chatId===chatId); if(oc) return {state:"changed",fp,cid,oldFp:oc.id.slice(0,8).toUpperCase()};
-    return {state:"new",fp,cid};
-}
-
-let _hsLock=Promise.resolve();
-function hsLock(fn){ let unlock; const prev=_hsLock; _hsLock=new Promise(r=>unlock=r); return prev.then(()=>fn()).finally(()=>unlock()); }
-
-function formatError(e){ if(!e) return "Unknown Error"; return (e.name?e.name+": ":"")+( e.message||String(e)); }
-
-function tsBuf(){ const ts=Math.floor(Date.now()/1000); return new Uint8Array([(ts>>>24)&255,(ts>>>16)&255,(ts>>>8)&255,ts&255]); }
 
 let cachedChatId = null;
 let cachedSettings = null;
@@ -813,19 +81,14 @@ function saveSettings(s) {
     localStorage.setItem(SETTINGS_PREFIX + id, JSON.stringify(s));
 }
 
-const chatType = () => { const h = location.hash; if(h.includes("g0")) return "group"; if(h.includes("c0")) return "channel"; return "dm"; };
-const isGroup = () => chatType() === "group";
-
 function getKey() {
     let s = getSettings();
-    return s.enabled && s.customKey && s.customKey.length === CFG.KEY_LEN ? s.customKey : null;
+    return s.enabled && s.customKey && s.customKey.length === 32 ? s.customKey : null;
 }
 
 function isEnabled() {
     return getSettings().enabled;
 }
-
-function genKey(){ const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[]; let f=0; while(f<CFG.KEY_LEN){const b=new Uint8Array(64);_C.getRandomValues(b);for(let i=0;i<64&&f<CFG.KEY_LEN;i++)if(b[i]<mx)r[f++]=c[b[i]%cl];} return r.join(""); }
 
 // ── Try all stored keys for preview decryption ──
 function getAllStoredKeys() {
@@ -847,17 +110,16 @@ function getAllStoredKeys() {
 }
 
 async function tryDecryptWithAllKeys(text) {
-    if (!text.startsWith(CFG.PFX_E)) return text;
+    if (!text.startsWith("@@")) return text;
     let keys = getAllStoredKeys();
     if (!keys.length) return text;
     for (let k of keys) {
         try {
-            let b;
-            if (text.startsWith(CFG.PFX_E2)) b = decodeB64Smart(text.slice(3));
-            else b = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
-            if (!b || b.length < 13) continue;
+            let data = base85decode(text.slice(2));
+            let iv = data.subarray(0, 12);
+            let ct = data.subarray(12);
             let aesKey = await deriveKey(k);
-            let dec = await crypto.subtle.decrypt({ name: ALGO, iv: b.subarray(0,12) }, aesKey, b.subarray(12));
+            let dec = await crypto.subtle.decrypt({ name: ALGO, iv }, aesKey, ct);
             return await decompress(new Uint8Array(dec));
         } catch {}
     }
@@ -939,20 +201,19 @@ async function encrypt(text) {
     let combined = new Uint8Array(12 + enc.length);
     combined.set(iv);
     combined.set(enc, 12);
-    return CFG.PFX_E2 + toB64(combined);
+    return "@@" + base85encode(combined);
 }
 
 async function decrypt(text) {
-    if (!text.startsWith(CFG.PFX_E)) return text;
+    if (!text.startsWith("@@")) return text;
     let k = getKey();
     if (!k) return text;
     try {
-        let b;
-        if (text.startsWith(CFG.PFX_E2)) b = decodeB64Smart(text.slice(3));
-        else b = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
-        if (!b || b.length < 13) return text;
+        let data = base85decode(text.slice(2));
+        let iv = data.subarray(0, 12);
+        let ct = data.subarray(12);
         let aesKey = await deriveKey(k);
-        let dec = await crypto.subtle.decrypt({ name: ALGO, iv: b.subarray(0,12) }, aesKey, b.subarray(12));
+        let dec = await crypto.subtle.decrypt({ name: ALGO, iv }, aesKey, ct);
         return await decompress(new Uint8Array(dec));
     } catch { return text; }
 }
@@ -969,182 +230,6 @@ async function splitEncrypt(text) {
     let b = await splitEncrypt(text.slice(splitAt).trim());
     return a && b ? [...a, ...b] : null;
 }
-
-// ── Bridge / Handshake system ──
-
-function renderHS(el,text,cc,fp="",trust="",onAction=null,btnText="Accept & Connect"){
-    const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#555";
-    const bg=cc==="ac"?"rgba(0,171,128,0.1)":cc==="wrn"?"rgba(210,153,34,0.1)":cc==="err"?"rgba(248,81,73,0.1)":"rgba(0,0,0,0.06)";
-    let h=`<div style="border:1.5px solid ${c};background:${bg};border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;margin-bottom:${fp?"6px":"0"};font-size:14px;color:${c}">${escapeHtml(text)}</span>`;
-    if(fp){ h+=`<div style="font-family:monospace;font-size:11.5px;margin-bottom:4px;font-weight:600;color:#00ab80">Fingerprint: ${escapeHtml(fp)}</div>`; const tc=trust.includes("\u26a0\ufe0f")?"#d32f2f":"#555"; h+=`<div style="color:${tc};font-weight:${trust.includes("\u26a0\ufe0f")?"700":"500"};margin-bottom:${onAction?"8px":"0"}">${escapeHtml(trust)}</div>`; }
-    if(onAction) h+=`<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:${c};color:#fff">${escapeHtml(btnText)}</button>`;
-    h+="</div>"; el.innerHTML=h;
-    if(onAction){ const btn=el.querySelector(".bb-hs-btn"); if(btn) btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();}; }
-}
-
-async function startBridge(){
-    const id=await getMyId(), eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
-    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
-    const nonce=new Uint8Array(16); _C.getRandomValues(nonce);
-    const payload=concatBytes(new Uint8Array([1,1]),nonce,tsBuf(),id.pubRaw,ephPub);
-    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
-    const hsRec={nonce:toHex(nonce),chatId:getChatId(),role:"initiator",stage:"invited",ephPrivHex:toHex(ephPriv),ephPubHex:toHex(ephPub),initIdPubHex:toHex(id.pubRaw),theirIdentityKeyHex:null,createdAt:Date.now(),payloadHashHex:toHex(await digest(payload)),chatType:chatType()};
-    if(isGroup()) hsRec.groupKey=genKey();
-    await dbOp("handshakes","put",hsRec);
-    await sendViaBridge(CFG.PFX_H+" "+toB64(msg)); toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!"); refreshUI();
-}
-
-async function acceptBridge(data,el){
-    const id=await getMyId(), eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
-    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
-    const {sessionKey,hmacKeyBytes}=await deriveSymmetric(ephPriv,data.theirEphPubRaw,data.nonce,data.theirIdPubRaw,id.pubRaw,data.theirEphPubRaw,ephPub);
-    const payload=concatBytes(new Uint8Array([1,2]),data.nonce,tsBuf(),data.payloadHash,id.pubRaw,ephPub);
-    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
-    await dbOp("handshakes","put",{nonce:toHex(data.nonce),chatId:getChatId(),role:"responder",stage:"accepted",derivedKey:sessionKey,hmacKeyHex:toHex(hmacKeyBytes),theirIdentityKeyHex:toHex(data.theirIdPubRaw),createdAt:Date.now()});
-    renderHS(el,"\ud83d\udd04 Bridge accepted \u2014 waiting for confirmation","wrn");
-    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));
-}
-
-async function processAccept(data,hs,el){
-    const id=await getMyId();
-    const hsNonce=fromHex(hs.nonce),hsInitPub=fromHex(hs.initIdPubHex),hsEphPub=fromHex(hs.ephPubHex),myPriv=fromHex(hs.ephPrivHex);
-    const {sessionKey,hmacKeyBytes}=await deriveSymmetric(myPriv,data.theirEphPubRaw,hsNonce,hsInitPub,data.theirIdPubRaw,hsEphPub,data.theirEphPubRaw);
-    const hmacKey=await _S.importKey("raw",hmacKeyBytes,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const hmacVal=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),hsNonce)));
-    const useGroupKey=hs.chatType==="group"&&hs.groupKey;
-    const activeSessionKey=useGroupKey?hs.groupKey:sessionKey;
-    let payload,encBlob;
-    if(useGroupKey){
-        const pairwiseAes=await _S.importKey("raw",new TextEncoder().encode(sessionKey),{name:"AES-GCM"},false,["encrypt"]);
-        const gkIv=new Uint8Array(12); _C.getRandomValues(gkIv);
-        const gkCt=u8(await _S.encrypt({name:"AES-GCM",iv:gkIv},pairwiseAes,new TextEncoder().encode(hs.groupKey)));
-        encBlob=concatBytes(gkIv,gkCt);
-        payload=concatBytes(new Uint8Array([1,4]),hsNonce,tsBuf(),hmacVal,encBlob);
-    }else{
-        payload=concatBytes(new Uint8Array([1,3]),hsNonce,tsBuf(),hmacVal);
-    }
-    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
-    saveSettings({enabled:true,customKey:activeSessionKey});
-    await dbOp("contacts","put",{id:data.cid,chatId:getChatId(),pubHex:toHex(data.theirIdPubRaw),lastSeen:Date.now()});
-    delete hs.ephPrivHex; hs.derivedKey=sessionKey; hs.stage="confirmed"; await dbOp("handshakes","put",hs);
-    refreshUI(); await sendViaBridge(CFG.PFX_H+" "+toB64(msg)); renderHS(el,useGroupKey?"\u2705 Group bridge \u2014 key delivered":"\u2705 Bridge established","ac");
-    setTimeout(async()=>{ const tc=await splitEncrypt("\u2705 Bridge Established! Fingerprints: "+id.fp+" \u2194 "+data.fp); if(tc) for(const c of tc) await sendViaBridge(c); },CFG.SEND_DLY+400);
-}
-
-async function processConfirm(data,hs,el){
-    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
-    if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
-    saveSettings({enabled:true,customKey:hs.derivedKey});
-    const fpInfo=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
-    await dbOp("contacts","put",{id:fpInfo.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
-    delete hs.hmacKeyHex; hs.stage="confirmed"; await dbOp("handshakes","put",hs);
-    refreshUI(); renderHS(el,"\u2705 Bridge established","ac");
-}
-
-async function processGroupConfirm(data,hs,el){
-    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
-    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
-    if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
-    const pairwiseAes=await _S.importKey("raw",new TextEncoder().encode(hs.derivedKey),{name:"AES-GCM"},false,["decrypt"]);
-    const gkIv=data.encBlob.slice(0,12),gkCt=data.encBlob.slice(12);
-    const groupKey=new TextDecoder().decode(u8(await _S.decrypt({name:"AES-GCM",iv:gkIv},pairwiseAes,gkCt)));
-    if(groupKey.length!==CFG.KEY_LEN) throw new Error("Invalid group key length");
-    saveSettings({enabled:true,customKey:groupKey});
-    const fpInfo=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
-    await dbOp("contacts","put",{id:fpInfo.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
-    delete hs.hmacKeyHex; hs.stage="confirmed"; hs.groupKey=groupKey; await dbOp("handshakes","put",hs);
-    refreshUI(); renderHS(el,"\u2705 Group bridge established","ac");
-}
-
-async function handleHandshake(b64,el){
-    if(el._isDecrypted) return; el._isDecrypted=true;
-    try{
-        const bytes=decodeB64Smart(b64); if(!bytes||bytes.length<118) return;
-        const ver=bytes[0],type=bytes[1]; if(ver!==1) return;
-        const nonce=bytes.slice(2,18),hexNonce=toHex(nonce);
-        const myId=await getMyId(), hs=await dbOp("handshakes","get",hexNonce);
-
-        if(type===1){
-            if(bytes.length!==216) return;
-            const payload=bytes.slice(0,152),sig=bytes.slice(152,216),idPub=bytes.slice(22,87),ephPub=bytes.slice(87,152);
-            if(!await ecVerify(idPub,sig,payload)) return;
-            if(toHex(idPub)===toHex(myId.pubRaw)) return renderHS(el,"\ud83d\udd04 Bridge invite sent","txM");
-            if(hs){ if(hs.stage==="accepted") return renderHS(el,"\ud83d\udd04 Waiting for confirmation","wrn"); if(hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); return renderHS(el,"\ud83e\udd1d Processed","txM"); }
-            const trust=await getTrustInfo(idPub,getChatId()), hsList=await dbOp("handshakes","getAll");
-            const out=hsList.find(h=>h.chatId===getChatId()&&h.role==="initiator"&&h.stage==="invited");
-            if(out){ if(myId.fp<trust.fp) return renderHS(el,"\ud83e\udd1d Collision avoided","txM"); else if(myId.fp>trust.fp) await dbOp("handshakes","del",out.nonce); else return; }
-            const tStr=trust.state==="new"?"\ud83c\udd95 New contact":trust.state==="known"?"\u2705 Known contact":`\u26a0\ufe0f IDENTITY CHANGED \u2014 old: ${trust.oldFp}, new: ${trust.fp}`;
-            renderHS(el,isGroup()?"\ud83d\udee1\ufe0f Group Bridge Request":"\ud83d\udee1\ufe0f Secure Bridge Request","ac",trust.fp,tStr,async()=>{
-                try{await acceptBridge({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,payloadHash:await digest(payload)},el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
-            },isGroup()?"Join Group Bridge":"Accept & Connect");
-        }else if(type===2){
-            if(bytes.length!==248) return;
-            const payload=bytes.slice(0,184),sig=bytes.slice(184,248),invHash=bytes.slice(22,54),idPub=bytes.slice(54,119),ephPub=bytes.slice(119,184);
-            if(!await ecVerify(idPub,sig,payload)) return;
-            if(toHex(idPub)===toHex(myId.pubRaw)) return renderHS(el,"\ud83d\udd04 Bridge accept sent","txM");
-            if(!hs||hs.role!=="initiator"||hs.stage!=="invited"){ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); return renderHS(el,"\ud83e\udd1d Processed","txM"); }
-            if(toHex(invHash)!==toHex(fromHex(hs.payloadHashHex))) return;
-            const trust=await getTrustInfo(idPub,getChatId());
-            const doAccept=async()=>{ try{await processAccept({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,fp:trust.fp,cid:trust.cid},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");} };
-            if(trust.state==="changed") renderHS(el,"\u26a0\ufe0f Identity Changed!","err",trust.fp,`Old: ${trust.oldFp}, New: ${trust.fp}`,doAccept,"Acknowledge & Connect");
-            else{ renderHS(el,"\u2705 Bridge completing...","ac"); await doAccept(); }
-        }else if(type===3){
-            if(bytes.length!==118) return;
-            const payload=bytes.slice(0,54),sig=bytes.slice(54,118),hmac=bytes.slice(22,54);
-            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
-                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,payload)) return;
-                try{await processConfirm({hmac},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
-            }else{ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); renderHS(el,"\ud83e\udd1d Processed","txM"); }
-        }else if(type===4){
-            if(bytes.length<178) return;
-            const hmac=bytes.slice(22,54),encBlob=bytes.slice(54,bytes.length-64);
-            const payload=bytes.slice(0,bytes.length-64),sig=bytes.slice(bytes.length-64);
-            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
-                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,payload)) return;
-                try{await processGroupConfirm({hmac,encBlob},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
-            }else{ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Group bridge established","ac"); renderHS(el,"\ud83e\udd1d Processed","txM"); }
-        }
-    }catch(e){ renderHS(el,"\u274c "+formatError(e),"err"); }
-}
-
-// sendViaBridge - raw text injection for handshake messages
-async function sendViaBridge(text){
-    let textarea = findTextarea();
-    if(!textarea) return;
-    let hideTarget = findInputWrapper() || textarea;
-    hideTarget.classList.remove("rb-locked-input");
-    hideTarget.style.cssText = "position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
-    textarea.focus();
-    document.execCommand("selectAll", false, null);
-    document.execCommand("insertText", false, text);
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    let enterEvt = { bubbles: true, cancelable: true, key: "Enter", keyCode: 13, which: 13 };
-    textarea.dispatchEvent(new KeyboardEvent("keydown", enterEvt));
-    textarea.dispatchEvent(new KeyboardEvent("keyup", enterEvt));
-    await delay(200);
-    let btn = findSendButton();
-    if(btn){
-        let evtOpts = { bubbles: true, cancelable: true, view: window };
-        btn.dispatchEvent(new PointerEvent("pointerdown", evtOpts));
-        btn.dispatchEvent(new MouseEvent("mousedown", evtOpts));
-        btn.dispatchEvent(new PointerEvent("pointerup", evtOpts));
-        btn.dispatchEvent(new MouseEvent("mouseup", evtOpts));
-        btn.dispatchEvent(new MouseEvent("click", evtOpts));
-        btn.click();
-    }
-    await delay(300);
-    textarea.focus();
-    document.execCommand("selectAll", false, null);
-    document.execCommand("insertText", false, "");
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    hideTarget.style.cssText = "";
-    hideTarget.classList.add("rb-locked-input");
-}
-
-function toast(m,d=CFG.TOAST_MS){ const el=document.createElement("div"); el.textContent=m; Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%) translateY(12px)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",fontFamily:"inherit",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s,transform .2s",whiteSpace:"nowrap",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)"}); document.body.appendChild(el); requestAnimationFrame(()=>{el.style.opacity="1";el.style.transform="translateX(-50%) translateY(0)";}); setTimeout(()=>{el.style.opacity="0";el.style.transform="translateX(-50%) translateY(8px)";setTimeout(()=>el.remove(),250);},d); }
-
-function stripInvisibles(s){return s.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFFF9-\uFFFB]/g,"");}
 
 function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 
@@ -1184,15 +269,6 @@ function renderMarkdown(text) {
 
     while (i < lines.length) {
         let line = lines[i];
-        if (/^```/.test(line)) {
-            let lang = line.slice(3).trim(); i++;
-            let code = [];
-            while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]);
-            if (i < lines.length) i++;
-            let langTag = lang ? `<span style="display:block;padding:4px 12px;font-size:10px;font-weight:600;color:#888;background:#f0f0f0;border-bottom:1px solid #ddd;text-transform:uppercase;letter-spacing:.04em">${escapeHtml(lang)}</span>` : "";
-            result.push(`<div class="bb-cblk" style="position:relative;background:#f8f8f8;border:1px solid #ddd;border-radius:8px;margin:4px 0;overflow:hidden">${langTag}<pre style="margin:0;padding:10px 12px;overflow-x:auto;font-family:monospace;font-size:12.5px;line-height:1.5;white-space:pre;tab-size:4"><code style="font-family:inherit;font-size:inherit;background:none;border:none;padding:0">${escapeHtml(code.join("\n"))}</code></pre><span class="bb-cblk-copy" title="Copy" style="position:absolute;top:4px;right:8px;cursor:pointer;font-size:12px;opacity:.4;transition:opacity .15s;z-index:1">\ud83d\udccb</span></div>`);
-            continue;
-        }
         if (line.startsWith("> ") || line === ">") {
             let qLines = [];
             while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">"))
@@ -1274,11 +350,6 @@ function openSettings() {
                     <span class="bb-key-counter" id="bb-key-counter">0 / 32</span>
                 </div>
             </div>
-            <div id="bb-bridge-section" style="margin-top:16px;border-top:1px solid #f4f5f7;padding-top:16px">
-                <div style="font-size:14px;font-weight:700;margin-bottom:4px">\ud83e\udd1d Automatic Key Exchange</div>
-                <div style="font-size:12px;color:#888;margin-bottom:10px" id="bb-bridge-desc">Establish encryption automatically with your contact.</div>
-                <button class="bb-tool-btn" id="bb-bridge-btn" style="width:100%;margin-top:8px">Loading...</button>
-            </div>
             <div class="bb-actions">
                 <button class="bb-btn bb-btn-cancel" id="bb-btn-cancel">Cancel</button>
                 <button class="bb-btn bb-btn-save" id="bb-btn-save">Save</button>
@@ -1289,9 +360,6 @@ function openSettings() {
     let overlay = document.getElementById("bb-modal-overlay");
     let keyInput = document.getElementById("bb-custom-key");
     let keySection = document.getElementById("bb-key-section");
-    let bridgeSection = document.getElementById("bb-bridge-section");
-    let bridgeBtn = document.getElementById("bb-bridge-btn");
-    let bridgeDesc = document.getElementById("bb-bridge-desc");
     let counter = document.getElementById("bb-key-counter");
     let error = document.getElementById("bb-key-error");
     let saveBtn = document.getElementById("bb-btn-save");
@@ -1300,76 +368,44 @@ function openSettings() {
     let genBtn = document.getElementById("bb-gen-key");
     let visBtn = document.getElementById("bb-toggle-vis");
 
-    let _ig = isGroup();
-    if(_ig) {
-        bridgeDesc.textContent = "Start a group bridge \u2014 each member joins individually. You generate the key, others receive it securely.";
-    }
-
     function validate() {
         let len = keyInput.value.length;
         let on = enableChk.checked;
         counter.textContent = `${len} / 32`;
         counter.className = "bb-key-counter" + (len === 32 ? " exact" : "");
         keySection.style.display = on ? "" : "none";
-        bridgeSection.style.display = on ? "" : "none";
         if (!on) { error.textContent = ""; saveBtn.disabled = false; return; }
         if (len === 0) { error.textContent = "A key is required when encryption is enabled."; saveBtn.disabled = true; }
         else if (len !== 32) { error.textContent = `Key must be exactly 32 characters (currently ${len}).`; saveBtn.disabled = true; }
         else { error.textContent = ""; saveBtn.disabled = false; }
     }
 
-    async function updateBridgeUI(){
-        try{
-            const hsList=await dbOp("handshakes","getAll");
-            const ahs=hsList.find(h=>h.chatId===getChatId()&&h.stage!=="confirmed"&&Date.now()-h.createdAt<CFG.HS_EXP*1000);
-            if(ahs){
-                bridgeBtn.textContent="\ud83d\udd04 Waiting for response... (Cancel)";
-                bridgeBtn.style.color="#d29922";
-                bridgeBtn.style.borderColor="#d29922";
-                bridgeBtn.onclick=async()=>{await dbOp("handshakes","del",ahs.nonce);updateBridgeUI();};
-            }else{
-                const ch=hsList.find(h=>h.chatId===getChatId()&&h.stage==="confirmed"&&(h.derivedKey===keyInput.value||h.groupKey===keyInput.value));
-                if(ch&&keyInput.value.length===CFG.KEY_LEN){
-                    bridgeBtn.textContent=_ig?"\u2705 Group bridge active (Re-key)":"\u2705 Connected via Bridge (Re-key)";
-                    bridgeBtn.style.color="#00ab80";
-                    bridgeBtn.style.borderColor="#00ab80";
-                }else{
-                    bridgeBtn.textContent=_ig?"\ud83e\udd1d Start Group Bridge":"\ud83e\udd1d Start Bridge";
-                    bridgeBtn.style.color="inherit";
-                    bridgeBtn.style.borderColor="#ccc";
-                }
-                bridgeBtn.onclick=async()=>{overlay.remove();try{await startBridge();}catch(_){toast("Bridge error!");}};
-            }
-        }catch(_){bridgeBtn.textContent="Bridge unavailable";bridgeBtn.disabled=true;}
-    }
-    updateBridgeUI();
-
-    keyInput.addEventListener("input", ()=>{validate();updateBridgeUI();});
+    keyInput.addEventListener("input", validate);
     enableChk.addEventListener("change", validate);
     validate();
 
     visBtn.addEventListener("click", () => {
         let show = keyInput.type === "password";
         keyInput.type = show ? "text" : "password";
-        visBtn.textContent = show ? "\ud83d\ude48" : "\ud83d\udc41";
+        visBtn.textContent = show ? "🙈" : "👁";
     });
 
     copyBtn.addEventListener("click", () => {
         if (keyInput.value) {
             navigator.clipboard.writeText(keyInput.value).then(() => {
-                copyBtn.textContent = "\u2705";
+                copyBtn.textContent = "✅";
                 copyBtn.classList.add("copied");
-                setTimeout(() => { copyBtn.textContent = "\ud83d\udccb"; copyBtn.classList.remove("copied"); }, 1500);
+                setTimeout(() => { copyBtn.textContent = "📋"; copyBtn.classList.remove("copied"); }, 1500);
             });
         }
     });
 
     genBtn.addEventListener("click", () => {
-        keyInput.value = genKey();
+        let bytes = crypto.getRandomValues(new Uint8Array(32));
+        keyInput.value = Array.from(bytes, b => KEY_CHARS[b % KEY_CHARS.length]).join("");
         keyInput.type = "text";
-        visBtn.textContent = "\ud83d\ude48";
+        visBtn.textContent = "🙈";
         validate();
-        updateBridgeUI();
     });
 
     document.getElementById("bb-btn-cancel").onclick = () => overlay.remove();
@@ -1379,7 +415,6 @@ function openSettings() {
         overlay.remove();
         refreshUI();
     };
-    overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
 }
 
 const ICONS = {
@@ -1711,8 +746,6 @@ button.toggle-emoticons { display: none !important; }
 document.addEventListener("click", e => {
     let sp = e.target.closest(".bb-spoiler");
     if (sp) { sp.style.color = "inherit"; sp.style.background = "#dfe1e6"; }
-    let cb = e.target.closest(".bb-cblk-copy");
-    if (cb) { e.preventDefault(); e.stopPropagation(); let pre = cb.closest(".bb-cblk")?.querySelector("code"); if(pre) navigator.clipboard.writeText(pre.textContent).then(()=>{cb.textContent="\u2705";setTimeout(()=>cb.textContent="\ud83d\udccb",1200);}).catch(()=>{}); }
 }, true);
 
 ctxMenu = document.createElement("div");
@@ -1787,34 +820,20 @@ document.addEventListener("click", e => {
     }
 }, true);
 
-// ── Auto-decrypt main messages + handshake detection ──
-const _infly=new WeakSet();
-
+// ── Auto-decrypt main messages ──
 function decryptMessages() {
     let nodes = document.body.querySelectorAll("div[rb-copyable]");
     for (let node of nodes) {
-        if (node._isDecrypting || _infly.has(node)) continue;
+        if (node._isDecrypting) continue;
         let text = node.textContent.trim();
-        let ct = stripInvisibles(text);
-
-        // Detect handshake messages (!! prefix)
-        let hi = ct.indexOf(CFG.PFX_H);
-        if (hi !== -1 && !node._isDecrypted) {
-            let raw = ct.slice(hi + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g,"");
-            if (raw.length > 50) {
-                _infly.add(node);
-                hsLock(() => handleHandshake(raw, node).catch(() => {})).finally(() => _infly.delete(node));
-                continue;
-            }
-        }
 
         if (node._isDecrypted) {
-            if (!ct.startsWith(CFG.PFX_E) || node.querySelector(".bb-copy-btn")) continue;
+            if (!text.startsWith("@@") || node.querySelector(".bb-copy-btn")) continue;
             node._isDecrypted = false;
             node.removeAttribute("data-orig-text");
         }
 
-        if (!ct.startsWith(CFG.PFX_E) || ct.length <= 20) continue;
+        if (!text.startsWith("@@") || text.length <= 20) continue;
 
         if (!node.hasAttribute("data-orig-text")) node.setAttribute("data-orig-text", text);
         let raw = node.getAttribute("data-orig-text").replace(/\s/g, "");
@@ -2203,16 +1222,12 @@ function injectUI() {
     let debounceTimer;
     let lastHref = location.href;
 
-    let hsRetryTimer;
     const observer = new MutationObserver(() => {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
             decryptMessages();
             decryptPreviews();
             injectUI();
-            // Delayed re-scan for handshakes that Angular hadn't finished rendering
-            clearTimeout(hsRetryTimer);
-            hsRetryTimer = setTimeout(decryptMessages, 500);
 
             if (isEnabled() && !isSending) {
                 let ov = document.getElementById("secure-input-overlay");
@@ -2231,15 +1246,7 @@ function injectUI() {
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
 
-// ── Handshake cleanup ──
-function cleanupHs(){dbOp("handshakes","getAll").then(hs=>{const now=Date.now();hs.forEach(h=>{if(h.stage!=="confirmed"&&now-h.createdAt>CFG.HS_CLEANUP)dbOp("handshakes","del",h.nonce);});}).catch(()=>{});}
-setTimeout(cleanupHs,2000);setInterval(cleanupHs,CFG.HS_CLEANUP);
-
-} // end _initEncryption
-
-// ── Bootstrap: run encryption init when DOM is ready ──
-if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => setTimeout(_initEncryption, 100));
-} else {
-    setTimeout(_initEncryption, 100);
-}
+}();
+} // end _rbInitEnc
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",()=>setTimeout(_rbInitEnc,100));
+else setTimeout(_rbInitEnc,100);
