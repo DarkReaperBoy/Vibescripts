@@ -185,6 +185,7 @@ raceDCs();
 // ── Connectivity state ──
 
 let activeSocket = null;
+let activeSocketUrl = null;
 let pingTimer = null;
 let pongTimer = null;
 let reconnectAttempts = 0;
@@ -193,19 +194,44 @@ let lastVisibleTime = Date.now();
 let wasHidden = false;
 let statusEl = null;
 let statusHideTimer = null;
+let statusGraceTimer = null;
 let handshakeData = null;
 
+// Adaptive RTT tracking
+let rttSamples = [];
+let lastPingSentAt = 0;
+const RTT_WINDOW = 10; // keep last 10 samples
+
+function getAdaptivePongTimeout() {
+    if (rttSamples.length < 3) return 12000; // conservative default until we have data
+    const sorted = [...rttSamples].sort((a,b) => a - b);
+    const p90 = sorted[Math.floor(sorted.length * 0.9)]; // 90th percentile
+    return Math.max(5000, Math.min(20000, p90 * 3)); // 3x p90, clamped 5s–20s
+}
+
+function getAdaptivePingInterval() {
+    if (rttSamples.length < 3) return 15000;
+    const avg = rttSamples.reduce((a,b) => a+b, 0) / rttSamples.length;
+    // Slower connections get less frequent pings to avoid congestion
+    return Math.max(10000, Math.min(25000, avg * 8));
+}
+
+function recordRtt(ms) {
+    rttSamples.push(ms);
+    if (rttSamples.length > RTT_WINDOW) rttSamples.shift();
+}
+
 const CONN = {
-    PING_INTERVAL: 15000,
-    PONG_TIMEOUT: 10000,
     RECONNECT_BASE: 1000,
     RECONNECT_MAX: 30000,
     RECONNECT_MULT: 1.5,
     VISIBILITY_GRACE: 5000,
-    STATUS_SHOW_MS: 5000,
+    STATUS_SHOW_MS: 4000,
+    DISCONNECT_GRACE: 3000, // don't show "disconnected" for blips shorter than this
+    PRECONNECT_RTT_THRESH: 3, // if pong takes >3x avg RTT, preemptively prepare backup
 };
 
-// ── Status indicator ──
+// ── Status indicator with grace period ──
 
 function ensureStatusUI() {
     if (statusEl && document.body && document.body.contains(statusEl)) return;
@@ -236,10 +262,65 @@ function showStatus(text, color, persistent) {
     if (!persistent) statusHideTimer = setTimeout(hideStatus, CONN.STATUS_SHOW_MS);
 }
 
+// Show disconnect status only after grace period (avoids flashing on brief blips)
+function showDisconnectGraceful(text, color) {
+    clearTimeout(statusGraceTimer);
+    statusGraceTimer = setTimeout(() => {
+        // Only show if still disconnected
+        if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) {
+            showStatus(text, color, true);
+        }
+    }, CONN.DISCONNECT_GRACE);
+}
+
+function cancelDisconnectGrace() {
+    clearTimeout(statusGraceTimer);
+}
+
 function hideStatus() {
     if (!statusEl) return;
     statusEl.style.transform = "translateX(-50%) translateY(-50px)";
     statusEl.style.opacity = "0";
+}
+
+// ── Pre-connect: open backup DC before current one fully dies ──
+
+let backupSocket = null;
+let backupSocketUrl = null;
+
+function preconnectBackup() {
+    if (backupSocket && backupSocket.readyState <= OrigWebSocket.OPEN) return; // already have one
+    const nextUrl = getBestSocketUrl();
+    if (!nextUrl || nextUrl === activeSocketUrl) {
+        // Try the one after current
+        rotateSocketUrl(null); // don't blacklist, just rotate index
+        const alt = getBestSocketUrl();
+        if (!alt || alt === activeSocketUrl) return;
+        backupSocketUrl = alt;
+    } else {
+        backupSocketUrl = nextUrl;
+    }
+
+    console.log(`[RB-Fix] Pre-connecting backup socket: ${backupSocketUrl}`);
+    try {
+        backupSocket = new OrigWebSocket(backupSocketUrl);
+        backupSocket.onopen = () => {
+            console.log(`[RB-Fix] Backup socket ready: ${backupSocketUrl}`);
+            // Send handshake to keep it warm
+            if (handshakeData) {
+                try { backupSocket.send(handshakeData); } catch(_) {}
+            }
+        };
+        backupSocket.onerror = () => { backupSocket = null; backupSocketUrl = null; };
+        backupSocket.onclose = () => { backupSocket = null; backupSocketUrl = null; };
+        // Auto-close backup after 60s if not used (don't waste resources)
+        setTimeout(() => {
+            if (backupSocket && activeSocket && activeSocket.readyState === OrigWebSocket.OPEN) {
+                try { backupSocket.close(); } catch(_) {}
+                backupSocket = null; backupSocketUrl = null;
+            }
+        }, 60000);
+    } catch(_) { backupSocket = null; backupSocketUrl = null; }
 }
 
 // ── WebSocket interceptor ──
@@ -264,8 +345,10 @@ function PatchedWebSocket(url, protocols) {
     if (!url || !url.includes("iranlms.ir")) return ws;
 
     activeSocket = ws;
+    activeSocketUrl = url;
     reconnectAttempts = 0;
     lastMessageTime = Date.now();
+    cancelDisconnectGrace();
     console.log("[RB-Fix] Intercepted socket:", url);
 
     const origSend = ws.send.bind(ws);
@@ -281,17 +364,22 @@ function PatchedWebSocket(url, protocols) {
 
     function setupPing() {
         clearTimers();
+        const interval = getAdaptivePingInterval();
         pingTimer = setInterval(() => {
             if (ws.readyState === OrigWebSocket.OPEN) {
+                lastPingSentAt = performance.now();
                 try { origSend("{}"); } catch(_) {}
                 clearTimeout(pongTimer);
+                const timeout = getAdaptivePongTimeout();
                 pongTimer = setTimeout(() => {
-                    console.log("[RB-Fix] Pong timeout");
-                    showStatus("\u26a0\ufe0f Connection lost — reconnecting...", "rgba(210,153,34,.95)", true);
+                    console.log(`[RB-Fix] Pong timeout (adaptive: ${Math.round(timeout)}ms)`);
+                    // Don't flash disconnect — just quietly switch
+                    showStatus("\ud83d\udd04 Switching...", "rgba(210,153,34,.95)", true);
                     try { ws.close(4000, "pong_timeout"); } catch(_) {}
-                }, CONN.PONG_TIMEOUT);
+                }, timeout);
             }
-        }, CONN.PING_INTERVAL);
+        }, interval);
+        console.log(`[RB-Fix] Ping interval: ${Math.round(interval)}ms, pong timeout: ${Math.round(getAdaptivePongTimeout())}ms`);
     }
 
     // Wrap event handlers set by Angular (via property assignment)
@@ -300,6 +388,7 @@ function PatchedWebSocket(url, protocols) {
     Object.defineProperty(ws, "onopen", { get:()=>_onopen, set(fn){
         _onopen = function(e) {
             console.log("[RB-Fix] Socket opened");
+            cancelDisconnectGrace();
             showStatus("\u2705 Connected", "rgba(0,171,128,.9)");
             reconnectAttempts = 0; lastMessageTime = Date.now();
             setupPing();
@@ -309,7 +398,26 @@ function PatchedWebSocket(url, protocols) {
 
     Object.defineProperty(ws, "onmessage", { get:()=>_onmessage, set(fn){
         _onmessage = function(e) {
+            const now = performance.now();
             lastMessageTime = Date.now();
+            cancelDisconnectGrace();
+
+            // Record RTT if this is a pong response to our ping
+            if (lastPingSentAt > 0) {
+                const rtt = now - lastPingSentAt;
+                recordRtt(rtt);
+                lastPingSentAt = 0;
+
+                // If RTT is degrading badly, pre-connect a backup
+                if (rttSamples.length >= 3) {
+                    const avg = rttSamples.slice(0, -1).reduce((a,b)=>a+b,0) / (rttSamples.length-1);
+                    if (rtt > avg * CONN.PRECONNECT_RTT_THRESH) {
+                        console.log(`[RB-Fix] RTT spike: ${Math.round(rtt)}ms (avg: ${Math.round(avg)}ms) — pre-connecting backup`);
+                        preconnectBackup();
+                    }
+                }
+            }
+
             clearTimeout(pongTimer); pongTimer = null;
             if (fn) fn.call(ws, e);
         };
@@ -321,13 +429,12 @@ function PatchedWebSocket(url, protocols) {
             clearTimers();
             // Blacklist this DC and rotate to next one for the reconnect
             rotateSocketUrl(url);
-            const next = getBestSocketUrl();
-            if (next && next !== url) {
-                showStatus(`\ud83d\udd04 Switching DC...`, "rgba(210,153,34,.95)", true);
-            } else if (e.code !== 4000) {
-                showStatus("\u274c Disconnected", "rgba(211,47,47,.9)", true);
-            }
+
+            // Use graceful disconnect display — don't flash for brief reconnects
+            showDisconnectGraceful("\u274c Disconnected — reconnecting...", "rgba(211,47,47,.9)");
+
             activeSocket = null;
+            activeSocketUrl = null;
             if (fn) fn.call(ws, e);
         };
     }});
@@ -336,8 +443,15 @@ function PatchedWebSocket(url, protocols) {
         _onerror = function(e) { if (fn) fn.call(ws, e); };
     }});
 
-    ws.addEventListener("message", () => { lastMessageTime = Date.now(); clearTimeout(pongTimer); pongTimer = null; });
-    ws.addEventListener("open", () => { reconnectAttempts = 0; lastMessageTime = Date.now(); setupPing(); });
+    ws.addEventListener("message", () => {
+        lastMessageTime = Date.now();
+        clearTimeout(pongTimer); pongTimer = null;
+    });
+    ws.addEventListener("open", () => {
+        reconnectAttempts = 0; lastMessageTime = Date.now();
+        cancelDisconnectGrace();
+        setupPing();
+    });
 
     return ws;
 }
@@ -413,13 +527,17 @@ document.addEventListener("visibilitychange", () => {
         let dur = Date.now() - lastVisibleTime;
         if (wasHidden && dur > CONN.VISIBILITY_GRACE) {
             if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) {
-                showStatus("\ud83d\udd04 Reconnecting...", "rgba(210,153,34,.95)", true);
+                // Don't flash — just quietly reconnect
                 triggerReconnect();
-            } else if (Date.now() - lastMessageTime > CONN.PING_INTERVAL * 2) {
-                showStatus("\ud83d\udd04 Checking connection...", "rgba(210,153,34,.95)", true);
+            } else if (Date.now() - lastMessageTime > getAdaptivePingInterval() * 2) {
+                // Socket might be stale — probe it
+                lastPingSentAt = performance.now();
                 try { activeSocket.send("{}"); } catch(_) {}
                 clearTimeout(pongTimer);
-                pongTimer = setTimeout(() => { try { activeSocket.close(4000, "stale"); } catch(_) {} }, CONN.PONG_TIMEOUT);
+                pongTimer = setTimeout(() => {
+                    // Stale — preconnect was hopefully already warming up a backup
+                    try { activeSocket.close(4000, "stale"); } catch(_) {}
+                }, getAdaptivePongTimeout());
             } else { forceResync(); }
         }
         wasHidden = false;
@@ -427,32 +545,50 @@ document.addEventListener("visibilitychange", () => {
 });
 
 _W.addEventListener("online", () => {
-    showStatus("\ud83c\udf10 Network restored", "rgba(0,171,128,.9)", true);
-    setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 1000);
+    cancelDisconnectGrace();
+    showStatus("\ud83c\udf10 Network restored", "rgba(0,171,128,.9)");
+    setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 500);
 });
-_W.addEventListener("offline", () => { showStatus("\u274c No network", "rgba(211,47,47,.9)", true); });
+_W.addEventListener("offline", () => {
+    showDisconnectGraceful("\u274c No network", "rgba(211,47,47,.9)");
+});
 
 if (navigator.connection) {
     navigator.connection.addEventListener("change", () => {
         if (navigator.onLine) {
-            showStatus("\ud83d\udd04 Network changed — resync...", "rgba(210,153,34,.95)");
-            setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 500);
+            setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 300);
         }
     });
 }
 
-// Health check
+// Adaptive health check — interval adjusts to connection speed
 setInterval(() => {
     if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) return;
-    if (Date.now() - lastMessageTime > CONN.PING_INTERVAL * 2.5) {
+    const pingInt = getAdaptivePingInterval();
+    if (Date.now() - lastMessageTime > pingInt * 2.5) {
+        console.log("[RB-Fix] Health check — probing");
+        lastPingSentAt = performance.now();
         try { activeSocket.send("{}"); } catch(_) {}
         clearTimeout(pongTimer);
         pongTimer = setTimeout(() => {
-            showStatus("\u26a0\ufe0f Stale — reconnecting...", "rgba(210,153,34,.95)", true);
             try { activeSocket.close(4000, "health"); } catch(_) {}
-        }, CONN.PONG_TIMEOUT);
+        }, getAdaptivePongTimeout());
     }
-}, CONN.PING_INTERVAL * 2);
+}, 20000); // check every 20s regardless
+
+// Retry DC discovery if initial race failed (important for flaky intranet)
+setTimeout(() => {
+    if (!_dcReady) {
+        console.log("[RB-Fix] DC race didn't complete — retrying");
+        raceDCs();
+    }
+}, 15000);
+setTimeout(() => {
+    if (!_dcReady) {
+        console.log("[RB-Fix] DC race retry 2");
+        raceDCs();
+    }
+}, 45000);
 
 console.log("[RB-Fix] Connectivity fix loaded (document-start)");
 })();
