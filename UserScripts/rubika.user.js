@@ -1,21 +1,501 @@
 // ==UserScript==
-// @name         Rubika Bridge Encryptor/Decryptor (Ultimate Privacy)
+// @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      3.4
-// @description  Per-chat encryption keys, Shield button, Markdown UI, Auto-decrypt, Draft blocker. Desktop + Mobile.
+// @version      5.0
+// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (fast DC racing, keepalive, reconnect, resync), draft blocker.
 // @author       You
 // @match        *://web.rubika.ir/*
 // @grant        none
+// @run-at       document-start
 // ==/UserScript==
-!function(){"use strict";
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  PHASE 1: CONNECTIVITY FIX (runs at document-start)        ║
+// ║  Patches WebSocket before Angular bootstraps.               ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+(function(){
+"use strict";
+
+const _W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+const OrigWebSocket = _W.WebSocket;
+const DC_URL = "https://getdcmess.iranlms.ir/";
+
+// ── DC Racing: test all endpoints in parallel, use fastest ──
+
+let _bestApiUrl = null;
+let _bestSocketUrl = null;
+let _allApiUrls = [];
+let _allSocketUrls = [];
+let _dcReady = false;
+
+async function raceDCs() {
+    try {
+        const resp = await fetch(DC_URL, {
+            headers: {"User-Agent": navigator.userAgent},
+            signal: AbortSignal.timeout(8000)
+        });
+        const json = await resp.json();
+        const d = json.data || json;
+
+        // Collect all API URLs
+        if (d.API) _allApiUrls = Object.values(d.API).filter(u => u);
+        if (d.default_api) {
+            const da = String(d.default_api);
+            if (d.API && d.API[da]) _allApiUrls.unshift(d.API[da]);
+        }
+        if (d.default_apis) {
+            for (const code of d.default_apis) {
+                if (d.API && d.API[String(code)]) _allApiUrls.unshift(d.API[String(code)]);
+            }
+        }
+
+        // Collect all Socket URLs
+        if (d.socket) _allSocketUrls = Object.values(d.socket).filter(u => u);
+        if (d.Socket) _allSocketUrls = Object.values(d.Socket).filter(u => u);
+        if (d.default_socket) {
+            const ds = String(d.default_socket);
+            if ((d.socket||d.Socket) && (d.socket||d.Socket)[ds]) _allSocketUrls.unshift((d.socket||d.Socket)[ds]);
+        }
+
+        // Deduplicate
+        _allApiUrls = [...new Set(_allApiUrls.map(u => u.endsWith("/") ? u : u + "/"))];
+        _allSocketUrls = [...new Set(_allSocketUrls)];
+
+        // Race API endpoints — whoever responds first wins
+        if (_allApiUrls.length > 0) {
+            _bestApiUrl = await raceEndpoints(_allApiUrls, "api");
+        }
+
+        // For sockets we can't easily race, but we sort by TCP reachability
+        if (_allSocketUrls.length > 0) {
+            _bestSocketUrl = await raceSocketEndpoints(_allSocketUrls);
+        }
+
+        _dcReady = true;
+        console.log("[RB-Fix] DC race complete. Best API:", _bestApiUrl, "Best Socket:", _bestSocketUrl);
+    } catch(e) {
+        console.log("[RB-Fix] DC race failed:", e.message);
+    }
+}
+
+async function raceEndpoints(urls, type) {
+    // Race: first endpoint to respond with valid HTTP gets used
+    const controller = new AbortController();
+    try {
+        const winner = await Promise.any(urls.map(async url => {
+            const start = performance.now();
+            const resp = await fetch(url, {
+                method: "POST",
+                headers: {"Content-Type": "text/plain"},
+                body: "{}",
+                signal: controller.signal
+            });
+            if (!resp.ok && resp.status !== 200) throw new Error("bad status");
+            const latency = performance.now() - start;
+            console.log(`[RB-Fix] ${type} ${url} responded in ${Math.round(latency)}ms`);
+            return url;
+        }));
+        controller.abort(); // cancel the rest
+        return winner;
+    } catch(_) {
+        return urls[0]; // fallback to first
+    }
+}
+
+async function raceSocketEndpoints(urls) {
+    // Test WebSocket connections in parallel, first to open wins
+    return new Promise(resolve => {
+        let resolved = false;
+        const sockets = [];
+        const timeout = setTimeout(() => {
+            if (!resolved) { resolved = true; cleanup(); resolve(urls[0]); }
+        }, 5000);
+
+        function cleanup() {
+            clearTimeout(timeout);
+            for (const s of sockets) try { s.close(); } catch(_) {}
+        }
+
+        for (const url of urls) {
+            try {
+                const ws = new OrigWebSocket(url);
+                sockets.push(ws);
+                ws.onopen = () => {
+                    if (!resolved) {
+                        resolved = true;
+                        console.log(`[RB-Fix] Fastest socket: ${url}`);
+                        cleanup();
+                        resolve(url);
+                    }
+                };
+                ws.onerror = () => {};
+            } catch(_) {}
+        }
+    });
+}
+
+// Start racing immediately
+raceDCs();
+
+// ── Connectivity state ──
+
+let activeSocket = null;
+let pingTimer = null;
+let pongTimer = null;
+let reconnectAttempts = 0;
+let lastMessageTime = Date.now();
+let lastVisibleTime = Date.now();
+let wasHidden = false;
+let statusEl = null;
+let statusHideTimer = null;
+let handshakeData = null;
+
+const CONN = {
+    PING_INTERVAL: 15000,
+    PONG_TIMEOUT: 10000,
+    RECONNECT_BASE: 1000,
+    RECONNECT_MAX: 30000,
+    RECONNECT_MULT: 1.5,
+    VISIBILITY_GRACE: 5000,
+    STATUS_SHOW_MS: 5000,
+};
+
+// ── Status indicator ──
+
+function ensureStatusUI() {
+    if (statusEl && document.body && document.body.contains(statusEl)) return;
+    if (!document.body) return;
+    statusEl = document.createElement("div");
+    statusEl.id = "rb-conn-status";
+    Object.assign(statusEl.style, {
+        position:"fixed",top:"8px",left:"50%",
+        transform:"translateX(-50%) translateY(-50px)",
+        background:"rgba(0,0,0,0.85)",color:"#fff",
+        padding:"6px 16px",borderRadius:"20px",fontSize:"12px",
+        fontWeight:"600",fontFamily:"inherit",zIndex:"9999999",
+        pointerEvents:"none",transition:"transform .3s cubic-bezier(.2,.8,.2,1),opacity .3s",
+        opacity:"0",whiteSpace:"nowrap",backdropFilter:"blur(8px)",
+        WebkitBackdropFilter:"blur(8px)",letterSpacing:".02em"
+    });
+    document.body.appendChild(statusEl);
+}
+
+function showStatus(text, color, persistent) {
+    ensureStatusUI();
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    statusEl.style.background = color || "rgba(0,0,0,0.85)";
+    statusEl.style.transform = "translateX(-50%) translateY(0)";
+    statusEl.style.opacity = "1";
+    clearTimeout(statusHideTimer);
+    if (!persistent) statusHideTimer = setTimeout(hideStatus, CONN.STATUS_SHOW_MS);
+}
+
+function hideStatus() {
+    if (!statusEl) return;
+    statusEl.style.transform = "translateX(-50%) translateY(-50px)";
+    statusEl.style.opacity = "0";
+}
+
+// ── WebSocket interceptor ──
+
+function clearTimers() {
+    clearInterval(pingTimer); clearTimeout(pongTimer);
+    pingTimer = null; pongTimer = null;
+}
+
+function PatchedWebSocket(url, protocols) {
+    // If we have a faster socket URL and this is a Rubika socket, swap it
+    if (_bestSocketUrl && url && url.includes("iranlms.ir") && !url.includes("getdcmess")) {
+        console.log(`[RB-Fix] Redirecting socket: ${url} → ${_bestSocketUrl}`);
+        url = _bestSocketUrl;
+    }
+
+    const ws = protocols !== undefined
+        ? new OrigWebSocket(url, protocols)
+        : new OrigWebSocket(url);
+
+    if (!url || !url.includes("iranlms.ir")) return ws;
+
+    activeSocket = ws;
+    reconnectAttempts = 0;
+    lastMessageTime = Date.now();
+    console.log("[RB-Fix] Intercepted socket:", url);
+
+    const origSend = ws.send.bind(ws);
+    ws.send = function(data) {
+        try {
+            if (typeof data === "string") {
+                let p = JSON.parse(data);
+                if (p.method === "handShake") handshakeData = data;
+            }
+        } catch(_) {}
+        return origSend(data);
+    };
+
+    function setupPing() {
+        clearTimers();
+        pingTimer = setInterval(() => {
+            if (ws.readyState === OrigWebSocket.OPEN) {
+                try { origSend("{}"); } catch(_) {}
+                clearTimeout(pongTimer);
+                pongTimer = setTimeout(() => {
+                    console.log("[RB-Fix] Pong timeout");
+                    showStatus("\u26a0\ufe0f Connection lost — reconnecting...", "rgba(210,153,34,.95)", true);
+                    try { ws.close(4000, "pong_timeout"); } catch(_) {}
+                }, CONN.PONG_TIMEOUT);
+            }
+        }, CONN.PING_INTERVAL);
+    }
+
+    // Wrap event handlers set by Angular (via property assignment)
+    let _onopen=null, _onclose=null, _onerror=null, _onmessage=null;
+
+    Object.defineProperty(ws, "onopen", { get:()=>_onopen, set(fn){
+        _onopen = function(e) {
+            console.log("[RB-Fix] Socket opened");
+            showStatus("\u2705 Connected", "rgba(0,171,128,.9)");
+            reconnectAttempts = 0; lastMessageTime = Date.now();
+            setupPing();
+            if (fn) fn.call(ws, e);
+        };
+    }});
+
+    Object.defineProperty(ws, "onmessage", { get:()=>_onmessage, set(fn){
+        _onmessage = function(e) {
+            lastMessageTime = Date.now();
+            clearTimeout(pongTimer); pongTimer = null;
+            if (fn) fn.call(ws, e);
+        };
+    }});
+
+    Object.defineProperty(ws, "onclose", { get:()=>_onclose, set(fn){
+        _onclose = function(e) {
+            console.log("[RB-Fix] Socket closed:", e.code, e.reason);
+            clearTimers(); activeSocket = null;
+            if (e.code !== 4000) showStatus("\u274c Disconnected", "rgba(211,47,47,.9)", true);
+            if (fn) fn.call(ws, e);
+        };
+    }});
+
+    Object.defineProperty(ws, "onerror", { get:()=>_onerror, set(fn){
+        _onerror = function(e) { if (fn) fn.call(ws, e); };
+    }});
+
+    ws.addEventListener("message", () => { lastMessageTime = Date.now(); clearTimeout(pongTimer); pongTimer = null; });
+    ws.addEventListener("open", () => { reconnectAttempts = 0; lastMessageTime = Date.now(); setupPing(); });
+
+    return ws;
+}
+
+PatchedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+PatchedWebSocket.OPEN = OrigWebSocket.OPEN;
+PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
+PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
+PatchedWebSocket.prototype = OrigWebSocket.prototype;
+_W.WebSocket = PatchedWebSocket;
+
+// ── Intercept XHR to redirect API calls to fastest endpoint ──
+
+const OrigOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    if (_bestApiUrl && typeof url === "string" && url.includes("iranlms.ir") && !url.includes("getdcmess") && method === "POST") {
+        // Replace the domain with our fastest API
+        try {
+            const u = new URL(url);
+            const best = new URL(_bestApiUrl);
+            if (u.hostname !== best.hostname) {
+                const newUrl = best.origin + u.pathname + u.search;
+                console.log(`[RB-Fix] API redirect: ${u.hostname} → ${best.hostname}`);
+                url = newUrl;
+            }
+        } catch(_) {}
+        this.timeout = 15000; // shorter timeout
+    }
+    return OrigOpen.call(this, method, url, ...rest);
+};
+
+// ── Visibility + network handlers ──
+
+function forceResync() {
+    try { window.dispatchEvent(new HashChangeEvent("hashchange")); } catch(_) {}
+    try {
+        let ac = document.querySelector(".chatlist-chat.active");
+        if (ac) { ac.dispatchEvent(new MouseEvent("mousedown",{bubbles:true})); setTimeout(()=>{ ac.dispatchEvent(new MouseEvent("mouseup",{bubbles:true})); ac.dispatchEvent(new MouseEvent("click",{bubbles:true})); },50); }
+    } catch(_) {}
+    try { window.dispatchEvent(new Event("focus")); } catch(_) {}
+}
+
+function triggerReconnect() {
+    if (activeSocket && activeSocket.readyState === OrigWebSocket.OPEN) {
+        showStatus("\u2705 Connected", "rgba(0,171,128,.9)");
+        forceResync();
+        return;
+    }
+    window.dispatchEvent(new Event("online"));
+    setTimeout(forceResync, 500);
+}
+
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { wasHidden = true; lastVisibleTime = Date.now(); }
+    else {
+        let dur = Date.now() - lastVisibleTime;
+        if (wasHidden && dur > CONN.VISIBILITY_GRACE) {
+            if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) {
+                showStatus("\ud83d\udd04 Reconnecting...", "rgba(210,153,34,.95)", true);
+                triggerReconnect();
+            } else if (Date.now() - lastMessageTime > CONN.PING_INTERVAL * 2) {
+                showStatus("\ud83d\udd04 Checking connection...", "rgba(210,153,34,.95)", true);
+                try { activeSocket.send("{}"); } catch(_) {}
+                clearTimeout(pongTimer);
+                pongTimer = setTimeout(() => { try { activeSocket.close(4000, "stale"); } catch(_) {} }, CONN.PONG_TIMEOUT);
+            } else { forceResync(); }
+        }
+        wasHidden = false;
+    }
+});
+
+_W.addEventListener("online", () => {
+    showStatus("\ud83c\udf10 Network restored", "rgba(0,171,128,.9)", true);
+    setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 1000);
+});
+_W.addEventListener("offline", () => { showStatus("\u274c No network", "rgba(211,47,47,.9)", true); });
+
+if (navigator.connection) {
+    navigator.connection.addEventListener("change", () => {
+        if (navigator.onLine) {
+            showStatus("\ud83d\udd04 Network changed — resync...", "rgba(210,153,34,.95)");
+            setTimeout(() => { reconnectAttempts = 0; triggerReconnect(); }, 500);
+        }
+    });
+}
+
+// Health check
+setInterval(() => {
+    if (!activeSocket || activeSocket.readyState !== OrigWebSocket.OPEN) return;
+    if (Date.now() - lastMessageTime > CONN.PING_INTERVAL * 2.5) {
+        try { activeSocket.send("{}"); } catch(_) {}
+        clearTimeout(pongTimer);
+        pongTimer = setTimeout(() => {
+            showStatus("\u26a0\ufe0f Stale — reconnecting...", "rgba(210,153,34,.95)", true);
+            try { activeSocket.close(4000, "health"); } catch(_) {}
+        }, CONN.PONG_TIMEOUT);
+    }
+}, CONN.PING_INTERVAL * 2);
+
+console.log("[RB-Fix] Connectivity fix loaded (document-start)");
+})();
+
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  PHASE 2: E2E ENCRYPTION (deferred until DOM ready)        ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+function _initEncryption() {
+"use strict";
+
+const CFG = Object.freeze({
+    KEY_LEN:32, MAX_ENC:4000, TOAST_MS:4500, LONG_PRESS:400,
+    SEND_DLY:60, POST_DLY:100, MAX_DEPTH:10, KCACHE:16,
+    CHARS:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~",
+    B85:"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~",
+    PFX_E:"@@", PFX_E2:"@@+", PFX_H:"!!", HS_EXP:86400, HS_CLEANUP:86400000
+});
 
 const ALGO = "AES-GCM";
 const COMPRESS = "deflate";
 const SETTINGS_PREFIX = "rubika_bridge_settings_";
-const BASE85_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-const KEY_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_+=~";
+const BASE85_CHARS = CFG.B85;
+const KEY_CHARS = CFG.CHARS;
 const HTML_ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"};
 const URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
+
+const _W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+const _C = crypto, _S = crypto.subtle;
+
+function u8(ab){ const v = new Uint8Array(ab), c = new Uint8Array(v.length); c.set(v); return c; }
+
+// ── Base64url encoding (@@+ format) ──
+
+function toB64(buf){ let b = ""; const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf); for(let i=0;i<a.byteLength;i++) b += String.fromCharCode(a[i]); return btoa(b).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
+function fromB64(s){ let c = s.replace(/[^A-Za-z0-9\-_]/g,"").replace(/-/g,"+").replace(/_/g,"/"); c += "=".repeat((4-(c.length%4))%4); const b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+function fromStdB64(s){ const c = s.replace(/[^A-Za-z0-9+/=]/g,""), b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+function fromLegacyB64(s){ let c = s.replace(/[^A-Za-z0-9\-_.+/=]/g,"").replace(/-/g,"+").replace(/_/g,"/").replace(/\./g,"=").replace(/=+$/,""); c += "=".repeat((4-(c.length%4))%4); const b = atob(c), a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+function decodeB64Smart(s){ try{const r=fromB64(s);if(r.length>0)return r;}catch(_){} try{const r=fromLegacyB64(s);if(r.length>0)return r;}catch(_){} try{const r=fromStdB64(s);if(r.length>0)return r;}catch(_){} return null; }
+
+// ── Crypto helpers for bridge ──
+
+async function digest(d){ return u8(await _S.digest("SHA-256",d)); }
+function toHex(b){ return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join(""); }
+function fromHex(h){ if(!h) return new Uint8Array(0); const a=new Uint8Array(h.length/2); for(let i=0;i<h.length;i+=2) a[i/2]=parseInt(h.substring(i,i+2),16); return a; }
+function concatBytes(...a){ let t=a.reduce((s,x)=>s+x.length,0),r=new Uint8Array(t),o=0; for(const x of a){r.set(x,o);o+=x.length;} return r; }
+async function getFpStr(pub){ return toHex(await digest(pub)).slice(0,8).toUpperCase(); }
+async function ecSign(priv,buf){ return u8(await _S.sign({name:"ECDSA",hash:"SHA-256"},priv,buf)); }
+async function ecVerify(pubRaw,sig,buf){ try{ const p=await _S.importKey("raw",pubRaw,{name:"ECDSA",namedCurve:"P-256"},false,["verify"]); return await _S.verify({name:"ECDSA",hash:"SHA-256"},p,sig,buf); }catch(_){return false;} }
+
+async function deriveSymmetric(myPrivBuf,theirPubRaw,nonce,initIdPub,respIdPub,initEphPub,respEphPub){
+    const myPriv=await _S.importKey("pkcs8",myPrivBuf,{name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const theirPub=await _S.importKey("raw",theirPubRaw,{name:"ECDH",namedCurve:"P-256"},true,[]);
+    const shared=await _S.deriveBits({name:"ECDH",public:theirPub},myPriv,256);
+    const hkdfKey=await _S.importKey("raw",shared,{name:"HKDF"},false,["deriveBits"]);
+    const info=concatBytes(initEphPub,respEphPub,nonce,initIdPub,respIdPub);
+    const salt=u8(await _S.digest("SHA-256",concatBytes(nonce,initIdPub,respIdPub)));
+    const material=u8(await _S.deriveBits({name:"HKDF",hash:"SHA-256",salt,info},hkdfKey,96*8));
+    const keyMat=material.slice(0,64),hmacMat=material.slice(64,96);
+    const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[]; let f=0;
+    for(let i=0;i<keyMat.length&&f<CFG.KEY_LEN;i++) if(keyMat[i]<mx) r[f++]=c[keyMat[i]%cl];
+    if(f<CFG.KEY_LEN) throw new Error("Key Exhaustion");
+    return {sessionKey:r.join(""), hmacKeyBytes:hmacMat};
+}
+
+// ── IndexedDB storage ──
+
+function safeClone(obj){
+    if(obj==null||typeof obj!=="object") return obj;
+    try{return structuredClone(obj);}catch(_){}
+    try{return JSON.parse(JSON.stringify(obj));}catch(_){}
+    try{ if(Array.isArray(obj)) return obj.map(safeClone); const o={}; let keys; try{keys=Object.keys(obj);}catch(_){keys=[];for(const k in obj)keys.push(k);} for(const k of keys) try{o[k]=typeof obj[k]==="object"&&obj[k]!==null?safeClone(obj[k]):obj[k];}catch(_){} return o; }catch(_){return obj;}
+}
+
+let _db,_memDB={identity:{},contacts:{},handshakes:{}},_useMem=false;
+async function getDB(){
+    if(_useMem) return null; if(_db) return _db;
+    return new Promise((res,rej)=>{
+        const rq=indexedDB.open("rubika_bridge_db",2);
+        rq.onupgradeneeded=e=>{const d=e.target.result; if(e.oldVersion<2){for(const n of["identity","contacts","handshakes"])if(d.objectStoreNames.contains(n))d.deleteObjectStore(n);} for(const[n,k]of[["identity","id"],["contacts","id"],["handshakes","nonce"]])if(!d.objectStoreNames.contains(n))d.createObjectStore(n,{keyPath:k});};
+        rq.onsuccess=e=>{_db=e.target.result;res(_db);}; rq.onerror=()=>{_useMem=true;rej(rq.error);};
+    });
+}
+async function dbOp(s,o,v){
+    try{ const d=await getDB(); if(!d) throw 0; return new Promise((res,rej)=>{ const tx=d.transaction(s,o==="get"||o==="getAll"?"readonly":"readwrite"),st=tx.objectStore(s); let rq; if(o==="get")rq=st.get(v);else if(o==="put")rq=st.put(safeClone(v));else if(o==="del")rq=st.delete(v);else rq=st.getAll(); rq.onsuccess=()=>{try{res(rq.result!=null&&typeof rq.result==="object"?safeClone(rq.result):rq.result);}catch(_){res(rq.result);}}; rq.onerror=()=>rej(rq.error); });
+    }catch(_){ _useMem=true; if(o==="get") return _memDB[s][v]?safeClone(_memDB[s][v]):undefined; if(o==="put"){_memDB[s][v.id||v.nonce]=safeClone(v);return v;} if(o==="del"){delete _memDB[s][v];return;} return Object.values(_memDB[s]).map(safeClone); }
+}
+
+// ── Identity & trust ──
+
+async function getMyId(){
+    let rec=await dbOp("identity","get","self");
+    if(rec&&rec.pubHex&&rec.privHex){ try{ const pubBuf=fromHex(rec.pubHex),privBuf=fromHex(rec.privHex); const pub=await _S.importKey("raw",pubBuf,{name:"ECDSA",namedCurve:"P-256"},true,["verify"]); const priv=await _S.importKey("pkcs8",privBuf,{name:"ECDSA",namedCurve:"P-256"},true,["sign"]); return {pub,priv,pubRaw:pubBuf,fp:await getFpStr(pubBuf)}; }catch(_){} }
+    const kp=await _S.generateKey({name:"ECDSA",namedCurve:"P-256"},true,["sign","verify"]);
+    const pubRaw=u8(await _S.exportKey("raw",kp.publicKey)),privPkcs8=u8(await _S.exportKey("pkcs8",kp.privateKey));
+    await dbOp("identity","put",{id:"self",pubHex:toHex(pubRaw),privHex:toHex(privPkcs8),createdAt:Date.now()});
+    return {pub:kp.publicKey,priv:kp.privateKey,pubRaw,fp:await getFpStr(pubRaw)};
+}
+
+async function getTrustInfo(idPubRaw,chatId){
+    const h=toHex(await digest(idPubRaw)),cid=h.slice(0,16),fp=h.slice(0,8).toUpperCase(),all=await dbOp("contacts","getAll");
+    const ex=all.find(c=>c.id===cid); if(ex) return {state:"known",fp,cid};
+    const oc=all.find(c=>c.chatId===chatId); if(oc) return {state:"changed",fp,cid,oldFp:oc.id.slice(0,8).toUpperCase()};
+    return {state:"new",fp,cid};
+}
+
+let _hsLock=Promise.resolve();
+function hsLock(fn){ let unlock; const prev=_hsLock; _hsLock=new Promise(r=>unlock=r); return prev.then(()=>fn()).finally(()=>unlock()); }
+
+function formatError(e){ if(!e) return "Unknown Error"; return (e.name?e.name+": ":"")+( e.message||String(e)); }
+
+function tsBuf(){ const ts=Math.floor(Date.now()/1000); return new Uint8Array([(ts>>>24)&255,(ts>>>16)&255,(ts>>>8)&255,ts&255]); }
 
 let cachedChatId = null;
 let cachedSettings = null;
@@ -47,14 +527,19 @@ function saveSettings(s) {
     localStorage.setItem(SETTINGS_PREFIX + id, JSON.stringify(s));
 }
 
+const chatType = () => { const h = location.hash; if(h.includes("g0")) return "group"; if(h.includes("c0")) return "channel"; return "dm"; };
+const isGroup = () => chatType() === "group";
+
 function getKey() {
     let s = getSettings();
-    return s.enabled && s.customKey && s.customKey.length === 32 ? s.customKey : null;
+    return s.enabled && s.customKey && s.customKey.length === CFG.KEY_LEN ? s.customKey : null;
 }
 
 function isEnabled() {
     return getSettings().enabled;
 }
+
+function genKey(){ const c=CFG.CHARS,cl=c.length,mx=(cl*Math.floor(256/cl))|0,r=[]; let f=0; while(f<CFG.KEY_LEN){const b=new Uint8Array(64);_C.getRandomValues(b);for(let i=0;i<64&&f<CFG.KEY_LEN;i++)if(b[i]<mx)r[f++]=c[b[i]%cl];} return r.join(""); }
 
 // ── Try all stored keys for preview decryption ──
 function getAllStoredKeys() {
@@ -76,16 +561,17 @@ function getAllStoredKeys() {
 }
 
 async function tryDecryptWithAllKeys(text) {
-    if (!text.startsWith("@@")) return text;
+    if (!text.startsWith(CFG.PFX_E)) return text;
     let keys = getAllStoredKeys();
     if (!keys.length) return text;
     for (let k of keys) {
         try {
-            let data = base85decode(text.slice(2));
-            let iv = data.subarray(0, 12);
-            let ct = data.subarray(12);
+            let b;
+            if (text.startsWith(CFG.PFX_E2)) b = decodeB64Smart(text.slice(3));
+            else b = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
+            if (!b || b.length < 13) continue;
             let aesKey = await deriveKey(k);
-            let dec = await crypto.subtle.decrypt({ name: ALGO, iv }, aesKey, ct);
+            let dec = await crypto.subtle.decrypt({ name: ALGO, iv: b.subarray(0,12) }, aesKey, b.subarray(12));
             return await decompress(new Uint8Array(dec));
         } catch {}
     }
@@ -167,19 +653,20 @@ async function encrypt(text) {
     let combined = new Uint8Array(12 + enc.length);
     combined.set(iv);
     combined.set(enc, 12);
-    return "@@" + base85encode(combined);
+    return CFG.PFX_E2 + toB64(combined);
 }
 
 async function decrypt(text) {
-    if (!text.startsWith("@@")) return text;
+    if (!text.startsWith(CFG.PFX_E)) return text;
     let k = getKey();
     if (!k) return text;
     try {
-        let data = base85decode(text.slice(2));
-        let iv = data.subarray(0, 12);
-        let ct = data.subarray(12);
+        let b;
+        if (text.startsWith(CFG.PFX_E2)) b = decodeB64Smart(text.slice(3));
+        else b = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
+        if (!b || b.length < 13) return text;
         let aesKey = await deriveKey(k);
-        let dec = await crypto.subtle.decrypt({ name: ALGO, iv }, aesKey, ct);
+        let dec = await crypto.subtle.decrypt({ name: ALGO, iv: b.subarray(0,12) }, aesKey, b.subarray(12));
         return await decompress(new Uint8Array(dec));
     } catch { return text; }
 }
@@ -196,6 +683,182 @@ async function splitEncrypt(text) {
     let b = await splitEncrypt(text.slice(splitAt).trim());
     return a && b ? [...a, ...b] : null;
 }
+
+// ── Bridge / Handshake system ──
+
+function renderHS(el,text,cc,fp="",trust="",onAction=null,btnText="Accept & Connect"){
+    const c=cc==="ac"?"#00ab80":cc==="wrn"?"#d29922":cc==="err"?"#d32f2f":"#888";
+    const bg=cc==="ac"?"rgba(0,171,128,0.1)":cc==="wrn"?"rgba(210,153,34,0.1)":cc==="err"?"rgba(248,81,73,0.1)":"rgba(255,255,255,0.05)";
+    let h=`<div style="border:1px solid ${c};background:${bg};border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;margin-bottom:${fp?"6px":"0"};font-size:14px;color:${c}">${escapeHtml(text)}</span>`;
+    if(fp){ h+=`<div style="font-family:monospace;font-size:11.5px;margin-bottom:4px;font-weight:600;color:#00ab80">Fingerprint: ${escapeHtml(fp)}</div>`; const tc=trust.includes("\u26a0\ufe0f")?"#d32f2f":"#888"; h+=`<div style="color:${tc};font-weight:${trust.includes("\u26a0\ufe0f")?"700":"500"};margin-bottom:${onAction?"8px":"0"}">${escapeHtml(trust)}</div>`; }
+    if(onAction) h+=`<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:${c};color:#fff">${escapeHtml(btnText)}</button>`;
+    h+="</div>"; el.innerHTML=h;
+    if(onAction){ const btn=el.querySelector(".bb-hs-btn"); if(btn) btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();}; }
+}
+
+async function startBridge(){
+    const id=await getMyId(), eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
+    const nonce=new Uint8Array(16); _C.getRandomValues(nonce);
+    const payload=concatBytes(new Uint8Array([1,1]),nonce,tsBuf(),id.pubRaw,ephPub);
+    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
+    const hsRec={nonce:toHex(nonce),chatId:getChatId(),role:"initiator",stage:"invited",ephPrivHex:toHex(ephPriv),ephPubHex:toHex(ephPub),initIdPubHex:toHex(id.pubRaw),theirIdentityKeyHex:null,createdAt:Date.now(),payloadHashHex:toHex(await digest(payload)),chatType:chatType()};
+    if(isGroup()) hsRec.groupKey=genKey();
+    await dbOp("handshakes","put",hsRec);
+    await sendViaBridge(CFG.PFX_H+" "+toB64(msg)); toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!"); refreshUI();
+}
+
+async function acceptBridge(data,el){
+    const id=await getMyId(), eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
+    const ephPub=u8(await _S.exportKey("raw",eph.publicKey)),ephPriv=u8(await _S.exportKey("pkcs8",eph.privateKey));
+    const {sessionKey,hmacKeyBytes}=await deriveSymmetric(ephPriv,data.theirEphPubRaw,data.nonce,data.theirIdPubRaw,id.pubRaw,data.theirEphPubRaw,ephPub);
+    const payload=concatBytes(new Uint8Array([1,2]),data.nonce,tsBuf(),data.payloadHash,id.pubRaw,ephPub);
+    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
+    await dbOp("handshakes","put",{nonce:toHex(data.nonce),chatId:getChatId(),role:"responder",stage:"accepted",derivedKey:sessionKey,hmacKeyHex:toHex(hmacKeyBytes),theirIdentityKeyHex:toHex(data.theirIdPubRaw),createdAt:Date.now()});
+    renderHS(el,"\ud83d\udd04 Bridge accepted \u2014 waiting for confirmation","wrn");
+    await sendViaBridge(CFG.PFX_H+" "+toB64(msg));
+}
+
+async function processAccept(data,hs,el){
+    const id=await getMyId();
+    const hsNonce=fromHex(hs.nonce),hsInitPub=fromHex(hs.initIdPubHex),hsEphPub=fromHex(hs.ephPubHex),myPriv=fromHex(hs.ephPrivHex);
+    const {sessionKey,hmacKeyBytes}=await deriveSymmetric(myPriv,data.theirEphPubRaw,hsNonce,hsInitPub,data.theirIdPubRaw,hsEphPub,data.theirEphPubRaw);
+    const hmacKey=await _S.importKey("raw",hmacKeyBytes,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const hmacVal=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),hsNonce)));
+    const useGroupKey=hs.chatType==="group"&&hs.groupKey;
+    const activeSessionKey=useGroupKey?hs.groupKey:sessionKey;
+    let payload,encBlob;
+    if(useGroupKey){
+        const pairwiseAes=await _S.importKey("raw",new TextEncoder().encode(sessionKey),{name:"AES-GCM"},false,["encrypt"]);
+        const gkIv=new Uint8Array(12); _C.getRandomValues(gkIv);
+        const gkCt=u8(await _S.encrypt({name:"AES-GCM",iv:gkIv},pairwiseAes,new TextEncoder().encode(hs.groupKey)));
+        encBlob=concatBytes(gkIv,gkCt);
+        payload=concatBytes(new Uint8Array([1,4]),hsNonce,tsBuf(),hmacVal,encBlob);
+    }else{
+        payload=concatBytes(new Uint8Array([1,3]),hsNonce,tsBuf(),hmacVal);
+    }
+    const sig=await ecSign(id.priv,payload), msg=concatBytes(payload,sig);
+    saveSettings({enabled:true,customKey:activeSessionKey});
+    await dbOp("contacts","put",{id:data.cid,chatId:getChatId(),pubHex:toHex(data.theirIdPubRaw),lastSeen:Date.now()});
+    delete hs.ephPrivHex; hs.derivedKey=sessionKey; hs.stage="confirmed"; await dbOp("handshakes","put",hs);
+    refreshUI(); await sendViaBridge(CFG.PFX_H+" "+toB64(msg)); renderHS(el,useGroupKey?"\u2705 Group bridge \u2014 key delivered":"\u2705 Bridge established","ac");
+    setTimeout(async()=>{ const tc=await splitEncrypt("\u2705 Bridge Established! Fingerprints: "+id.fp+" \u2194 "+data.fp); if(tc) for(const c of tc) await sendViaBridge(c); },CFG.SEND_DLY+400);
+}
+
+async function processConfirm(data,hs,el){
+    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
+    if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
+    saveSettings({enabled:true,customKey:hs.derivedKey});
+    const fpInfo=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
+    await dbOp("contacts","put",{id:fpInfo.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
+    delete hs.hmacKeyHex; hs.stage="confirmed"; await dbOp("handshakes","put",hs);
+    refreshUI(); renderHS(el,"\u2705 Bridge established","ac");
+}
+
+async function processGroupConfirm(data,hs,el){
+    const hmacKey=await _S.importKey("raw",fromHex(hs.hmacKeyHex),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+    const expected=u8(await _S.sign("HMAC",hmacKey,concatBytes(new Uint8Array([0x63,0x6f,0x6e,0x66]),fromHex(hs.nonce))));
+    if(toHex(data.hmac)!==toHex(expected)) throw new Error("HMAC Verification Failed");
+    const pairwiseAes=await _S.importKey("raw",new TextEncoder().encode(hs.derivedKey),{name:"AES-GCM"},false,["decrypt"]);
+    const gkIv=data.encBlob.slice(0,12),gkCt=data.encBlob.slice(12);
+    const groupKey=new TextDecoder().decode(u8(await _S.decrypt({name:"AES-GCM",iv:gkIv},pairwiseAes,gkCt)));
+    if(groupKey.length!==CFG.KEY_LEN) throw new Error("Invalid group key length");
+    saveSettings({enabled:true,customKey:groupKey});
+    const fpInfo=await getTrustInfo(fromHex(hs.theirIdentityKeyHex),getChatId());
+    await dbOp("contacts","put",{id:fpInfo.cid,chatId:getChatId(),pubHex:hs.theirIdentityKeyHex,lastSeen:Date.now()});
+    delete hs.hmacKeyHex; hs.stage="confirmed"; hs.groupKey=groupKey; await dbOp("handshakes","put",hs);
+    refreshUI(); renderHS(el,"\u2705 Group bridge established","ac");
+}
+
+async function handleHandshake(b64,el){
+    if(el._isDecrypted) return; el._isDecrypted=true;
+    try{
+        const bytes=decodeB64Smart(b64); if(!bytes||bytes.length<118) return;
+        const ver=bytes[0],type=bytes[1]; if(ver!==1) return;
+        const nonce=bytes.slice(2,18),hexNonce=toHex(nonce);
+        const myId=await getMyId(), hs=await dbOp("handshakes","get",hexNonce);
+
+        if(type===1){
+            if(bytes.length!==216) return;
+            const payload=bytes.slice(0,152),sig=bytes.slice(152,216),idPub=bytes.slice(22,87),ephPub=bytes.slice(87,152);
+            if(!await ecVerify(idPub,sig,payload)) return;
+            if(toHex(idPub)===toHex(myId.pubRaw)) return renderHS(el,"\ud83d\udd04 Bridge invite sent","txM");
+            if(hs){ if(hs.stage==="accepted") return renderHS(el,"\ud83d\udd04 Waiting for confirmation","wrn"); if(hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); return renderHS(el,"\ud83e\udd1d Processed","txM"); }
+            const trust=await getTrustInfo(idPub,getChatId()), hsList=await dbOp("handshakes","getAll");
+            const out=hsList.find(h=>h.chatId===getChatId()&&h.role==="initiator"&&h.stage==="invited");
+            if(out){ if(myId.fp<trust.fp) return renderHS(el,"\ud83e\udd1d Collision avoided","txM"); else if(myId.fp>trust.fp) await dbOp("handshakes","del",out.nonce); else return; }
+            const tStr=trust.state==="new"?"\ud83c\udd95 New contact":trust.state==="known"?"\u2705 Known contact":`\u26a0\ufe0f IDENTITY CHANGED \u2014 old: ${trust.oldFp}, new: ${trust.fp}`;
+            renderHS(el,isGroup()?"\ud83d\udee1\ufe0f Group Bridge Request":"\ud83d\udee1\ufe0f Secure Bridge Request","ac",trust.fp,tStr,async()=>{
+                try{await acceptBridge({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,payloadHash:await digest(payload)},el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            },isGroup()?"Join Group Bridge":"Accept & Connect");
+        }else if(type===2){
+            if(bytes.length!==248) return;
+            const payload=bytes.slice(0,184),sig=bytes.slice(184,248),invHash=bytes.slice(22,54),idPub=bytes.slice(54,119),ephPub=bytes.slice(119,184);
+            if(!await ecVerify(idPub,sig,payload)) return;
+            if(toHex(idPub)===toHex(myId.pubRaw)) return renderHS(el,"\ud83d\udd04 Bridge accept sent","txM");
+            if(!hs||hs.role!=="initiator"||hs.stage!=="invited"){ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); return renderHS(el,"\ud83e\udd1d Processed","txM"); }
+            if(toHex(invHash)!==toHex(fromHex(hs.payloadHashHex))) return;
+            const trust=await getTrustInfo(idPub,getChatId());
+            const doAccept=async()=>{ try{await processAccept({nonce,theirIdPubRaw:idPub,theirEphPubRaw:ephPub,fp:trust.fp,cid:trust.cid},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");} };
+            if(trust.state==="changed") renderHS(el,"\u26a0\ufe0f Identity Changed!","err",trust.fp,`Old: ${trust.oldFp}, New: ${trust.fp}`,doAccept,"Acknowledge & Connect");
+            else{ renderHS(el,"\u2705 Bridge completing...","ac"); await doAccept(); }
+        }else if(type===3){
+            if(bytes.length!==118) return;
+            const payload=bytes.slice(0,54),sig=bytes.slice(54,118),hmac=bytes.slice(22,54);
+            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
+                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,payload)) return;
+                try{await processConfirm({hmac},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            }else{ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Bridge established","ac"); renderHS(el,"\ud83e\udd1d Processed","txM"); }
+        }else if(type===4){
+            if(bytes.length<178) return;
+            const hmac=bytes.slice(22,54),encBlob=bytes.slice(54,bytes.length-64);
+            const payload=bytes.slice(0,bytes.length-64),sig=bytes.slice(bytes.length-64);
+            if(hs&&hs.role==="responder"&&hs.stage==="accepted"){
+                if(!await ecVerify(fromHex(hs.theirIdentityKeyHex),sig,payload)) return;
+                try{await processGroupConfirm({hmac,encBlob},hs,el);}catch(e){renderHS(el,"\u274c "+formatError(e),"err");}
+            }else{ if(hs&&hs.stage==="confirmed") return renderHS(el,"\u2705 Group bridge established","ac"); renderHS(el,"\ud83e\udd1d Processed","txM"); }
+        }
+    }catch(e){ renderHS(el,"\u274c "+formatError(e),"err"); }
+}
+
+// sendViaBridge - raw text injection for handshake messages
+async function sendViaBridge(text){
+    let textarea = findTextarea();
+    if(!textarea) return;
+    let hideTarget = findInputWrapper() || textarea;
+    hideTarget.classList.remove("rb-locked-input");
+    hideTarget.style.cssText = "position:absolute!important;top:0!important;left:0!important;opacity:0!important;pointer-events:none!important;z-index:-1!important";
+    textarea.focus();
+    document.execCommand("selectAll", false, null);
+    document.execCommand("insertText", false, text);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    let enterEvt = { bubbles: true, cancelable: true, key: "Enter", keyCode: 13, which: 13 };
+    textarea.dispatchEvent(new KeyboardEvent("keydown", enterEvt));
+    textarea.dispatchEvent(new KeyboardEvent("keyup", enterEvt));
+    await delay(200);
+    let btn = findSendButton();
+    if(btn){
+        let evtOpts = { bubbles: true, cancelable: true, view: window };
+        btn.dispatchEvent(new PointerEvent("pointerdown", evtOpts));
+        btn.dispatchEvent(new MouseEvent("mousedown", evtOpts));
+        btn.dispatchEvent(new PointerEvent("pointerup", evtOpts));
+        btn.dispatchEvent(new MouseEvent("mouseup", evtOpts));
+        btn.dispatchEvent(new MouseEvent("click", evtOpts));
+        btn.click();
+    }
+    await delay(300);
+    textarea.focus();
+    document.execCommand("selectAll", false, null);
+    document.execCommand("insertText", false, "");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    hideTarget.style.cssText = "";
+    hideTarget.classList.add("rb-locked-input");
+}
+
+function toast(m,d=CFG.TOAST_MS){ const el=document.createElement("div"); el.textContent=m; Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%) translateY(12px)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",fontFamily:"inherit",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s,transform .2s",whiteSpace:"nowrap",backdropFilter:"blur(16px)",WebkitBackdropFilter:"blur(16px)"}); document.body.appendChild(el); requestAnimationFrame(()=>{el.style.opacity="1";el.style.transform="translateX(-50%) translateY(0)";}); setTimeout(()=>{el.style.opacity="0";el.style.transform="translateX(-50%) translateY(8px)";setTimeout(()=>el.remove(),250);},d); }
+
+function stripInvisibles(s){return s.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFFF9-\uFFFB]/g,"");}
 
 function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 
@@ -235,6 +898,15 @@ function renderMarkdown(text) {
 
     while (i < lines.length) {
         let line = lines[i];
+        if (/^```/.test(line)) {
+            let lang = line.slice(3).trim(); i++;
+            let code = [];
+            while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]);
+            if (i < lines.length) i++;
+            let langTag = lang ? `<span style="display:block;padding:4px 12px;font-size:10px;font-weight:600;color:#888;background:#f0f0f0;border-bottom:1px solid #ddd;text-transform:uppercase;letter-spacing:.04em">${escapeHtml(lang)}</span>` : "";
+            result.push(`<div class="bb-cblk" style="position:relative;background:#f8f8f8;border:1px solid #ddd;border-radius:8px;margin:4px 0;overflow:hidden">${langTag}<pre style="margin:0;padding:10px 12px;overflow-x:auto;font-family:monospace;font-size:12.5px;line-height:1.5;white-space:pre;tab-size:4"><code style="font-family:inherit;font-size:inherit;background:none;border:none;padding:0">${escapeHtml(code.join("\n"))}</code></pre><span class="bb-cblk-copy" title="Copy" style="position:absolute;top:4px;right:8px;cursor:pointer;font-size:12px;opacity:.4;transition:opacity .15s;z-index:1">\ud83d\udccb</span></div>`);
+            continue;
+        }
         if (line.startsWith("> ") || line === ">") {
             let qLines = [];
             while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">"))
@@ -316,6 +988,11 @@ function openSettings() {
                     <span class="bb-key-counter" id="bb-key-counter">0 / 32</span>
                 </div>
             </div>
+            <div id="bb-bridge-section" style="margin-top:16px;border-top:1px solid #f4f5f7;padding-top:16px">
+                <div style="font-size:14px;font-weight:700;margin-bottom:4px">\ud83e\udd1d Automatic Key Exchange</div>
+                <div style="font-size:12px;color:#888;margin-bottom:10px" id="bb-bridge-desc">Establish encryption automatically with your contact.</div>
+                <button class="bb-tool-btn" id="bb-bridge-btn" style="width:100%;margin-top:8px">Loading...</button>
+            </div>
             <div class="bb-actions">
                 <button class="bb-btn bb-btn-cancel" id="bb-btn-cancel">Cancel</button>
                 <button class="bb-btn bb-btn-save" id="bb-btn-save">Save</button>
@@ -326,6 +1003,9 @@ function openSettings() {
     let overlay = document.getElementById("bb-modal-overlay");
     let keyInput = document.getElementById("bb-custom-key");
     let keySection = document.getElementById("bb-key-section");
+    let bridgeSection = document.getElementById("bb-bridge-section");
+    let bridgeBtn = document.getElementById("bb-bridge-btn");
+    let bridgeDesc = document.getElementById("bb-bridge-desc");
     let counter = document.getElementById("bb-key-counter");
     let error = document.getElementById("bb-key-error");
     let saveBtn = document.getElementById("bb-btn-save");
@@ -334,44 +1014,76 @@ function openSettings() {
     let genBtn = document.getElementById("bb-gen-key");
     let visBtn = document.getElementById("bb-toggle-vis");
 
+    let _ig = isGroup();
+    if(_ig) {
+        bridgeDesc.textContent = "Start a group bridge \u2014 each member joins individually. You generate the key, others receive it securely.";
+    }
+
     function validate() {
         let len = keyInput.value.length;
         let on = enableChk.checked;
         counter.textContent = `${len} / 32`;
         counter.className = "bb-key-counter" + (len === 32 ? " exact" : "");
         keySection.style.display = on ? "" : "none";
+        bridgeSection.style.display = on ? "" : "none";
         if (!on) { error.textContent = ""; saveBtn.disabled = false; return; }
         if (len === 0) { error.textContent = "A key is required when encryption is enabled."; saveBtn.disabled = true; }
         else if (len !== 32) { error.textContent = `Key must be exactly 32 characters (currently ${len}).`; saveBtn.disabled = true; }
         else { error.textContent = ""; saveBtn.disabled = false; }
     }
 
-    keyInput.addEventListener("input", validate);
+    async function updateBridgeUI(){
+        try{
+            const hsList=await dbOp("handshakes","getAll");
+            const ahs=hsList.find(h=>h.chatId===getChatId()&&h.stage!=="confirmed"&&Date.now()-h.createdAt<CFG.HS_EXP*1000);
+            if(ahs){
+                bridgeBtn.textContent="\ud83d\udd04 Waiting for response... (Cancel)";
+                bridgeBtn.style.color="#d29922";
+                bridgeBtn.style.borderColor="#d29922";
+                bridgeBtn.onclick=async()=>{await dbOp("handshakes","del",ahs.nonce);updateBridgeUI();};
+            }else{
+                const ch=hsList.find(h=>h.chatId===getChatId()&&h.stage==="confirmed"&&(h.derivedKey===keyInput.value||h.groupKey===keyInput.value));
+                if(ch&&keyInput.value.length===CFG.KEY_LEN){
+                    bridgeBtn.textContent=_ig?"\u2705 Group bridge active (Re-key)":"\u2705 Connected via Bridge (Re-key)";
+                    bridgeBtn.style.color="#00ab80";
+                    bridgeBtn.style.borderColor="#00ab80";
+                }else{
+                    bridgeBtn.textContent=_ig?"\ud83e\udd1d Start Group Bridge":"\ud83e\udd1d Start Bridge";
+                    bridgeBtn.style.color="inherit";
+                    bridgeBtn.style.borderColor="#ccc";
+                }
+                bridgeBtn.onclick=async()=>{overlay.remove();try{await startBridge();}catch(_){toast("Bridge error!");}};
+            }
+        }catch(_){bridgeBtn.textContent="Bridge unavailable";bridgeBtn.disabled=true;}
+    }
+    updateBridgeUI();
+
+    keyInput.addEventListener("input", ()=>{validate();updateBridgeUI();});
     enableChk.addEventListener("change", validate);
     validate();
 
     visBtn.addEventListener("click", () => {
         let show = keyInput.type === "password";
         keyInput.type = show ? "text" : "password";
-        visBtn.textContent = show ? "🙈" : "👁";
+        visBtn.textContent = show ? "\ud83d\ude48" : "\ud83d\udc41";
     });
 
     copyBtn.addEventListener("click", () => {
         if (keyInput.value) {
             navigator.clipboard.writeText(keyInput.value).then(() => {
-                copyBtn.textContent = "✅";
+                copyBtn.textContent = "\u2705";
                 copyBtn.classList.add("copied");
-                setTimeout(() => { copyBtn.textContent = "📋"; copyBtn.classList.remove("copied"); }, 1500);
+                setTimeout(() => { copyBtn.textContent = "\ud83d\udccb"; copyBtn.classList.remove("copied"); }, 1500);
             });
         }
     });
 
     genBtn.addEventListener("click", () => {
-        let bytes = crypto.getRandomValues(new Uint8Array(32));
-        keyInput.value = Array.from(bytes, b => KEY_CHARS[b % KEY_CHARS.length]).join("");
+        keyInput.value = genKey();
         keyInput.type = "text";
-        visBtn.textContent = "🙈";
+        visBtn.textContent = "\ud83d\ude48";
         validate();
+        updateBridgeUI();
     });
 
     document.getElementById("bb-btn-cancel").onclick = () => overlay.remove();
@@ -381,6 +1093,7 @@ function openSettings() {
         overlay.remove();
         refreshUI();
     };
+    overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
 }
 
 const ICONS = {
@@ -712,6 +1425,8 @@ button.toggle-emoticons { display: none !important; }
 document.addEventListener("click", e => {
     let sp = e.target.closest(".bb-spoiler");
     if (sp) { sp.style.color = "inherit"; sp.style.background = "#dfe1e6"; }
+    let cb = e.target.closest(".bb-cblk-copy");
+    if (cb) { e.preventDefault(); e.stopPropagation(); let pre = cb.closest(".bb-cblk")?.querySelector("code"); if(pre) navigator.clipboard.writeText(pre.textContent).then(()=>{cb.textContent="\u2705";setTimeout(()=>cb.textContent="\ud83d\udccb",1200);}).catch(()=>{}); }
 }, true);
 
 ctxMenu = document.createElement("div");
@@ -786,20 +1501,34 @@ document.addEventListener("click", e => {
     }
 }, true);
 
-// ── Auto-decrypt main messages ──
+// ── Auto-decrypt main messages + handshake detection ──
+const _infly=new WeakSet();
+
 function decryptMessages() {
     let nodes = document.body.querySelectorAll("div[rb-copyable]");
     for (let node of nodes) {
-        if (node._isDecrypting) continue;
+        if (node._isDecrypting || _infly.has(node)) continue;
         let text = node.textContent.trim();
+        let ct = stripInvisibles(text);
+
+        // Detect handshake messages (!! prefix)
+        let hi = ct.indexOf(CFG.PFX_H);
+        if (hi !== -1 && !node._isDecrypted) {
+            let raw = ct.slice(hi + CFG.PFX_H.length).trim().split(/\s+/)[0].replace(/[^A-Za-z0-9\-_]/g,"");
+            if (raw.length > 50) {
+                _infly.add(node);
+                hsLock(() => handleHandshake(raw, node).catch(() => {})).finally(() => _infly.delete(node));
+                continue;
+            }
+        }
 
         if (node._isDecrypted) {
-            if (!text.startsWith("@@") || node.querySelector(".bb-copy-btn")) continue;
+            if (!ct.startsWith(CFG.PFX_E) || node.querySelector(".bb-copy-btn")) continue;
             node._isDecrypted = false;
             node.removeAttribute("data-orig-text");
         }
 
-        if (!text.startsWith("@@") || text.length <= 20) continue;
+        if (!ct.startsWith(CFG.PFX_E) || ct.length <= 20) continue;
 
         if (!node.hasAttribute("data-orig-text")) node.setAttribute("data-orig-text", text);
         let raw = node.getAttribute("data-orig-text").replace(/\s/g, "");
@@ -1212,4 +1941,15 @@ function injectUI() {
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
 
-}();
+// ── Handshake cleanup ──
+function cleanupHs(){dbOp("handshakes","getAll").then(hs=>{const now=Date.now();hs.forEach(h=>{if(h.stage!=="confirmed"&&now-h.createdAt>CFG.HS_CLEANUP)dbOp("handshakes","del",h.nonce);});}).catch(()=>{});}
+setTimeout(cleanupHs,2000);setInterval(cleanupHs,CFG.HS_CLEANUP);
+
+} // end _initEncryption
+
+// ── Bootstrap: run encryption init when DOM is ready ──
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(_initEncryption, 100));
+} else {
+    setTimeout(_initEncryption, 100);
+}
