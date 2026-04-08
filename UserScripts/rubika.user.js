@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.7
+// @version      8.8
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -352,7 +352,10 @@ async function tryDecryptWithAllKeys(text) {
     if (!keys.length) return text;
     for (let k of keys) {
         try {
-            let data = base85decode(text.slice(2));
+            let data;
+            if (text.startsWith("@@+")) data = fromB64(text.slice(3));
+            else data = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
+            if (!data || data.length < 13) continue;
             let iv = data.subarray(0, 12);
             let ct = data.subarray(12);
             let aesKey = await deriveKey(k);
@@ -438,7 +441,7 @@ async function encrypt(text) {
     let combined = new Uint8Array(12 + enc.length);
     combined.set(iv);
     combined.set(enc, 12);
-    return "@@" + base85encode(combined);
+    return "@@+" + toB64(combined);
 }
 
 async function decrypt(text) {
@@ -446,7 +449,10 @@ async function decrypt(text) {
     let k = getKey();
     if (!k) return text;
     try {
-        let data = base85decode(text.slice(2));
+        let data;
+        if (text.startsWith("@@+")) data = fromB64(text.slice(3));
+        else data = base85decode(text.slice(2).replace(/[^\x21-\x7E]/g,""));
+        if (!data || data.length < 13) return text;
         let iv = data.subarray(0, 12);
         let ct = data.subarray(12);
         let aesKey = await deriveKey(k);
