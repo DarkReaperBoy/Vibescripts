@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -1505,6 +1505,78 @@ function injectUI() {
     });
 
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+})();
+
+// ── Notifications ──
+(function initNotifications() {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "default") {
+        // Ask permission on first user interaction
+        let asked = false;
+        document.addEventListener("click", function askPerm() {
+            if (!asked) { asked = true; Notification.requestPermission(); document.removeEventListener("click", askPerm); }
+        });
+    }
+
+    // Track unread state per chat
+    let prevUnreads = new Map();
+    let notifCooldown = new Map(); // prevent spam
+
+    function checkNotifications() {
+        if (Notification.permission !== "granted") return;
+        // Only notify when tab is hidden or not focused
+        if (document.hasFocus()) { prevUnreads.clear(); return; }
+
+        let chatItems = document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
+        for (let li of chatItems) {
+            // Skip active/open chat
+            if (li.classList.contains("open")) continue;
+
+            let badge = li.querySelector(".badge.badge-primary:not(.badge-ads):not([hidden])");
+            let count = badge ? parseInt(badge.textContent.trim()) || 0 : 0;
+            if (count <= 0) continue;
+
+            let nameEl = li.querySelector(".peer-title");
+            let name = nameEl ? nameEl.textContent.trim() : "New message";
+
+            let msgEl = li.querySelector(".user-last-message");
+            let preview = msgEl ? msgEl.textContent.trim() : "";
+            if (preview.length > 80) preview = preview.slice(0, 80) + "\u2026";
+
+            // Check if this is a NEW unread (count increased)
+            let key = name;
+            let prev = prevUnreads.get(key) || 0;
+            if (count > prev) {
+                // Cooldown: max 1 notif per chat per 10s
+                let lastNotif = notifCooldown.get(key) || 0;
+                if (Date.now() - lastNotif > 10000) {
+                    notifCooldown.set(key, Date.now());
+                    try {
+                        let n = new Notification(name, {
+                            body: preview || "New message",
+                            icon: "https://web.rubika.ir/assets/img/iphone_home120.png",
+                            tag: "rb-" + key, // replace previous notif from same chat
+                            silent: false
+                        });
+                        n.onclick = function() { window.focus(); li.click(); n.close(); };
+                        setTimeout(() => n.close(), 8000);
+                    } catch(e) { console.log("[RB] Notif error:", e); }
+                }
+            }
+            prevUnreads.set(key, count);
+        }
+    }
+
+    // Check every 2 seconds
+    setInterval(checkNotifications, 2000);
+
+    // Also check on visibility change (tab hidden → messages may arrive)
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+            // Reset so we detect new unreads while hidden
+            prevUnreads.clear();
+        }
+    });
 })();
 
 // Handshake cleanup
