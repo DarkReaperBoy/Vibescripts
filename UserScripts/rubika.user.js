@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.9
+// @version      9.0
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -655,7 +655,7 @@ function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 function renderInline(s) {
     return s
         .replace(/``([^`]+)``|`([^`]+)`/g, (_, a, b) =>
-            `<code style="background:rgba(0,0,0,.07);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.9em">${a ?? b}</code>`)
+            `<code style="background:#1b2028;color:#e6edf3;border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.9em">${a ?? b}</code>`)
         .replace(/\|\|(.+?)\|\|/g, (_, t) =>
             `<span class="bb-spoiler" style="background:#42526e;color:transparent;border-radius:3px;padding:0 3px;cursor:pointer;user-select:none" title="Click to reveal">${t}</span>`)
         .replace(/\*\*\*(.+?)\*\*\*/g, (_, t) => `<strong><em>${t}</em></strong>`)
@@ -695,8 +695,8 @@ function renderMarkdown(text) {
             let code = [];
             while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]);
             if (i < lines.length) i++;
-            let langTag = lang ? `<div style="padding:4px 10px;font-size:10px;font-weight:600;color:#888;background:rgba(0,0,0,.05);border-bottom:1px solid rgba(0,0,0,.1);text-transform:uppercase;letter-spacing:.04em">${escapeHtml(lang)}</div>` : "";
-            result.push(`<div style="position:relative;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);border-radius:8px;margin:4px 0;overflow:hidden">${langTag}<pre style="margin:0;padding:10px 12px;overflow-x:auto;font-family:monospace;font-size:12.5px;line-height:1.5;white-space:pre;tab-size:4"><code>${escapeHtml(code.join("\n"))}</code></pre><span class="bb-cblk-copy" title="Copy" style="position:absolute;top:4px;right:8px;cursor:pointer;font-size:12px;opacity:.4">\ud83d\udccb</span></div>`);
+            let langTag = lang ? `<div style="padding:4px 10px;font-size:10px;font-weight:600;color:#8b949e;background:#161b22;border-bottom:1px solid #30363d;text-transform:uppercase;letter-spacing:.04em">${escapeHtml(lang)}</div>` : "";
+            result.push(`<div style="position:relative;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;margin:4px 0;overflow:hidden">${langTag}<pre style="margin:0;padding:10px 12px;overflow-x:auto;font-family:monospace;font-size:12.5px;line-height:1.5;white-space:pre;tab-size:4;color:#e6edf3"><code>${escapeHtml(code.join("\n"))}</code></pre><span class="bb-cblk-copy" title="Copy" style="position:absolute;top:4px;right:8px;cursor:pointer;font-size:12px;opacity:.6;color:#8b949e">\ud83d\udccb</span></div>`);
             continue;
         }
         if (line.startsWith("> ") || line === ">") {
