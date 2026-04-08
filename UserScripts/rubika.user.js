@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.2
+// @version      7.3
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -124,7 +124,8 @@ function showMsgNotification(chatName,text,authorName){
                                             // Get chat name from sidebar
                                             const chatGuid=mm.object_guid||m.object_guid||"";
                                             let chatName=authorName||"New message";
-                                            // Find chat name in DOM
+                                            // Skip if tab is focused
+                                            if(document.hasFocus())continue;
                                             try{
                                                 const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
                                                 for(const li of items){
@@ -471,7 +472,7 @@ function renderHS(el,text,cc,fp,trust,onAction,btnText){
     let h='<div style="border:1.5px solid '+c+';background:'+bg+';border-radius:10px;padding:12px;margin:6px 0;font-size:13px;line-height:1.4"><span style="display:block;font-weight:700;font-size:14px;color:'+c+'">'+escapeHtml(text)+'</span>';
     if(fp){h+='<div style="font-family:monospace;font-size:11.5px;margin:4px 0;font-weight:600;color:#00ab80">Fingerprint: '+escapeHtml(fp)+'</div>';h+='<div style="color:'+(trust&&trust.includes("\u26a0")?"#d32f2f":"#555")+';font-weight:500;margin-bottom:'+(onAction?"8px":"0")+'">'+escapeHtml(trust||"")+'</div>';}
     if(onAction)h+='<button class="bb-hs-btn" style="display:inline-block;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:'+c+';color:#fff">'+escapeHtml(btnText)+'</button>';
-    h+='</div>';el.innerHTML=h;
+    h+='</div>';el.innerHTML=h;el._hsProcessed=true;
     if(onAction){const btn=el.querySelector(".bb-hs-btn");if(btn)btn.onclick=e=>{e.preventDefault();e.stopPropagation();btn.disabled=true;btn.innerText="Processing...";onAction();};}
 }
 function toast(m,d){d=d||CFG.TOAST_MS;const el=document.createElement("div");el.textContent=m;Object.assign(el.style,{position:"fixed",bottom:"80px",left:"50%",transform:"translateX(-50%)",background:"rgba(0,0,0,.85)",color:"#fff",padding:"10px 22px",borderRadius:"12px",fontSize:"13px",zIndex:"9999999",opacity:"0",pointerEvents:"none",transition:"opacity .2s",whiteSpace:"nowrap"});document.body.appendChild(el);requestAnimationFrame(()=>{el.style.opacity="1";});setTimeout(()=>{el.style.opacity="0";setTimeout(()=>el.remove(),250);},d);}
@@ -507,6 +508,8 @@ async function startBridge(){
     if(isGroup())hsRec.groupKey=genKey();
     await dbOp("handshakes","put",hsRec);
     await sendViaBridge(CFG.PFX_H+" "+toB64(msg));toast(isGroup()?"Group bridge invite sent!":"Bridge invite sent!");refreshUI();
+    // Force re-scan so the !! message renders as widget immediately
+    setTimeout(()=>decryptMessages(),300);setTimeout(()=>decryptMessages(),800);
 }
 async function acceptBridge(data,el){
     const id=await getMyId(),eph=await _S.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveBits"]);
@@ -562,10 +565,9 @@ async function processGroupConfirm(data,hs,el){
     refreshUI();renderHS(el,"\u2705 Group bridge established","ac");
 }
 async function handleHandshake(b64,el){
-    if(el._hsProcessed)return;el._hsProcessed=true;
-    console.log("[RB] handleHandshake called, b64 len:", b64.length);
+    if(el._hsProcessed)return;
     try{
-        const bytes=decodeB64Smart(b64);if(!bytes||bytes.length<118){console.log("[RB] HS: bad decode, bytes:",bytes?.length);return;}
+        const bytes=decodeB64Smart(b64);if(!bytes||bytes.length<118)return;
         const ver=bytes[0],type=bytes[1];if(ver!==1)return;
         const nonce=bytes.slice(2,18),hexNonce=toHex(nonce);
         const myId=await getMyId(),hs=await dbOp("handshakes","get",hexNonce);
