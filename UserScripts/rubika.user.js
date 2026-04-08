@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      7.1
+// @version      7.2
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -58,6 +58,22 @@ async function aesCbcDecrypt(b64data,key){
         return new TextDecoder().decode(dec);
     }catch(_){return null;}
 }
+function playNotifSound(){
+    try{
+        const ac=new(window.AudioContext||window.webkitAudioContext)();
+        // Two-tone chime
+        [[880,.0,.08],[1047,.07,.15]].forEach(([freq,start,end])=>{
+            const o=ac.createOscillator(),g=ac.createGain();
+            o.type="sine";o.frequency.value=freq;
+            g.gain.setValueAtTime(0,ac.currentTime+start);
+            g.gain.linearRampToValueAtTime(0.15,ac.currentTime+start+0.02);
+            g.gain.linearRampToValueAtTime(0,ac.currentTime+end);
+            o.connect(g);g.connect(ac.destination);
+            o.start(ac.currentTime+start);o.stop(ac.currentTime+end+0.01);
+        });
+        setTimeout(()=>ac.close(),500);
+    }catch(_){}
+}
 function showMsgNotification(chatName,text,authorName){
     if(!("Notification" in _W))return;
     if(Notification.permission==="default"){Notification.requestPermission();return;}
@@ -65,8 +81,9 @@ function showMsgNotification(chatName,text,authorName){
     let title=authorName&&authorName!==chatName?authorName+" in "+chatName:chatName;
     let body=text||"New message";
     if(body.length>120)body=body.slice(0,120)+"\u2026";
+    playNotifSound();
     try{
-        const n=new Notification(title,{body,icon:"https://web.rubika.ir/assets/img/iphone_home120.png",tag:"rb-"+chatName,silent:false});
+        const n=new Notification(title,{body,icon:"https://web.rubika.ir/assets/img/iphone_home120.png",tag:"rb-"+chatName,silent:true});
         n.onclick=()=>{_W.focus();n.close();};
         setTimeout(()=>n.close(),8000);
     }catch(_){}
