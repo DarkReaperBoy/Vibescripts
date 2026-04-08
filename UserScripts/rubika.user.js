@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      5.4
+// @version      5.5
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (fast DC racing, keepalive, reconnect, resync), draft blocker.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -505,7 +505,7 @@ XMLHttpRequest.prototype.send = function(...args) {
 function forceResync() {
     try { window.dispatchEvent(new HashChangeEvent("hashchange")); } catch(_) {}
     try {
-        let ac = document.querySelector(".chatlist-chat.active");
+        let ac = document.querySelector("ul.chatlist > li.open");
         if (ac) { ac.dispatchEvent(new MouseEvent("mousedown",{bubbles:true})); setTimeout(()=>{ ac.dispatchEvent(new MouseEvent("mouseup",{bubbles:true})); ac.dispatchEvent(new MouseEvent("click",{bubbles:true})); },50); }
     } catch(_) {}
     try { window.dispatchEvent(new Event("focus")); } catch(_) {}
@@ -661,45 +661,55 @@ html.night ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25);
 
 * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-color) transparent; }
 
-/* ── Sidebar / Chat List ── */
+/* ── Sidebar / Chat List ──
+   Actual DOM: ul.chatlist > li[rb-chat-item].rp
+   Active chat: li.open */
 
-.sidebar-left-section {
-    background: var(--surface-color) !important;
+ul.chatlist {
+    padding: 0 6px !important;
 }
 
-.chatlist-chat {
+ul.chatlist > li {
     border-radius: 10px !important;
-    margin: 1px 6px !important;
-    padding: 8px 10px !important;
+    margin: 1px 0 !important;
     transition: background .15s ease !important;
 }
 
-.chatlist-chat:hover {
+ul.chatlist > li:hover {
     background: rgba(0,0,0,0.04) !important;
 }
-html.night .chatlist-chat:hover {
+html.night ul.chatlist > li:hover {
     background: rgba(255,255,255,0.06) !important;
 }
 
-.chatlist-chat.active,
-.chatlist-chat.open {
+ul.chatlist > li.open {
     background: var(--primary-color) !important;
     border-radius: 10px !important;
 }
 
-.chatlist-chat.active *,
-.chatlist-chat.open * {
+ul.chatlist > li.open .user-caption,
+ul.chatlist > li.open .user-caption * {
     color: #fff !important;
 }
 
-.chatlist-chat.active .unread,
-.chatlist-chat.open .unread {
+ul.chatlist > li.open .user-last-message,
+ul.chatlist > li.open .dialog-subtitle,
+ul.chatlist > li.open .message-time,
+ul.chatlist > li.open .im_dialog_chat_from {
+    color: rgba(255,255,255,0.8) !important;
+}
+
+ul.chatlist > li.open .badge:not(.badge-ads) {
     background: #fff !important;
     color: var(--primary-color) !important;
 }
 
+ul.chatlist > li.open .sending-status-icon {
+    color: rgba(255,255,255,0.7) !important;
+}
+
 /* Unread badge */
-.unread:not(.is-muted) {
+.badge.badge-primary:not(.badge-ads) {
     background: var(--primary-color) !important;
     font-weight: 600 !important;
     min-width: 22px !important;
@@ -709,11 +719,10 @@ html.night .chatlist-chat:hover {
 }
 
 /* Dialog preview text */
-.im_dialog_message,
+.user-last-message,
 .dialog-subtitle {
     font-size: 14px !important;
     line-height: 1.35 !important;
-    opacity: 0.75;
 }
 
 /* Chat title in list */
@@ -723,16 +732,14 @@ html.night .chatlist-chat:hover {
 }
 
 /* Dialog date */
-.im_dialog_date {
+.message-time {
     font-size: 12px !important;
     font-weight: 500 !important;
     opacity: 0.55;
 }
 
-/* Avatars — rounder, slightly larger */
-.dialog-avatar img,
-.avatar-photo,
-rb-avatar .avatar-photo {
+/* Avatars */
+.avatar-element {
     border-radius: 50% !important;
 }
 
@@ -753,39 +760,58 @@ html.night .sidebar-header .input-search:focus-within {
     box-shadow: 0 0 0 3px rgba(135,116,225,0.15) !important;
 }
 
-/* ── Message Bubbles ── */
+/* ── Message Bubbles ──
+   Actual DOM: .bubble > .bubble-content-wrapper > .bubble-content > .message
+   Outgoing: .bubble.is-out
+   Groups have .bubbles-group wrapping related bubbles */
 
+/* Tighten spacing between bubbles in a group */
+.bubbles-group .bubble {
+    margin-bottom: 1px !important;
+}
+
+/* Space between different groups */
+.bubbles-group + .bubbles-group {
+    margin-top: 6px !important;
+}
+
+/* Don't override padding on bubble-content — Rubika needs it for layout.
+   Only refine the border-radius */
 .bubble-content {
     border-radius: 12px !important;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.08) !important;
-    padding: 6px 10px !important;
-    max-width: min(85vw, 520px) !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06) !important;
 }
 
 html.night .bubble-content {
-    box-shadow: 0 1px 3px rgba(0,0,0,0.25) !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2) !important;
 }
 
-/* Outgoing bubble — green tint like Telegram */
-.bubble.is-out .bubble-content {
-    background-color: var(--message-out-background-color) !important;
+/* Outgoing: round all corners except bottom-right (where tail is) for RTL: bottom-left */
+.rtl .bubble.is-out .bubble-content {
+    border-radius: 12px !important;
+    border-bottom-left-radius: 4px !important;
+}
+.rtl .bubble:not(.is-out):not(.service):not(.is-date) .bubble-content {
+    border-radius: 12px !important;
     border-bottom-right-radius: 4px !important;
 }
-
-/* Incoming bubble */
-.bubble:not(.is-out) .bubble-content {
-    background-color: var(--message-background-color) !important;
+/* LTR fallback */
+body:not(.rtl) .bubble.is-out .bubble-content {
+    border-radius: 12px !important;
+    border-bottom-right-radius: 4px !important;
+}
+body:not(.rtl) .bubble:not(.is-out):not(.service):not(.is-date) .bubble-content {
+    border-radius: 12px !important;
     border-bottom-left-radius: 4px !important;
 }
 
-/* Service/date messages */
+/* Service/date messages — frosted glass pill */
 .bubble.service .bubble-content,
 .bubble.is-date .bubble-content {
     background: rgba(0,0,0,0.35) !important;
     color: #fff !important;
     border-radius: 16px !important;
     box-shadow: none !important;
-    padding: 4px 12px !important;
     font-size: 13px !important;
     font-weight: 500 !important;
     backdrop-filter: blur(12px);
@@ -798,15 +824,10 @@ div[rb-copyable] {
     line-height: var(--line-height, 1.375) !important;
 }
 
-/* Message time */
+/* Message time — inside .reactions-block */
 .time {
     font-size: 11px !important;
-    opacity: 0.55 !important;
     font-weight: 500 !important;
-}
-
-.bubble.is-out .time {
-    color: var(--message-out-primary-color) !important;
 }
 
 /* Reactions */
@@ -816,23 +837,11 @@ div[rb-copyable] {
     transition: transform .2s cubic-bezier(.2,1,.2,1), opacity .15s !important;
 }
 
-/* ── Bubble tails ── */
+/* ── Reply inside bubble ── */
 
-.bubble-tail {
-    opacity: 0.85;
-}
-
-/* ── Chat area background ── */
-
-.bubbles {
-    background-color: var(--body-background-color) !important;
-}
-
-/* ── Reply bar ── */
-
-.reply-wrapper {
-    border-radius: 8px 8px 0 0 !important;
-    transition: height .2s ease !important;
+.bubble .reply {
+    border-radius: 6px !important;
+    overflow: hidden !important;
 }
 
 .reply-border {
@@ -847,59 +856,49 @@ div[rb-copyable] {
     -webkit-backdrop-filter: blur(16px) saturate(180%) !important;
 }
 
-/* ── Chat Input area ── */
+/* ── Chat Input area ──
+   Actual DOM: .chat-input > .chat-input-container > .chat-input-content > .rows-wrapper */
 
 .chat-input {
     background: var(--surface-color) !important;
-    border-top: 1px solid var(--border-color) !important;
 }
 
+/* The actual text input is .composer_rich_textarea[contenteditable] inside
+   .input-message-input inside .input-message-container */
+
+.composer_rich_textarea,
 .input-message-input {
     font-size: var(--messages-text-size, 16px) !important;
     line-height: var(--line-height, 1.375) !important;
     caret-color: var(--primary-color) !important;
-    padding: 10px 12px !important;
 }
 
-.input-message-container {
-    border-radius: 18px !important;
-    background: var(--input-search-background-color, var(--surface-color)) !important;
-    border: 1.5px solid var(--border-color) !important;
-    transition: border-color .2s, box-shadow .2s !important;
-    margin: 4px 0 !important;
+/* The rows-wrapper has a bubble-tail SVG background — that's the input "bubble".
+   We just clean up the corners. */
+.rows-wrapper {
+    border-radius: 12px !important;
 }
 
-.input-message-container:focus-within {
-    border-color: var(--primary-color) !important;
-    box-shadow: 0 0 0 3px rgba(51,144,236,0.1) !important;
-}
-html.night .input-message-container:focus-within {
-    box-shadow: 0 0 0 3px rgba(135,116,225,0.12) !important;
+.rows-wrapper > .bubble-tail {
+    opacity: 0.7;
 }
 
-/* Send button — circular, Telegram-style */
-.btn-send-container .btn-send {
-    border-radius: 50% !important;
-    width: 42px !important;
-    height: 42px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
+/* Send button — from DOM: button.btn-send.animated-button-icon inside .btn-send-container
+   States: .record (mic icon) / .send (send icon) */
+.btn-send-container button.btn-send {
     transition: transform .2s cubic-bezier(.2,1,.2,1), background .15s !important;
 }
 
-.btn-send-container .btn-send.send {
+.btn-send-container button.btn-send.send {
     background: var(--primary-color) !important;
-    color: #fff !important;
-    transform: scale(1) !important;
 }
 
-.btn-send-container .btn-send.send .rbico-send {
+.btn-send-container button.btn-send.send .rbico-send {
     color: #fff !important;
 }
 
-.btn-send-container .btn-send:active {
-    transform: scale(0.92) !important;
+.btn-send-container button.btn-send:active {
+    transform: scale(0.9) !important;
 }
 
 /* ── Modals & Popups ── */
