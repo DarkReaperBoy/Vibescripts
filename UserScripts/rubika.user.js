@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      8.2
+// @version      8.3
 // @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -649,9 +649,9 @@ function escapeHtml(s) { return s.replace(/[&<>"]/g, c => HTML_ESC[c]); }
 function renderInline(s) {
     return s
         .replace(/``([^`]+)``|`([^`]+)`/g, (_, a, b) =>
-            `<code style="background:var(--color-neutrals-n-20,#f4f5f7);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.92em">${a ?? b}</code>`)
+            `<code style="background:rgba(0,0,0,.07);border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.9em">${a ?? b}</code>`)
         .replace(/\|\|(.+?)\|\|/g, (_, t) =>
-            `<span class="bb-spoiler" style="background:var(--color-neutrals-n-400,#42526e);color:transparent;border-radius:3px;padding:0 3px;cursor:pointer;user-select:none" title="Click to reveal">${t}</span>`)
+            `<span class="bb-spoiler" style="background:#42526e;color:transparent;border-radius:3px;padding:0 3px;cursor:pointer;user-select:none" title="Click to reveal">${t}</span>`)
         .replace(/\*\*\*(.+?)\*\*\*/g, (_, t) => `<strong><em>${t}</em></strong>`)
         .replace(/\*\*(.+?)\*\*/g, (_, t) => `<strong>${t}</strong>`)
         .replace(/(?<![_a-zA-Z0-9])__(.+?)__(?![_a-zA-Z0-9])/g, (_, t) => `<u>${t}</u>`)
@@ -682,6 +682,17 @@ function renderMarkdown(text) {
 
     while (i < lines.length) {
         let line = lines[i];
+        // Fenced code blocks
+        if (/^```/.test(line)) {
+            let lang = line.slice(3).trim();
+            i++;
+            let code = [];
+            while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]);
+            if (i < lines.length) i++;
+            let langTag = lang ? `<div style="padding:4px 10px;font-size:10px;font-weight:600;color:#888;background:rgba(0,0,0,.05);border-bottom:1px solid rgba(0,0,0,.1);text-transform:uppercase;letter-spacing:.04em">${escapeHtml(lang)}</div>` : "";
+            result.push(`<div style="position:relative;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);border-radius:8px;margin:4px 0;overflow:hidden">${langTag}<pre style="margin:0;padding:10px 12px;overflow-x:auto;font-family:monospace;font-size:12.5px;line-height:1.5;white-space:pre;tab-size:4"><code>${escapeHtml(code.join("\n"))}</code></pre><span class="bb-cblk-copy" title="Copy" style="position:absolute;top:4px;right:8px;cursor:pointer;font-size:12px;opacity:.4">\ud83d\udccb</span></div>`);
+            continue;
+        }
         if (line.startsWith("> ") || line === ">") {
             let qLines = [];
             while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">"))
@@ -1203,6 +1214,8 @@ button.toggle-emoticons { display: none !important; }
 document.addEventListener("click", e => {
     let sp = e.target.closest(".bb-spoiler");
     if (sp) { sp.style.color = "inherit"; sp.style.background = "#dfe1e6"; }
+    let cb = e.target.closest(".bb-cblk-copy");
+    if (cb) { e.preventDefault(); e.stopPropagation(); let code = cb.parentElement?.querySelector("code"); if(code) navigator.clipboard.writeText(code.textContent).then(()=>{cb.textContent="\u2705";setTimeout(()=>cb.textContent="\ud83d\udccb",1200);}).catch(()=>{}); }
 }, true);
 
 ctxMenu = document.createElement("div");
