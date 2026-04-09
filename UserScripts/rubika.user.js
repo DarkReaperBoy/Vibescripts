@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      10.2.0
+// @version      10.3
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -278,57 +278,42 @@ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"text/plain"},body:
 const j=await r.json();if(!j.data_enc)return null;const p=await aesCbcDecrypt(j.data_enc,_passKey);return p?JSON.parse(p):null;
 }catch(_){rotA();return null;}}
 
-// Poll getChatsUpdates — detect missed messages, inject or reconnect
+// Poll getChatsUpdates — detect missed messages, force WS reconnect to sync
+let _lastReconnect=0;
 async function _doSync(){
 if(_sBusy||!_authKey)return;_sBusy=true;
 try{if(!_sState)_sState=Math.floor(Date.now()/1000)-30;
 const r=await _rApi("getChatsUpdates",{state:_sState});
 if(!r||r.status!=="OK"){
-// Handle "OldState" — server says our state is too stale, reset and force full reconnect
 if(r&&(r.status_det==="OldState"||r.status==="OldState"||(r.data&&r.data.status==="OldState"))){
-_sState=Math.floor(Date.now()/1000)-30;
-if(aSock&&aSock.readyState===1){try{aSock.close(4000,"old");}catch(_){}}
-else{_W.dispatchEvent(new Event("online"));}}
+_sState=Math.floor(Date.now()/1000)-30;_forceReconnect();}
 return;}
 const d=r.data||{};if(d.new_state&&d.new_state>_sState)_sState=d.new_state;
-// Also handle OldState inside data
-if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;
-if(aSock&&aSock.readyState===1){try{aSock.close(4000,"old");}catch(_){}}return;}
+if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;_forceReconnect();return;}
 const chats=d.chats||[];
-if(chats.length>0){_sMiss++;
-// Always inject chat updates — force sync regardless of WS state
-if(aSock&&aSock.readyState===1){
-try{const ed=await _aEnc(JSON.stringify({chat_updates:chats,message_updates:chats.filter(c=>c.last_message).map(c=>({message:c.last_message,object_guid:c.object_guid}))}),_passKey);
-aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}}
-// Force WS reconnect after 3+ consecutive missed syncs
-if(_sMiss>=3){_sMiss=0;
-if(aSock&&aSock.readyState===1){try{aSock.close(4000,"sync");}catch(_){}}
-else{_W.dispatchEvent(new Event("online"));}}
-}else{_sMiss=0;}
-// Always sync current chat messages too
-await _chatSync();
+if(chats.length>0){
+// New updates detected — force Angular to re-sync by reconnecting WS
+// Cooldown: max 1 reconnect per 5s to avoid spam
+_forceReconnect();
+}
 }finally{_sBusy=false;}}
 
-// Per-chat sync — fetch messages for current open chat
-async function _chatSync(){
-if(!_authKey)return;const h=location.hash;if(!h.startsWith("#c="))return;const g=h.slice(3);if(!g)return;
-try{const r=await _rApi("getMessagesUpdates",{object_guid:g,state:Math.floor(Date.now()/1000)-120});
-if(!r||r.status!=="OK")return;const d=r.data||{};
-const msgs=d.updated_messages||d.messages||[];
-if(msgs.length>0&&aSock&&aSock.readyState===1){
-try{const ed=await _aEnc(JSON.stringify({message_updates:msgs.map(m=>({message:m,object_guid:g}))}),_passKey);
-aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}
-}}catch(_){}}
+function _forceReconnect(){
+if(Date.now()-_lastReconnect<5000)return; // 5s cooldown
+_lastReconnect=Date.now();
+if(aSock&&aSock.readyState===1){try{aSock.close(4000,"sync");}catch(_){}}
+else{_W.dispatchEvent(new Event("online"));}
+}
 
-// Fixed 5s sync scheduler
+// 2s sync scheduler — detects updates, forces WS reconnect to deliver them
 (function(){let st=null;
 function sched(){clearTimeout(st);
 st=setTimeout(()=>{_doSync().then(sched);},2000);}
 const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine started");_doSync().then(sched);}},2000);
 // Immediate sync on tab focus
-document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(()=>{_chatSync();sched();});}});
-// Sync current chat on navigation
-_W.addEventListener("hashchange",()=>{if(_authKey)setTimeout(_chatSync,1500);});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(sched);}});
+// Force reconnect on chat navigation to load fresh messages
+_W.addEventListener("hashchange",()=>{if(_authKey)setTimeout(_forceReconnect,500);});
 })();
 
 // Reconnection watchdog — force reconnect if WS dead >10s
