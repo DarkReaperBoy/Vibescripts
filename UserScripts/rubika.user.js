@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      9.1
-// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, keepalive, reconnect). Desktop + Mobile.
+// @version      10.0
+// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, active sync polling, keepalive, reconnect). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
+// @match        *://m.rubika.ir/*
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -22,9 +23,9 @@ async function raceDCs(){try{const r=await fetch("https://getdcmess.iranlms.ir/"
 if(s.length)_rk.sock=await new Promise(res=>{const r=[],st={},ws=[];let n=s.length;const to=setTimeout(fin,10000);function fin(){clearTimeout(to);ws.forEach(w=>{try{w.close();}catch(_){}});const ok=r.sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(ok);s.forEach(u=>{if(!seen.has(u))ok.push(u);});res(ok);}s.forEach(u=>{try{st[u]=performance.now();const w=new OrigWS(u);ws.push(w);w.onopen=()=>{r.push({u,ms:performance.now()-st[u]});if(--n<=0)fin();};w.onerror=()=>{if(--n<=0)fin();};}catch(_){if(--n<=0)fin();}});if(n<=0)fin();});
 }catch(e){console.log("[RB] DC fail:",e.message);}}
 raceDCs();setTimeout(()=>{if(!_rk.api.length)raceDCs();},15000);
-let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null;
-function aPoT(){if(rtt.length<3)return 12000;const s=[...rtt].sort((a,b)=>a-b);return Math.max(5000,Math.min(20000,s[Math.floor(s.length*.9)]*3));}
-function aPiT(){if(rtt.length<3)return 15000;return Math.max(10000,Math.min(25000,(rtt.reduce((a,b)=>a+b,0)/rtt.length)*8));}
+let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null,_decAuth=null,_sState=0,_sBusy=false,_sMiss=0;
+function aPoT(){if(rtt.length<3)return 8000;const s=[...rtt].sort((a,b)=>a-b);return Math.max(4000,Math.min(10000,s[Math.floor(s.length*.9)]*2.5));}
+function aPiT(){if(rtt.length<3)return 8000;return Math.max(6000,Math.min(15000,(rtt.reduce((a,b)=>a+b,0)/rtt.length)*6));}
 function clrP(){clearInterval(piT);clearTimeout(poT);piT=poT=null;}
 function PW(url,pr){const bs=bestS();if(bs&&url&&url.includes("iranlms.ir")&&!url.includes("getdcmess"))url=bs;const ws=pr!==undefined?new OrigWS(url,pr):new OrigWS(url);if(!url||!url.includes("iranlms.ir"))return ws;aSock=ws;lastM=Date.now();const os=ws.send.bind(ws);ws.send=function(d){try{if(typeof d==="string"&&d.includes("EditParameter")&&d.includes("drafts_"))return;}catch(_){}return os(d);};
 function sP(){clrP();piT=setInterval(()=>{if(ws.readyState===1){pS=performance.now();try{os("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{ws.close(4000,"pt");}catch(_){}},aPoT());}},aPiT());}
@@ -167,8 +168,8 @@ function showMsgNotification(chatName,text,authorName){
             if(typeof d==="string"){
                 const p=JSON.parse(d);
                 if(p.method==="handShake"&&p.auth&&p.auth.length===32){
-                    _authKey=p.auth;_passKey=derivePassphrase(p.auth);
-                    console.log("[RB] Auth captured, notifications enabled");
+                    _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;_sMiss=0;
+                    console.log("[RB] Auth captured, sync+notifications enabled");
                 }
                 if(d.includes("EditParameter")&&d.includes("drafts_"))return;
             }
@@ -195,10 +196,80 @@ const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
 function adaptiveXhrTimeout(){if(rtt.length<3)return 20000;const avg=rtt.reduce((a,b)=>a+b,0)/rtt.length;return Math.max(15000,Math.min(45000,avg*15));}
 XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=adaptiveXhrTimeout();}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
-document.addEventListener("visibilitychange",()=>{if(!document.hidden&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));else if(Date.now()-lastM>60000){try{aSock.close(4000,"stale");}catch(_){}}}});
 _W.addEventListener("online",()=>{setTimeout(()=>{if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));},1000);});
 if(navigator.connection)navigator.connection.addEventListener("change",()=>{if(navigator.onLine&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
-setInterval(()=>{if(!aSock||aSock.readyState!==1)return;if(Date.now()-lastM>aPiT()*2.5){pS=performance.now();try{aSock.send("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{aSock.close(4000,"hc");}catch(_){}},aPoT());}},20000);
+setInterval(()=>{if(!aSock||aSock.readyState!==1)return;if(Date.now()-lastM>aPiT()*2){pS=performance.now();try{aSock.send("{}");}catch(_){}clearTimeout(poT);poT=setTimeout(()=>{try{aSock.close(4000,"hc");}catch(_){}},aPoT());}},10000);
+
+// ── Active Sync Engine ──
+// Provides backup message sync via API polling when WebSocket misses updates.
+// Detects sync gaps, injects missed updates, and forces WS reconnect as fallback.
+function _dAuth(a){let r='';for(let i=0;i<a.length;i++){const c=a.charCodeAt(i);if(c>=97&&c<=122)r+=String.fromCharCode(((32-(c-97))%26)+97);else if(c>=65&&c<=90)r+=String.fromCharCode(((29-(c-65))%26)+65);else if(c>=48&&c<=57)r+=String.fromCharCode(((13-(c-48))%10)+48);else r+=a[i];}return r;}
+async function _aEnc(s,k){const iv=new Uint8Array(16),ck=await crypto.subtle.importKey("raw",new TextEncoder().encode(k),{name:"AES-CBC"},false,["encrypt"]),enc=new Uint8Array(await crypto.subtle.encrypt({name:"AES-CBC",iv},ck,new TextEncoder().encode(s)));let b='';for(let i=0;i<enc.length;i++)b+=String.fromCharCode(enc[i]);return btoa(b);}
+async function _rApi(m,inp){
+if(!_authKey||!_passKey)return null;if(!_decAuth)_decAuth=_dAuth(_authKey);
+const u=bestA()||_rk.api[0];if(!u)return null;
+try{const _pkg=location.hostname.includes("m.rubika")?"m.rubika.ir":"web.rubika.ir";
+const de=await _aEnc(JSON.stringify({client:{app_name:"Main",app_version:"2.5.4",platform:"PWA",package:_pkg,lang_code:"fa"},method:m,input:inp}),_passKey);
+const r=await fetch(u,{method:"POST",headers:{"Content-Type":"text/plain"},body:JSON.stringify({api_version:"6",auth:_decAuth,data_enc:de}),signal:AbortSignal.timeout(12000)});
+const j=await r.json();if(!j.data_enc)return null;const p=await aesCbcDecrypt(j.data_enc,_passKey);return p?JSON.parse(p):null;
+}catch(_){rotA();return null;}}
+
+// Poll getChatsUpdates — detect missed messages, inject or reconnect
+async function _doSync(){
+if(_sBusy||!_authKey)return;_sBusy=true;
+try{if(!_sState)_sState=Math.floor(Date.now()/1000)-30;
+const r=await _rApi("getChatsUpdates",{state:_sState});
+if(!r||r.status!=="OK"){
+// Handle "OldState" — server says our state is too stale, reset and force full reconnect
+if(r&&(r.status_det==="OldState"||r.status==="OldState"||(r.data&&r.data.status==="OldState"))){
+_sState=Math.floor(Date.now()/1000)-30;
+if(aSock&&aSock.readyState===1){try{aSock.close(4000,"old");}catch(_){}}
+else{_W.dispatchEvent(new Event("online"));}}
+return;}
+const d=r.data||{};if(d.new_state&&d.new_state>_sState)_sState=d.new_state;
+// Also handle OldState inside data
+if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;
+if(aSock&&aSock.readyState===1){try{aSock.close(4000,"old");}catch(_){}}return;}
+const chats=d.chats||[];const wsStale=Date.now()-lastM>8000;
+if(chats.length>0&&wsStale){_sMiss++;
+// Try injecting chat updates via synthetic WS message
+if(aSock&&aSock.readyState===1){
+try{const ed=await _aEnc(JSON.stringify({chat_updates:chats,message_updates:chats.filter(c=>c.last_message).map(c=>({message:c.last_message,object_guid:c.object_guid}))}),_passKey);
+aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}}
+// Force WS reconnect after 2+ consecutive missed syncs
+if(_sMiss>=2){_sMiss=0;
+if(aSock&&aSock.readyState===1){try{aSock.close(4000,"sync");}catch(_){}}
+else{_W.dispatchEvent(new Event("online"));}}
+}else{_sMiss=0;}
+}finally{_sBusy=false;}}
+
+// Per-chat sync — fetch messages for current open chat
+async function _chatSync(){
+if(!_authKey)return;const h=location.hash;if(!h.startsWith("#c="))return;const g=h.slice(3);if(!g)return;
+try{const r=await _rApi("getMessagesUpdates",{object_guid:g,state:Math.floor(Date.now()/1000)-120});
+if(!r||r.status!=="OK")return;const d=r.data||{};
+const msgs=d.updated_messages||d.messages||[];
+if(msgs.length>0&&aSock&&aSock.readyState===1){
+try{const ed=await _aEnc(JSON.stringify({message_updates:msgs.map(m=>({message:m,object_guid:g}))}),_passKey);
+aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}
+}}catch(_){}}
+
+// Adaptive sync scheduler
+(function(){let st=null;
+function sched(){clearTimeout(st);const a=Date.now()-_lastActivity<30000,wOk=aSock&&aSock.readyState===1&&Date.now()-lastM<25000;
+st=setTimeout(()=>{_doSync().then(sched);},a&&!wOk?5000:a?10000:20000);}
+const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine started");_doSync().then(sched);}},2000);
+// Immediate sync on tab focus
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(()=>{_chatSync();sched();});}});
+// Sync current chat on navigation
+_W.addEventListener("hashchange",()=>{if(_authKey)setTimeout(_chatSync,1500);});
+})();
+
+// Reconnection watchdog — force reconnect if WS dead >10s
+setInterval(()=>{if(_authKey&&(!aSock||aSock.readyState>1)&&Date.now()-lastM>10000)_W.dispatchEvent(new Event("online"));},8000);
+// Re-race DCs every 5 minutes to adapt to network changes
+setInterval(raceDCs,300000);
 })();
 
 // ── E2E ENCRYPTION (deferred to DOM ready) ──
