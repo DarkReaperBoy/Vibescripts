@@ -249,7 +249,7 @@ function _handleWsMsg(e){
 const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
 // Adaptive XHR timeout: scales with connection speed. Fast=15s, slow=45s
 function adaptiveXhrTimeout(){if(rtt.length<3)return 20000;const avg=rtt.reduce((a,b)=>a+b,0)/rtt.length;return Math.max(15000,Math.min(45000,avg*15));}
-XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=adaptiveXhrTimeout();}return oO.call(this,m,u,...r);};
+XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&!u.includes("GetFile")&&!u.includes("getfile")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=adaptiveXhrTimeout();}return oO.call(this,m,u,...r);};
 XMLHttpRequest.prototype.send=function(...a){
 // Capture auth from XHR API requests (fallback if WS capture fails)
 if(!_authKey&&a[0]&&typeof a[0]==="string"&&this._ru&&this._ru.includes("iranlms.ir")){
