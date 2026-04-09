@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      11.0
+// @version      11.0.1
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -37,7 +37,7 @@ async function raceDCs(){try{const r=await fetch("https://getdcmess.iranlms.ir/"
 if(s.length)_rk.sock=await new Promise(res=>{const r=[],st={},ws=[];let n=s.length;const to=setTimeout(fin,10000);function fin(){clearTimeout(to);ws.forEach(w=>{try{w.close();}catch(_){}});const ok=r.sort((a,b)=>a.ms-b.ms).map(x=>x.u);const seen=new Set(ok);s.forEach(u=>{if(!seen.has(u))ok.push(u);});res(ok);}s.forEach(u=>{try{st[u]=performance.now();const w=new OrigWS(u);ws.push(w);w.onopen=()=>{r.push({u,ms:performance.now()-st[u]});if(--n<=0)fin();};w.onerror=()=>{if(--n<=0)fin();};}catch(_){if(--n<=0)fin();}});if(n<=0)fin();});
 }catch(e){console.log("[RB] DC fail:",e.message);}}
 raceDCs();setTimeout(()=>{if(!_rk.api.length)raceDCs();},15000);
-let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null,_decAuth=null,_sState=0,_sBusy=false,_sMiss=0;
+let aSock=null,lastM=Date.now(),rtt=[],pS=0,piT=null,poT=null,_decAuth=null,_sState=0,_sBusy=false;
 function aPoT(){if(rtt.length<3)return 8000;const s=[...rtt].sort((a,b)=>a-b);return Math.max(4000,Math.min(10000,s[Math.floor(s.length*.9)]*2.5));}
 function aPiT(){if(rtt.length<3)return 8000;return Math.max(6000,Math.min(15000,(rtt.reduce((a,b)=>a+b,0)/rtt.length)*6));}
 function clrP(){clearInterval(piT);clearTimeout(poT);piT=poT=null;}
@@ -78,24 +78,24 @@ async function aesCbcDecrypt(b64data,key){
     }catch(_){return null;}
 }
 let _notifAC=null;
-// Pre-warm AudioContext on first user interaction so it's ready for notifications
-["click","keydown","touchstart"].forEach(e=>{_W.addEventListener(e,function _acWarm(){
+(function(){let _warmed=false;function _acWarm(){
+    if(_warmed)return;_warmed=true;
     try{if(!_notifAC){_notifAC=new(window.AudioContext||window.webkitAudioContext)();_notifAC.resume();}}catch(_){}
-    _W.removeEventListener(e,_acWarm);},{once:true,capture:true});});
+    ["click","keydown","touchstart"].forEach(e=>_W.removeEventListener(e,_acWarm,true));
+}["click","keydown","touchstart"].forEach(e=>_W.addEventListener(e,_acWarm,{once:false,capture:true}));
+})();
 function playNotifSound(){
     try{
         if(!_notifAC)_notifAC=new(window.AudioContext||window.webkitAudioContext)();
         _notifAC.resume().then(()=>{
-            const ac=_notifAC;
-            // Three-tone chime — louder, longer
             [[880,.0,.12],[1047,.1,.22],[1319,.2,.35]].forEach(([freq,start,end])=>{
-                const o=ac.createOscillator(),g=ac.createGain();
+                const o=_notifAC.createOscillator(),g=_notifAC.createGain();
                 o.type="sine";o.frequency.value=freq;
-                g.gain.setValueAtTime(0,ac.currentTime+start);
-                g.gain.linearRampToValueAtTime(0.35,ac.currentTime+start+0.03);
-                g.gain.linearRampToValueAtTime(0,ac.currentTime+end);
-                o.connect(g);g.connect(ac.destination);
-                o.start(ac.currentTime+start);o.stop(ac.currentTime+end+0.01);
+                g.gain.setValueAtTime(0,_notifAC.currentTime+start);
+                g.gain.linearRampToValueAtTime(0.35,_notifAC.currentTime+start+0.03);
+                g.gain.linearRampToValueAtTime(0,_notifAC.currentTime+end);
+                o.connect(g);g.connect(_notifAC.destination);
+                o.start(_notifAC.currentTime+start);o.stop(_notifAC.currentTime+end+0.01);
             });
         }).catch(()=>{});
     }catch(_){}
@@ -115,31 +115,29 @@ function showMsgNotification(chatName,text,authorName){
         setTimeout(()=>n.close(),8000);
     }catch(_){}
 }
-// ── Notification message handler (reusable) ──
-let _wsMsgCount=0;
+function _notifyDecrypted(chatName,text,authorName){
+    if(text.startsWith("@@")&&_W._rbDecrypt){
+        _W._rbDecrypt(text).then(dec=>{
+            showMsgNotification(chatName,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message",authorName);
+        }).catch(()=>showMsgNotification(chatName,"\ud83d\udd12 Encrypted message",authorName));
+    } else { showMsgNotification(chatName,text,authorName); }
+}
 function _handleWsMsg(e){
     try{
-        if(!e.data||typeof e.data!=="string")return;
+        if(!_passKey||!e.data||typeof e.data!=="string")return;
         const msg=JSON.parse(e.data);
         if(!msg.data_enc)return;
-        _wsMsgCount++;
-        if(!_passKey){if(_wsMsgCount<=3)console.log("[RB] WS msg #%d but no auth yet",_wsMsgCount);return;}
         aesCbcDecrypt(msg.data_enc,_passKey).then(plain=>{
             if(!plain)return;
             try{
                 const d=JSON.parse(plain);
-                // Log first few messages to diagnose format
-                if(_wsMsgCount<=5)console.log("[RB] WS #%d keys:",_wsMsgCount,Object.keys(d).join(","),"| sample:",JSON.stringify(d).slice(0,300));
-                // Extract messages from ALL possible field names
-                // WS push uses: message_updates, chat_updates, message, chat, show_notifications
-                // May also be nested under d.data
                 const src=d.data||d;
                 const msgs=src.message_updates||src.message||[];
-                const chats=src.chat_updates||src.chat||[];
                 const notifs=src.show_notifications||[];
-                if(!msgs.length&&!chats.length&&!notifs.length)return;
-                // Process message updates
+                if(!msgs.length&&!notifs.length)return;
+                const isFocused=document.hasFocus()&&Date.now()-_lastActivity<15000;
                 for(const m of msgs){
+                    if(isFocused)break;
                     const mm=m.message||m;
                     const authorGuid=mm.author_object_guid||mm.author_guid||"";
                     if(_myGuid&&authorGuid===_myGuid)continue;
@@ -147,39 +145,25 @@ function _handleWsMsg(e){
                     const authorName=mm.author_name||mm.author_title||"";
                     const chatGuid=mm.object_guid||m.object_guid||"";
                     let chatName=authorName||"New message";
-                    if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
                     try{
                         const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
                         for(const li of items){
                             const pt=li.querySelector(".peer-title");
-                            if(pt&&li.innerHTML.includes(chatGuid)){chatName=pt.textContent.trim();break;}
+                            if(pt&&li.getAttribute("data-peer-id")===chatGuid){chatName=pt.textContent.trim();break;}
                         }
                     }catch(_){}
-                    if(text||authorName){
-                        if(text.startsWith("@@")&&_W._rbDecrypt){
-                            _W._rbDecrypt(text).then(dec=>{
-                                showMsgNotification(chatName,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message",authorName);
-                            }).catch(()=>showMsgNotification(chatName,"\ud83d\udd12 Encrypted message",authorName));
-                        } else { showMsgNotification(chatName,text,authorName); }
-                    }
+                    if(text||authorName) _notifyDecrypted(chatName,text,authorName);
                 }
-                // Process show_notifications (Rubika's own notification triggers)
                 for(const n of notifs){
-                    const text=n.text||n.message_text||"";
-                    const title=n.title||n.chat_title||n.sender_name||"Rubika";
-                    if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
+                    if(isFocused)break;
                     const authorGuid=n.author_object_guid||n.sender_guid||"";
                     if(_myGuid&&authorGuid===_myGuid)continue;
-                    if(text||title){
-                        if(text.startsWith("@@")&&_W._rbDecrypt){
-                            _W._rbDecrypt(text).then(dec=>{
-                                showMsgNotification(title,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message");
-                            }).catch(()=>showMsgNotification(title,"\ud83d\udd12 Encrypted message"));
-                        } else { showMsgNotification(title,text); }
-                    }
+                    const text=n.text||n.message_text||"";
+                    const title=n.title||n.chat_title||n.sender_name||"Rubika";
+                    if(text||title) _notifyDecrypted(title,text);
                 }
-            }catch(ex){console.log("[RB] WS parse error:",ex.message);}
-        }).catch(ex=>{if(_wsMsgCount<=5)console.log("[RB] WS decrypt fail:",ex.message);});
+            }catch(_){}
+        }).catch(()=>{});
     }catch(_){}
 }
 
@@ -217,7 +201,7 @@ function _handleWsMsg(e){
             if(typeof d==="string"){
                 const p=JSON.parse(d);
                 if(p.method==="handShake"&&p.auth&&typeof p.auth==="string"&&p.auth.length>=20){
-                    _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;_sMiss=0;
+                    _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;
                     console.log("[RB] Auth captured from WS handshake (%d chars)",p.auth.length);
                 }
                 if(d.includes("EditParameter")&&d.includes("drafts_"))return;
@@ -269,7 +253,7 @@ XMLHttpRequest.prototype.send=function(...a){
 if(!_authKey&&a[0]&&typeof a[0]==="string"&&this._ru&&this._ru.includes("iranlms.ir")){
 try{const b=JSON.parse(a[0]);if(b.auth&&typeof b.auth==="string"&&b.auth.length>=20){
 // b.auth is decode_auth — _dAuth is its own inverse, so _dAuth(decode_auth) = raw_auth
-const raw=_dAuth(b.auth);_authKey=raw;_passKey=derivePassphrase(raw);_decAuth=b.auth;_sState=0;_sMiss=0;
+const raw=_dAuth(b.auth);_authKey=raw;_passKey=derivePassphrase(raw);_decAuth=b.auth;_sState=0;
 console.log("[RB] Auth captured from XHR request");
 }}catch(_){}}
 this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
@@ -349,7 +333,7 @@ const _adObs=new MutationObserver(muts=>{for(const m of muts){for(const n of m.a
 // Kill ad iframes
 if(n.tagName==="IFRAME"){const s=n.src||"";if(_adDomains.some(d=>s.includes(d))){n.remove();continue;}}
 // Kill ad scripts
-if(n.tagName==="SCRIPT"){const s=n.src||n.textContent||"";if(_adDomains.some(d=>s.includes(d))){n.remove();continue;}}
+if(n.tagName==="SCRIPT"){const s=n.src||(n.textContent||"").slice(0,200);if(_adDomains.some(d=>s.includes(d))){n.remove();continue;}}
 // Kill elements with ad classes
 const cl=n.className||"";const id=n.id||"";
 if(/\b(ads?[-_]|[-_]ads?|advert|banner.?ad|promo|sponsor|tabligh|tebligh)\b/i.test(cl+id)){n.remove();}
