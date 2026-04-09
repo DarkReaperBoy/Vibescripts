@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      10.1.1
+// @version      10.2.0
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -323,7 +323,7 @@ aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed
 // Fixed 5s sync scheduler
 (function(){let st=null;
 function sched(){clearTimeout(st);
-st=setTimeout(()=>{_doSync().then(sched);},5000);}
+st=setTimeout(()=>{_doSync().then(sched);},2000);}
 const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine started");_doSync().then(sched);}},2000);
 // Immediate sync on tab focus
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(()=>{_chatSync();sched();});}});
@@ -1849,8 +1849,8 @@ function injectUI() {
         textarea.dispatchEvent(new KeyboardEvent("keyup", enterEvt));
 
         let sendBtn = null;
-        for (let attempt = 0; attempt < 20; attempt++) {
-            await delay(50);
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await delay(20);
             let btn = findSendButton();
             if (!btn) continue;
             let isReady = btn.classList.contains("send") || !btn.classList.contains("record") ||
@@ -1884,7 +1884,7 @@ function injectUI() {
             });
         }
 
-        await delay(300);
+        await delay(100);
 
         textarea.focus();
         document.execCommand("selectAll", false, null);
@@ -1902,30 +1902,36 @@ function injectUI() {
         isBypass = false;
     }
 
+    // Direct API send — bypasses DOM injection entirely, near-instant
+    async function apiSendMessage(msgText) {
+        const chatId = getChatId();
+        if (!chatId || chatId === "global") throw new Error("No chat open");
+        if (typeof _rApi !== "function" || !_authKey) throw new Error("API not ready");
+        const r = await _rApi("sendMessage", {
+            object_guid: chatId,
+            text: msgText,
+            rnd: Math.floor(Math.random() * 999999) + 1
+        });
+        if (!r || r.status !== "OK") throw new Error("API send failed: " + (r ? r.status_det || r.status : "null"));
+        return true;
+    }
+
     async function triggerSend(encrypted = true) {
         if (isSending) return;
         let text = getOverlayText();
         if (!text) return;
 
-        async function sendWithRetry(chunks, maxRetries, plaintext) {
-            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        // Try direct API first (instant), fallback to DOM injection (slow)
+        async function sendChunks(chunks) {
+            for (let chunk of chunks) {
                 try {
-                    for (let chunk of chunks) await injectAndSend(chunk);
-                    return true;
-                } catch(err) {
-                    console.error("[RB] Send attempt " + (attempt+1) + " failed:", err);
-                    if (attempt < maxRetries) {
-                        setOverlayText("\u26a0\ufe0f Retrying... (" + (attempt+2) + "/" + (maxRetries+1) + ")");
-                        await delay(1500 * (attempt + 1));
-                        // Re-encrypt with fresh IV — different ciphertext each retry
-                        if (plaintext) {
-                            let fresh = await splitEncrypt(plaintext);
-                            if (fresh) chunks = fresh;
-                        }
-                    }
+                    await apiSendMessage(chunk);
+                } catch(apiErr) {
+                    console.log("[RB] API send failed, falling back to DOM:", apiErr.message);
+                    await injectAndSend(chunk);
                 }
             }
-            return false;
+            return true;
         }
 
         if (encrypted) {
@@ -1936,7 +1942,7 @@ function injectUI() {
             try {
                 let chunks = await splitEncrypt(text);
                 if (!chunks) { setOverlayText(text); openSettings(); return; }
-                let ok = await sendWithRetry(chunks, 2, text);
+                let ok = await sendChunks(chunks);
                 if (ok) {
                     setOverlayText("");
                     hasContent = false;
@@ -1944,7 +1950,7 @@ function injectUI() {
                     secureInput.focus();
                 } else {
                     setOverlayText(text);
-                    toast("Send failed after 3 attempts. Tap send to retry.");
+                    toast("Send failed. Tap send to retry.");
                 }
             } catch (err) {
                 console.error("[RB] Encrypted send error:", err);
@@ -1961,7 +1967,7 @@ function injectUI() {
             isBypass = true;
             setOverlayText("\ud83c\udf10 Sending...");
             try {
-                let ok = await sendWithRetry([text], 2);
+                let ok = await sendChunks([text]);
                 if (ok) {
                     setOverlayText("");
                     hasContent = false;
@@ -1969,7 +1975,7 @@ function injectUI() {
                     secureInput.focus();
                 } else {
                     setOverlayText(text);
-                    toast("Send failed after 3 attempts. Tap send to retry.");
+                    toast("Send failed. Tap send to retry.");
                 }
             } catch (err) {
                 console.error("[RB] Plain send error:", err);
