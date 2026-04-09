@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      10.3
+// @version      11.0
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -14,6 +14,20 @@
 (function(){
 "use strict";
 const _W=typeof unsafeWindow!=="undefined"?unsafeWindow:window,OrigWS=_W.WebSocket;
+
+// ── Speed hack: intercept setTimeout to accelerate Angular's slow polling ──
+// Angular polls getChatsUpdates every 60s (ChatUpdateTimeout=60) and
+// waits 20s to reconnect WS (SocketWaitingTime=20). Patch before Zone.js loads.
+const _origST=_W.setTimeout;
+_W.setTimeout=function(fn,delay,...args){
+// 60s chat update poll → 2s
+if(delay>=55000&&delay<=65000)delay=2000;
+// 20s WS reconnect wait → 2s
+if(delay>=18000&&delay<=22000)delay=2000;
+// 5s WS retry → 1s
+if(delay>=4500&&delay<=5500)delay=1000;
+return _origST.call(this,fn,delay,...args);
+};
 let _rk={api:[],sock:[]},_ri={api:0,sock:0},_bad=new Set();
 function bestS(){for(let i=0;i<_rk.sock.length;i++){const u=_rk.sock[(_ri.sock+i)%_rk.sock.length];if(!_bad.has(u))return u;}return _rk.sock[0]||null;}
 function rotS(b){if(b){_bad.add(b);setTimeout(()=>_bad.delete(b),30000);}if(_rk.sock.length>1)_ri.sock=(_ri.sock+1)%_rk.sock.length;}
@@ -278,42 +292,26 @@ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"text/plain"},body:
 const j=await r.json();if(!j.data_enc)return null;const p=await aesCbcDecrypt(j.data_enc,_passKey);return p?JSON.parse(p):null;
 }catch(_){rotA();return null;}}
 
-// Poll getChatsUpdates — detect missed messages, force WS reconnect to sync
-let _lastReconnect=0;
+// Lightweight sync monitor — Angular's own polling is now 2s (patched from 60s)
+// This just tracks state for notifications; Angular handles the actual sync.
 async function _doSync(){
 if(_sBusy||!_authKey)return;_sBusy=true;
 try{if(!_sState)_sState=Math.floor(Date.now()/1000)-30;
 const r=await _rApi("getChatsUpdates",{state:_sState});
 if(!r||r.status!=="OK"){
 if(r&&(r.status_det==="OldState"||r.status==="OldState"||(r.data&&r.data.status==="OldState"))){
-_sState=Math.floor(Date.now()/1000)-30;_forceReconnect();}
+_sState=Math.floor(Date.now()/1000)-30;}
 return;}
 const d=r.data||{};if(d.new_state&&d.new_state>_sState)_sState=d.new_state;
-if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;_forceReconnect();return;}
-const chats=d.chats||[];
-if(chats.length>0){
-// New updates detected — force Angular to re-sync by reconnecting WS
-// Cooldown: max 1 reconnect per 5s to avoid spam
-_forceReconnect();
-}
+if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;return;}
 }finally{_sBusy=false;}}
 
-function _forceReconnect(){
-if(Date.now()-_lastReconnect<5000)return; // 5s cooldown
-_lastReconnect=Date.now();
-if(aSock&&aSock.readyState===1){try{aSock.close(4000,"sync");}catch(_){}}
-else{_W.dispatchEvent(new Event("online"));}
-}
-
-// 2s sync scheduler — detects updates, forces WS reconnect to deliver them
+// Sync monitor scheduler — lightweight, Angular does the heavy lifting now
 (function(){let st=null;
 function sched(){clearTimeout(st);
-st=setTimeout(()=>{_doSync().then(sched);},2000);}
-const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine started");_doSync().then(sched);}},2000);
-// Immediate sync on tab focus
+st=setTimeout(()=>{_doSync().then(sched);},5000);}
+const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine + Angular speed hack active");_doSync().then(sched);}},2000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(sched);}});
-// Force reconnect on chat navigation to load fresh messages
-_W.addEventListener("hashchange",()=>{if(_authKey)setTimeout(_forceReconnect,500);});
 })();
 
 // Reconnection watchdog — force reconnect if WS dead >10s
