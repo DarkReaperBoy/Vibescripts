@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor
 // @namespace    http://tampermonkey.net/
-// @version      17.5
+// @version      17.6
 // @description  E2E encryption overlay for Bale Web with ECDH key exchange.
 // @author       You
 // @match        *://web.bale.ai/*
@@ -37,9 +37,8 @@ function u8(ab){ const v = new Uint8Array(ab), c = new Uint8Array(v.length); c.s
 
 const _wsSend = _W.WebSocket.prototype.send;
 const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
-const _typingRx = /startTyping|stopTyping|TYPINGTYPE/;
 _W.WebSocket.prototype.send = function(d){
-    try{ if(typeof d === "string" && (_draftRx.test(d) || _typingRx.test(d))) return; }catch(_){}
+    try{ if(typeof d === "string" && _draftRx.test(d)) return; }catch(_){}
     return _wsSend.apply(this, arguments);
 };
 
