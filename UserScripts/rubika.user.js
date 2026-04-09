@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      10.0.5
-// @description  E2E encryption (ECDH key exchange, per-chat keys, Markdown), connectivity fix (DC racing, active sync polling, keepalive, reconnect). Desktop + Mobile.
+// @version      10.1
+// @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
 // @match        *://m.rubika.ir/*
@@ -336,6 +336,42 @@ setInterval(()=>{if(_authKey&&(!aSock||aSock.readyState>1)&&Date.now()-lastM>100
 // Re-race DCs every 5 minutes to adapt to network changes
 setInterval(raceDCs,300000);
 })();
+
+// ── Ad Blocker ──
+// CSS: hide ads early, before they render
+const _adCSS=document.createElement("style");_adCSS.textContent=`
+[class*="ads-"],[class*="-ads"],[class*="_ads"],[class*="ads_"],
+[class*="advert"],[class*="banner-ad"],[class*="ad-banner"],
+[class*="promo"],[class*="sponsor"],[class*="campaign"],
+[id*="ads-"],[id*="-ads"],[id*="ad-banner"],[id*="promo"],
+[class*="tabligh"],[class*="tebligh"],
+.ads-container,.ad-wrapper,.ad-slot,.ad-placeholder,
+.rb-ad,.rb-ads,.rb-banner,.rb-promo,
+.advertisement,.sponsored-content,.promoted,
+iframe[src*="yektanet"],iframe[src*="tapsell"],iframe[src*="adro"],
+iframe[src*="divar"],iframe[src*="ads"],
+[data-ad],[data-ads],[data-ad-slot],[data-campaign],
+div[style*="z-index"][style*="position: fixed"]:not(#bb-modal-overlay):not(#bale-bridge-menu):not(.bubble):has(a[target="_blank"][href*="rubika.ir/app"]),
+div[style*="z-index"][style*="position: fixed"]:not(#bb-modal-overlay):not(#bale-bridge-menu):not(.bubble):has(img[src*="banner"]),
+div[style*="z-index"][style*="position: fixed"]:not(#bb-modal-overlay):not(#bale-bridge-menu):not(.bubble):has(img[src*="promo"])
+{display:none!important;width:0!important;height:0!important;overflow:hidden!important;pointer-events:none!important;}
+`;
+(document.head||document.documentElement).appendChild(_adCSS);
+
+// DOM cleaner: remove ad iframes and scripts injected after load
+document.addEventListener("DOMContentLoaded",()=>{
+const _adDomains=["yektanet","tapsell","adro.ir","google-analytics","googletagmanager","doubleclick","googlesyndication","adservice"];
+const _adObs=new MutationObserver(muts=>{for(const m of muts){for(const n of m.addedNodes){if(n.nodeType!==1)continue;
+// Kill ad iframes
+if(n.tagName==="IFRAME"){const s=n.src||"";if(_adDomains.some(d=>s.includes(d))){n.remove();continue;}}
+// Kill ad scripts
+if(n.tagName==="SCRIPT"){const s=n.src||n.textContent||"";if(_adDomains.some(d=>s.includes(d))){n.remove();continue;}}
+// Kill elements with ad classes
+const cl=n.className||"";const id=n.id||"";
+if(/\b(ads?[-_]|[-_]ads?|advert|banner.?ad|promo|sponsor|tabligh|tebligh)\b/i.test(cl+id)){n.remove();}
+}}});
+_adObs.observe(document.body,{childList:true,subtree:true});
+});
 
 // ── E2E ENCRYPTION (deferred to DOM ready) ──
 function _rbInitEnc(){
