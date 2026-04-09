@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      10.1
+// @version      10.1.1
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -345,6 +345,7 @@ const _adCSS=document.createElement("style");_adCSS.textContent=`
 [class*="promo"],[class*="sponsor"],[class*="campaign"],
 [id*="ads-"],[id*="-ads"],[id*="ad-banner"],[id*="promo"],
 [class*="tabligh"],[class*="tebligh"],
+rb-chat-ads-container,.user-caption-ads,
 .ads-container,.ad-wrapper,.ad-slot,.ad-placeholder,
 .rb-ad,.rb-ads,.rb-banner,.rb-promo,
 .advertisement,.sponsored-content,.promoted,
