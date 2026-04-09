@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bale Bridge Encryptor
 // @namespace    http://tampermonkey.net/
-// @version      17.3
+// @version      17.4
 // @description  E2E encryption overlay for Bale Web with ECDH key exchange.
 // @author       You
 // @match        *://web.bale.ai/*
