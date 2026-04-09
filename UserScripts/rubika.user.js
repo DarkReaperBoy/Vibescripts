@@ -102,23 +102,35 @@ function showMsgNotification(chatName,text,authorName){
     }catch(_){}
 }
 // ── Notification message handler (reusable) ──
+let _wsMsgCount=0;
 function _handleWsMsg(e){
     try{
-        if(!_passKey||!e.data||typeof e.data!=="string")return;
+        if(!e.data||typeof e.data!=="string")return;
         const msg=JSON.parse(e.data);
         if(!msg.data_enc)return;
+        _wsMsgCount++;
+        if(!_passKey){if(_wsMsgCount<=3)console.log("[RB] WS msg #%d but no auth yet",_wsMsgCount);return;}
         aesCbcDecrypt(msg.data_enc,_passKey).then(plain=>{
             if(!plain)return;
             try{
                 const d=JSON.parse(plain);
-                if(!d.message_updates&&!d.chat_updates)return;
-                const msgs=d.message_updates||[];
+                // Log first few messages to diagnose format
+                if(_wsMsgCount<=5)console.log("[RB] WS #%d keys:",_wsMsgCount,Object.keys(d).join(","),"| sample:",JSON.stringify(d).slice(0,300));
+                // Extract messages from ALL possible field names
+                // WS push uses: message_updates, chat_updates, message, chat, show_notifications
+                // May also be nested under d.data
+                const src=d.data||d;
+                const msgs=src.message_updates||src.message||[];
+                const chats=src.chat_updates||src.chat||[];
+                const notifs=src.show_notifications||[];
+                if(!msgs.length&&!chats.length&&!notifs.length)return;
+                // Process message updates
                 for(const m of msgs){
                     const mm=m.message||m;
                     const authorGuid=mm.author_object_guid||mm.author_guid||"";
                     if(_myGuid&&authorGuid===_myGuid)continue;
                     const text=mm.text||"";
-                    const authorName=mm.author_name||"";
+                    const authorName=mm.author_name||mm.author_title||"";
                     const chatGuid=mm.object_guid||m.object_guid||"";
                     let chatName=authorName||"New message";
                     if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
@@ -137,8 +149,23 @@ function _handleWsMsg(e){
                         } else { showMsgNotification(chatName,text,authorName); }
                     }
                 }
-            }catch(_){}
-        }).catch(()=>{});
+                // Process show_notifications (Rubika's own notification triggers)
+                for(const n of notifs){
+                    const text=n.text||n.message_text||"";
+                    const title=n.title||n.chat_title||n.sender_name||"Rubika";
+                    if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
+                    const authorGuid=n.author_object_guid||n.sender_guid||"";
+                    if(_myGuid&&authorGuid===_myGuid)continue;
+                    if(text||title){
+                        if(text.startsWith("@@")&&_W._rbDecrypt){
+                            _W._rbDecrypt(text).then(dec=>{
+                                showMsgNotification(title,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message");
+                            }).catch(()=>showMsgNotification(title,"\ud83d\udd12 Encrypted message"));
+                        } else { showMsgNotification(title,text); }
+                    }
+                }
+            }catch(ex){console.log("[RB] WS parse error:",ex.message);}
+        }).catch(ex=>{if(_wsMsgCount<=5)console.log("[RB] WS decrypt fail:",ex.message);});
     }catch(_){}
 }
 
