@@ -204,7 +204,8 @@ function _handleWsMsg(e){
                     _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;
                     console.log("[RB] Auth captured from WS handshake (%d chars)",p.auth.length);
                 }
-                if(d.includes("EditParameter")&&d.includes("drafts_"))return;
+                if(d.includes("EditParameter")&&d.includes("drafts_")){console.log("[RB] BLOCKED draft");return;}
+                if(d!=="{}"&&(!p.method||p.method!=="handShake"))console.log("[RB] WS OUT:",d.length>300?d.slice(0,300)+"…":d);
             }
         }catch(_){}
         return _origProtoSend.apply(this,arguments);

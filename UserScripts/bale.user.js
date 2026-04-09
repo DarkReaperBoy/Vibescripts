@@ -38,7 +38,12 @@ function u8(ab){ const v = new Uint8Array(ab), c = new Uint8Array(v.length); c.s
 const _wsSend = _W.WebSocket.prototype.send;
 const _draftRx = /EditParameter[\s\S]*drafts_|drafts_[\s\S]*EditParameter/;
 _W.WebSocket.prototype.send = function(d){
-    try{ if(typeof d === "string" && _draftRx.test(d)) return; }catch(_){}
+    try{
+        if(typeof d === "string"){
+            if(_draftRx.test(d)){console.log("[BL] BLOCKED draft");return;}
+            if(d!=="{}"&&!d.includes('"handShake"'))console.log("[BL] WS OUT:",d.length>300?d.slice(0,300)+"…":d);
+        }
+    }catch(_){}
     return _wsSend.apply(this, arguments);
 };
 
