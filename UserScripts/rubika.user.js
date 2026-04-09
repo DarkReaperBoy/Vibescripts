@@ -63,20 +63,27 @@ async function aesCbcDecrypt(b64data,key){
         return new TextDecoder().decode(dec);
     }catch(_){return null;}
 }
+let _notifAC=null;
+// Pre-warm AudioContext on first user interaction so it's ready for notifications
+["click","keydown","touchstart"].forEach(e=>{_W.addEventListener(e,function _acWarm(){
+    try{if(!_notifAC){_notifAC=new(window.AudioContext||window.webkitAudioContext)();_notifAC.resume();}}catch(_){}
+    _W.removeEventListener(e,_acWarm);},{once:true,capture:true});});
 function playNotifSound(){
     try{
-        const ac=new(window.AudioContext||window.webkitAudioContext)();
-        // Two-tone chime
-        [[880,.0,.08],[1047,.07,.15]].forEach(([freq,start,end])=>{
-            const o=ac.createOscillator(),g=ac.createGain();
-            o.type="sine";o.frequency.value=freq;
-            g.gain.setValueAtTime(0,ac.currentTime+start);
-            g.gain.linearRampToValueAtTime(0.15,ac.currentTime+start+0.02);
-            g.gain.linearRampToValueAtTime(0,ac.currentTime+end);
-            o.connect(g);g.connect(ac.destination);
-            o.start(ac.currentTime+start);o.stop(ac.currentTime+end+0.01);
-        });
-        setTimeout(()=>ac.close(),500);
+        if(!_notifAC)_notifAC=new(window.AudioContext||window.webkitAudioContext)();
+        _notifAC.resume().then(()=>{
+            const ac=_notifAC;
+            // Three-tone chime — louder, longer
+            [[880,.0,.12],[1047,.1,.22],[1319,.2,.35]].forEach(([freq,start,end])=>{
+                const o=ac.createOscillator(),g=ac.createGain();
+                o.type="sine";o.frequency.value=freq;
+                g.gain.setValueAtTime(0,ac.currentTime+start);
+                g.gain.linearRampToValueAtTime(0.35,ac.currentTime+start+0.03);
+                g.gain.linearRampToValueAtTime(0,ac.currentTime+end);
+                o.connect(g);g.connect(ac.destination);
+                o.start(ac.currentTime+start);o.stop(ac.currentTime+end+0.01);
+            });
+        }).catch(()=>{});
     }catch(_){}
 }
 function showMsgNotification(chatName,text,authorName){
@@ -86,9 +93,10 @@ function showMsgNotification(chatName,text,authorName){
     let title=authorName&&authorName!==chatName?authorName+" in "+chatName:chatName;
     let body=text||"New message";
     if(body.length>120)body=body.slice(0,120)+"\u2026";
+    console.log("[RB] Notification:",title,"—",body,"| Permission:",Notification.permission);
     playNotifSound();
     try{
-        const n=new Notification(title,{body,icon:"https://web.rubika.ir/assets/img/iphone_home120.png",tag:"rb-"+chatName,silent:true});
+        const n=new Notification(title,{body,icon:"https://web.rubika.ir/assets/img/iphone_home120.png",tag:"rb-"+chatName});
         n.onclick=()=>{_W.focus();n.close();};
         setTimeout(()=>n.close(),8000);
     }catch(_){}
