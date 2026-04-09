@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rubika Bridge — E2E Encryption + Connectivity Fix
 // @namespace    http://tampermonkey.net/
-// @version      11.0.2
+// @version      11.1
 // @description  E2E encryption, ad blocker, connectivity fix (DC racing, active sync, keepalive). Desktop + Mobile.
 // @author       You
 // @match        *://web.rubika.ir/*
@@ -28,6 +28,9 @@ if(delay>=18000&&delay<=22000)delay=2000;
 if(delay>=4500&&delay<=5500)delay=1000;
 return _origST.call(this,fn,delay,...args);
 };
+// ── Privacy: block typing indicators + time tracking before encryption ──
+const _origJSONStringify=JSON.stringify;
+JSON.stringify=function(v){try{if(v&&typeof v==="object"&&(v.method==="sendChatActivity"||v.method==="setChatUseTime"))return _origJSONStringify({method:"getTime",input:{}});}catch(_){}return _origJSONStringify.apply(this,arguments);};
 let _rk={api:[],sock:[]},_ri={api:0,sock:0},_bad=new Set();
 function bestS(){for(let i=0;i<_rk.sock.length;i++){const u=_rk.sock[(_ri.sock+i)%_rk.sock.length];if(!_bad.has(u))return u;}return _rk.sock[0]||null;}
 function rotS(b){if(b){_bad.add(b);setTimeout(()=>_bad.delete(b),30000);}if(_rk.sock.length>1)_ri.sock=(_ri.sock+1)%_rk.sock.length;}
@@ -204,8 +207,7 @@ function _handleWsMsg(e){
                     _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;
                     console.log("[RB] Auth captured from WS handshake (%d chars)",p.auth.length);
                 }
-                if(d.includes("EditParameter")&&d.includes("drafts_")){console.log("[RB] BLOCKED draft");return;}
-                if(d!=="{}"&&(!p.method||p.method!=="handShake"))console.log("[RB] WS OUT:",d.length>300?d.slice(0,300)+"…":d);
+                if(d.includes("EditParameter")&&d.includes("drafts_"))return;
             }
         }catch(_){}
         return _origProtoSend.apply(this,arguments);
