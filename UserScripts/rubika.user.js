@@ -267,17 +267,19 @@ const d=r.data||{};if(d.new_state&&d.new_state>_sState)_sState=d.new_state;
 // Also handle OldState inside data
 if(d.status==="OldState"){_sState=Math.floor(Date.now()/1000)-30;
 if(aSock&&aSock.readyState===1){try{aSock.close(4000,"old");}catch(_){}}return;}
-const chats=d.chats||[];const wsStale=Date.now()-lastM>8000;
-if(chats.length>0&&wsStale){_sMiss++;
-// Try injecting chat updates via synthetic WS message
+const chats=d.chats||[];
+if(chats.length>0){_sMiss++;
+// Always inject chat updates — force sync regardless of WS state
 if(aSock&&aSock.readyState===1){
 try{const ed=await _aEnc(JSON.stringify({chat_updates:chats,message_updates:chats.filter(c=>c.last_message).map(c=>({message:c.last_message,object_guid:c.object_guid}))}),_passKey);
 aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}}
-// Force WS reconnect after 2+ consecutive missed syncs
-if(_sMiss>=2){_sMiss=0;
+// Force WS reconnect after 3+ consecutive missed syncs
+if(_sMiss>=3){_sMiss=0;
 if(aSock&&aSock.readyState===1){try{aSock.close(4000,"sync");}catch(_){}}
 else{_W.dispatchEvent(new Event("online"));}}
 }else{_sMiss=0;}
+// Always sync current chat messages too
+await _chatSync();
 }finally{_sBusy=false;}}
 
 // Per-chat sync — fetch messages for current open chat
@@ -291,10 +293,10 @@ try{const ed=await _aEnc(JSON.stringify({message_updates:msgs.map(m=>({message:m
 aSock.dispatchEvent(new MessageEvent("message",{data:JSON.stringify({data_enc:ed})}));}catch(_){}
 }}catch(_){}}
 
-// Adaptive sync scheduler
+// Fixed 5s sync scheduler
 (function(){let st=null;
-function sched(){clearTimeout(st);const a=Date.now()-_lastActivity<30000,wOk=aSock&&aSock.readyState===1&&Date.now()-lastM<25000;
-st=setTimeout(()=>{_doSync().then(sched);},a&&!wOk?5000:a?10000:20000);}
+function sched(){clearTimeout(st);
+st=setTimeout(()=>{_doSync().then(sched);},5000);}
 const wi=setInterval(()=>{if(_authKey){clearInterval(wi);console.log("[RB] Sync engine started");_doSync().then(sched);}},2000);
 // Immediate sync on tab focus
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&_authKey){clearTimeout(st);_doSync().then(()=>{_chatSync();sched();});}});
