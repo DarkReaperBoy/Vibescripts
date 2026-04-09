@@ -101,98 +101,118 @@ function showMsgNotification(chatName,text,authorName){
         setTimeout(()=>n.close(),8000);
     }catch(_){}
 }
+// ── Notification message handler (reusable) ──
+function _handleWsMsg(e){
+    try{
+        if(!_passKey||!e.data||typeof e.data!=="string")return;
+        const msg=JSON.parse(e.data);
+        if(!msg.data_enc)return;
+        aesCbcDecrypt(msg.data_enc,_passKey).then(plain=>{
+            if(!plain)return;
+            try{
+                const d=JSON.parse(plain);
+                if(!d.message_updates&&!d.chat_updates)return;
+                const msgs=d.message_updates||[];
+                for(const m of msgs){
+                    const mm=m.message||m;
+                    const authorGuid=mm.author_object_guid||mm.author_guid||"";
+                    if(_myGuid&&authorGuid===_myGuid)continue;
+                    const text=mm.text||"";
+                    const authorName=mm.author_name||"";
+                    const chatGuid=mm.object_guid||m.object_guid||"";
+                    let chatName=authorName||"New message";
+                    if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
+                    try{
+                        const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
+                        for(const li of items){
+                            const pt=li.querySelector(".peer-title");
+                            if(pt&&li.innerHTML.includes(chatGuid)){chatName=pt.textContent.trim();break;}
+                        }
+                    }catch(_){}
+                    if(text||authorName){
+                        if(text.startsWith("@@")&&_W._rbDecrypt){
+                            _W._rbDecrypt(text).then(dec=>{
+                                showMsgNotification(chatName,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message",authorName);
+                            }).catch(()=>showMsgNotification(chatName,"\ud83d\udd12 Encrypted message",authorName));
+                        } else { showMsgNotification(chatName,text,authorName); }
+                    }
+                }
+            }catch(_){}
+        }).catch(()=>{});
+    }catch(_){}
+}
+
 // Capture auth from handshake, intercept incoming messages
 (function(){
     const origAddEL=OrigWS.prototype.addEventListener;
-    const pwSendOrig=PW.prototype.send;
-    // We already wrap ws.send in PW — enhance it to capture auth
-    const _origPWSend=_W.WebSocket;
-    // Intercept at the instance level — patch PW to also capture auth and messages
-    const _origPW=PW;
-    // Instead of re-patching PW, hook into each instance via the existing message listener
-    // We'll add a message interceptor to the OrigWS prototype
     const _omsgHandlers=new WeakMap();
+
+    // Wrap addEventListener to intercept 'message' events
     OrigWS.prototype.addEventListener=function(type,fn,...rest){
         if(type==="message"){
-            const wrapped=function(e){
-                // Try to decrypt and notify
-                try{
-                    if(_passKey&&e.data&&typeof e.data==="string"){
-                        const msg=JSON.parse(e.data);
-                        if(msg.data_enc){
-                            aesCbcDecrypt(msg.data_enc,_passKey).then(plain=>{
-                                if(!plain)return;
-                                try{
-                                    const d=JSON.parse(plain);
-                                    // Chat updates with messages
-                                    if(d.message_updates||d.chat_updates){
-                                        const msgs=d.message_updates||[];
-                                        for(const m of msgs){
-                                            const mm=m.message||m;
-                                            const authorGuid=mm.author_object_guid||mm.author_guid||"";
-                                            // Don't notify for own messages
-                                            if(_myGuid&&authorGuid===_myGuid)continue;
-                                            const text=mm.text||"";
-                                            const authorName=mm.author_name||"";
-                                            // Get chat name from sidebar
-                                            const chatGuid=mm.object_guid||m.object_guid||"";
-                                            let chatName=authorName||"New message";
-                                            // Skip if page is focused AND user was active within 15s
-                                            if(document.hasFocus()&&Date.now()-_lastActivity<15000)continue;
-                                            try{
-                                                const items=document.querySelectorAll("ul.chatlist > li[rb-chat-item]");
-                                                for(const li of items){
-                                                    const pt=li.querySelector(".peer-title");
-                                                    if(pt&&li.innerHTML.includes(chatGuid)){chatName=pt.textContent.trim();break;}
-                                                }
-                                            }catch(_){}
-                                            if(text||authorName){
-                                                // Try to decrypt if it's an encrypted message
-                                                if(text.startsWith("@@")&&_W._rbDecrypt){
-                                                    _W._rbDecrypt(text).then(dec=>{
-                                                        showMsgNotification(chatName,dec!==text?"\ud83d\udd12 "+dec:"\ud83d\udd12 Encrypted message",authorName);
-                                                    }).catch(()=>showMsgNotification(chatName,"\ud83d\udd12 Encrypted message",authorName));
-                                                } else { showMsgNotification(chatName,text,authorName); }
-                                            }
-                                        }
-                                    }
-                                }catch(_){}
-                            }).catch(()=>{});
-                        }
-                    }
-                }catch(_){}
-                return fn.call(this,e);
-            };
+            const wrapped=function(e){ _handleWsMsg(e); return fn.call(this,e); };
             _omsgHandlers.set(fn,wrapped);
             return origAddEL.call(this,type,wrapped,...rest);
         }
         return origAddEL.call(this,type,fn,...rest);
     };
-    // Capture auth from send
-    const _origSendProto=OrigWS.prototype.send;
-    const _prevSend=OrigWS.prototype.send;
+
+    // Also intercept onmessage property — RxJS WebSocketSubject uses this instead of addEventListener
+    const _origOnMsgDesc=Object.getOwnPropertyDescriptor(OrigWS.prototype,'onmessage');
+    if(_origOnMsgDesc&&_origOnMsgDesc.set){
+        Object.defineProperty(OrigWS.prototype,'onmessage',{configurable:true,enumerable:true,
+            get:_origOnMsgDesc.get,
+            set:function(fn){
+                if(!fn)return _origOnMsgDesc.set.call(this,fn);
+                const ws=this;
+                _origOnMsgDesc.set.call(this,function(e){ _handleWsMsg(e); return fn.call(ws,e); });
+            }
+        });
+    }
+
+    // Capture auth from WS send (handshake)
     OrigWS.prototype.send=function(d){
         try{
             if(typeof d==="string"){
                 const p=JSON.parse(d);
-                if(p.method==="handShake"&&p.auth&&p.auth.length===32){
+                if(p.method==="handShake"&&p.auth&&typeof p.auth==="string"&&p.auth.length>=20){
                     _authKey=p.auth;_passKey=derivePassphrase(p.auth);_decAuth=null;_sState=0;_sMiss=0;
-                    console.log("[RB] Auth captured, sync+notifications enabled");
+                    console.log("[RB] Auth captured from WS handshake (%d chars)",p.auth.length);
                 }
                 if(d.includes("EditParameter")&&d.includes("drafts_"))return;
             }
         }catch(_){}
         return _origProtoSend.apply(this,arguments);
     };
-    // Try to get myGuid from localStorage
-    try{
-        for(let i=0;i<localStorage.length;i++){
-            const k=localStorage.key(i);
-            if(k&&localStorage.getItem(k)){
-                try{const v=JSON.parse(localStorage.getItem(k));if(v&&v.user_guid){_myGuid=v.user_guid;break;}}catch(_){}
+
+    // Try to get myGuid and auth from localStorage
+    function _scanLocalStorage(){
+        try{for(let i=0;i<localStorage.length;i++){
+            const k=localStorage.key(i),v=localStorage.getItem(k);
+            if(!v)continue;
+            try{const obj=JSON.parse(v);
+                if(obj&&typeof obj==="object"){
+                    if(!_myGuid&&obj.user_guid)_myGuid=obj.user_guid;
+                    // Auth stored as JSON field
+                    if(!_authKey&&typeof obj.auth==="string"&&obj.auth.length>=20&&/^[a-z0-9]+$/.test(obj.auth)){
+                        _authKey=obj.auth;_passKey=derivePassphrase(obj.auth);_decAuth=null;_sState=0;
+                        console.log("[RB] Auth from localStorage (key: %s)",k);
+                    }
+                }
+            }catch(_){}
+            // Regex scan for auth in stringified values
+            if(!_authKey){
+                const m=v.match(/"auth"\s*:\s*"([a-z]{20,32})"/);
+                if(m){_authKey=m[1];_passKey=derivePassphrase(m[1]);_decAuth=null;_sState=0;
+                    console.log("[RB] Auth from localStorage regex (key: %s)",k);}
             }
-        }
-    }catch(_){}
+        }}catch(_){}
+    }
+    _scanLocalStorage();
+    // Retry periodically in case localStorage is populated after page load
+    const _lsTimer=setInterval(()=>{if(_authKey){clearInterval(_lsTimer);return;}_scanLocalStorage();},3000);
+    setTimeout(()=>clearInterval(_lsTimer),60000); // stop after 1 min
+
     // Ask notification permission
     if("Notification" in _W&&Notification.permission==="default"){
         document.addEventListener("click",function ask(){Notification.requestPermission();document.removeEventListener("click",ask);},{once:true});
@@ -203,7 +223,15 @@ const oO=XMLHttpRequest.prototype.open,oX=XMLHttpRequest.prototype.send;
 // Adaptive XHR timeout: scales with connection speed. Fast=15s, slow=45s
 function adaptiveXhrTimeout(){if(rtt.length<3)return 20000;const avg=rtt.reduce((a,b)=>a+b,0)/rtt.length;return Math.max(15000,Math.min(45000,avg*15));}
 XMLHttpRequest.prototype.open=function(m,u,...r){this._ru=u;const b=bestA();if(b&&typeof u==="string"&&u.includes("iranlms.ir")&&!u.includes("getdcmess")&&m==="POST"){try{const o=new URL(u),n=new URL(b);if(o.hostname!==n.hostname)u=n.origin+o.pathname+o.search;}catch(_){}this.timeout=adaptiveXhrTimeout();}return oO.call(this,m,u,...r);};
-XMLHttpRequest.prototype.send=function(...a){this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
+XMLHttpRequest.prototype.send=function(...a){
+// Capture auth from XHR API requests (fallback if WS capture fails)
+if(!_authKey&&a[0]&&typeof a[0]==="string"&&this._ru&&this._ru.includes("iranlms.ir")){
+try{const b=JSON.parse(a[0]);if(b.auth&&typeof b.auth==="string"&&b.auth.length>=20){
+// b.auth is decode_auth — _dAuth is its own inverse, so _dAuth(decode_auth) = raw_auth
+const raw=_dAuth(b.auth);_authKey=raw;_passKey=derivePassphrase(raw);_decAuth=b.auth;_sState=0;_sMiss=0;
+console.log("[RB] Auth captured from XHR request");
+}}catch(_){}}
+this.addEventListener("error",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});this.addEventListener("timeout",()=>{if(this._ru&&this._ru.includes("iranlms.ir"))rotA();},{once:true});return oX.apply(this,a);};
 document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));else if(Date.now()-lastM>60000){try{aSock.close(4000,"stale");}catch(_){}}}});
 _W.addEventListener("online",()=>{setTimeout(()=>{if(!aSock||aSock.readyState!==1)_W.dispatchEvent(new Event("online"));},1000);});
 if(navigator.connection)navigator.connection.addEventListener("change",()=>{if(navigator.onLine&&(!aSock||aSock.readyState!==1))_W.dispatchEvent(new Event("online"));});
